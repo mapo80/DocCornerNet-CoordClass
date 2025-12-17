@@ -1,0 +1,5 @@
+tensorflow>=2.10
+numpy
+shapely
+tqdm
+pillow

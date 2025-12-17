@@ -1,0 +1,38 @@
+# Checkpoints & Models
+checkpoints/
+qat_output/
+exported/
+*.h5
+*.keras
+*.onnx
+*.npz
+*.tflite
+*.pb
+saved_model/
+savedmodel*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp
+*.tmp
+*.bak
+*.log
