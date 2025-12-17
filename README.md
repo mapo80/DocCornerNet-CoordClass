@@ -23,6 +23,61 @@ A lightweight neural network for document corner detection using a novel **Margi
 | **Classification F1** | 99.97% |
 | **Parameters** | < 1M |
 
+## Pretrained Models
+
+Pretrained models are included in the `checkpoints/` directory:
+
+### Model Files
+
+| File | Description | Size |
+|------|-------------|------|
+| `best_model.keras` | Best model (full, for training resume) | 3.5 MB |
+| `best_model.weights.h5` | Best model weights only | 3.3 MB |
+| `best_model_inference.keras` | Best model (inference optimized) | 3.5 MB |
+| `final_model.keras` | Final epoch model (full) | 3.5 MB |
+| `final_model.weights.h5` | Final epoch weights only | 3.3 MB |
+| `final_model_inference.keras` | Final model (inference optimized) | 3.5 MB |
+| `config.json` | Training configuration | 729 B |
+| `history.json` | Training history (loss, metrics per epoch) | 90 KB |
+
+### Quick Start with Pretrained Models
+
+```python
+import tensorflow as tf
+from model import create_model, create_inference_model
+
+# Load the best model for inference
+model = tf.keras.models.load_model("checkpoints/best_model_inference.keras")
+
+# Or load weights into a new model
+model = create_inference_model(img_size=224, alpha=0.75, fpn_ch=48, simcc_ch=128)
+model.load_weights("checkpoints/best_model.weights.h5")
+
+# Inference
+# Input: [B, 224, 224, 3] RGB image (ImageNet normalized)
+# Output: coords [B, 8], score_logit [B, 1]
+coords, score_logit = model(image_tensor)
+score = tf.nn.sigmoid(score_logit)  # Apply sigmoid for probability
+```
+
+### Training Configuration
+
+The pretrained models were trained with:
+
+| Parameter | Value |
+|-----------|-------|
+| `alpha` | 0.75 |
+| `fpn_ch` | 48 |
+| `simcc_ch` | 128 |
+| `img_size` | 224 |
+| `sigma_px` | 3.0 |
+| `batch_size` | 64 |
+| `epochs` | 100 |
+| `lr` | 0.0002 |
+| `w_simcc` | 1.0 |
+| `w_coord` | 0.5 |
+| `w_score` | 0.5 |
+
 ## Dataset
 
 This model is trained on the **DocCornerDataset** available on HuggingFace:
@@ -143,6 +198,36 @@ python eval_tflite.py \
     --data_root /path/to/dataset
 ```
 
+### TFLite V2-Compatible Export
+
+The `convert_v2_compatible.py` script converts the model to TFLite with an output format **identical to [DocCornerNet-Regression](https://github.com/mapo80/DocCornerNet-Regression)**:
+
+```bash
+# First export to SavedModel
+python export.py --weights ./checkpoints/best_model.weights.h5 --output_dir ./exported --format savedmodel
+
+# Then convert to V2-compatible TFLite
+cd exported
+python convert_v2_compatible.py
+```
+
+**V2-Compatible Format:**
+
+| Tensor | Name | Shape | Description |
+|--------|------|-------|-------------|
+| Input | `input` | `[1, 224, 224, 3]` | RGB image (float32) |
+| Output | `Identity` | `[1, 9]` | 8 coords + sigmoid(score) |
+
+**Output format:** `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
+- Coordinates: normalized [0, 1]
+- Score: sigmoid probability [0, 1] (already applied)
+
+This format is interchangeable with [DocCornerNet-Regression](https://github.com/mapo80/DocCornerNet-Regression) TFLite models.
+
+**Generated files:**
+- `model_float32.tflite` - Full precision
+- `model_float16.tflite` - Half precision (smaller size)
+
 ## Output Format
 
 ### Corner Order
@@ -181,17 +266,27 @@ Configuration used for the reported results:
 ## Files
 
 ```
-├── model.py              # Network architecture
-├── losses.py             # Loss functions (SimCC, Coord, Score)
-├── metrics.py            # Evaluation metrics (IoU, corner error)
-├── dataset.py            # TF Dataset with augmentations
-├── train.py              # Training script
-├── evaluate.py           # Evaluation script
-├── export.py             # Export to SavedModel/TFLite/ONNX
-├── eval_tflite.py        # TFLite evaluation
-├── train_qat.py          # Quantization-Aware Training
-├── ptq_improved.py       # Post-Training Quantization
-├── visualize_*.py        # Augmentation visualization
+├── checkpoints/
+│   ├── best_model.keras           # Best model (full)
+│   ├── best_model.weights.h5      # Best model weights
+│   ├── best_model_inference.keras # Best model (inference)
+│   ├── final_model.keras          # Final epoch model
+│   ├── final_model.weights.h5     # Final epoch weights
+│   ├── final_model_inference.keras# Final model (inference)
+│   ├── config.json                # Training configuration
+│   └── history.json               # Training history
+├── model.py                       # Network architecture
+├── losses.py                      # Loss functions (SimCC, Coord, Score)
+├── metrics.py                     # Evaluation metrics (IoU, corner error)
+├── dataset.py                     # TF Dataset with augmentations
+├── train.py                       # Training script
+├── evaluate.py                    # Evaluation script
+├── export.py                      # Export to SavedModel/TFLite/ONNX
+├── eval_tflite.py                 # TFLite evaluation
+├── convert_v2_compatible.py       # Convert to V2-compatible TFLite format
+├── train_qat.py                   # Quantization-Aware Training
+├── ptq_improved.py                # Post-Training Quantization
+├── visualize_*.py                 # Augmentation visualization
 └── README.md
 ```
 

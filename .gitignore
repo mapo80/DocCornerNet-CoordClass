@@ -1,9 +1,14 @@
-# Checkpoints & Models
-checkpoints/
+# Checkpoints & Models (allow pretrained models)
+!checkpoints/best_model.keras
+!checkpoints/best_model.weights.h5
+!checkpoints/best_model_inference.keras
+!checkpoints/final_model.keras
+!checkpoints/final_model.weights.h5
+!checkpoints/final_model_inference.keras
+!checkpoints/config.json
+!checkpoints/history.json
 qat_output/
 exported/
-*.h5
-*.keras
 *.onnx
 *.npz
 *.tflite
