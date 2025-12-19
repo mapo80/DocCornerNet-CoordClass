@@ -73,6 +73,7 @@ def build_doccorner_simcc_v3(
     num_bins: int = 224,
     tau: float = 1.0,
     score_init_bias: float = 1.75,
+    backbone_weights="imagenet",
 ):
     """
     Build DocCornerNetV3 model with correct SimCC (MMPose style).
@@ -97,12 +98,12 @@ def build_doccorner_simcc_v3(
     inp = keras.Input((img_size, img_size, 3), name="image")
 
     # =========================================================================
-    # Backbone: MobileNetV3Small with ImageNet weights
+    # Backbone: MobileNetV3Small (optionally ImageNet pretrained)
     # =========================================================================
     backbone = keras.applications.MobileNetV3Small(
         input_tensor=inp,
         include_top=False,
-        weights="imagenet",
+        weights=backbone_weights,
         alpha=alpha,
         include_preprocessing=True,
     )
@@ -298,6 +299,7 @@ def create_model(
     num_bins: int = 224,
     tau: float = 1.0,
     score_init_bias: float = 1.75,
+    backbone_weights="imagenet",
 ):
     """
     Factory function to create DocCornerNetV3 training model with SimCC.
@@ -328,6 +330,7 @@ def create_model(
         num_bins=num_bins,
         tau=tau,
         score_init_bias=score_init_bias,
+        backbone_weights=backbone_weights,
     )
 
 

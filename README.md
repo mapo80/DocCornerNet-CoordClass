@@ -9,19 +9,59 @@ A lightweight neural network for document corner detection using a novel **Margi
 
 ## Results
 
-| Metric | Value |
-|--------|-------|
-| **Mean IoU** | 0.9820 |
-| **Median IoU** | 0.9881 |
-| **Corner Error (mean)** | 0.94 px |
-| **Corner Error (p95)** | 2.07 px |
-| **Recall@50** | 99.89% |
-| **Recall@75** | 99.57% |
-| **Recall@90** | 98.81% |
-| **Recall@95** | 96.82% |
-| **Classification Accuracy** | 99.95% |
-| **Classification F1** | 99.97% |
-| **Parameters** | < 1M |
+### Teacher Model (Full)
+
+| Metric | VAL | TEST |
+|--------|-----|------|
+| **Mean IoU** | 0.9825 | 0.9827 |
+| **Median IoU** | 0.9888 | 0.9884 |
+| **Corner Error (mean)** | 0.93 px | 0.95 px |
+| **Corner Error (p95)** | 2.06 px | 2.08 px |
+| **Recall@90** | 98.8% | 98.9% |
+| **Recall@95** | 97.2% | 97.4% |
+| **Classification Accuracy** | 100.0% | 99.7% |
+| **Classification F1** | 99.97% | 99.83% |
+| **Parameters** | 742,417 | 742,417 |
+
+### Student Model (Distilled)
+
+| Metric | VAL | TEST |
+|--------|-----|------|
+| **Mean IoU** | 0.9761 | 0.9761 |
+| **Median IoU** | 0.9844 | 0.9838 |
+| **Corner Error (mean)** | 1.29 px | 1.29 px |
+| **Corner Error (p95)** | 2.92 px | 3.03 px |
+| **Recall@90** | 98.1% | 98.5% |
+| **Recall@95** | 94.4% | 94.6% |
+| **Classification Accuracy** | 100.0% | 99.8% |
+| **Classification F1** | 99.97% | 99.87% |
+| **Parameters** | 669,761 | 669,761 |
+
+### Model Comparison (TEST set)
+
+| Model | Approach | Parameters | Mean IoU | Corner Error | R@90 | R@95 | Cls F1 | TFLite (ms) | Size |
+|-------|----------|------------|----------|--------------|------|------|--------|-------------|------|
+| **Teacher** | SimCC (TF) | 742,417 | **0.9827** | **0.95 px** | **98.9%** | **97.4%** | 99.83% | 5.3 | 1.46 MB |
+| **Student** | SimCC (TF) | **669,761** | 0.9761 | 1.29 px | 98.5% | 94.6% | **99.87%** | **3.7** | **1.33 MB** |
+| Regression | Direct (PyTorch) | 1,002,025 | 0.9546 | 2.29 px | 94.8% | 70.0% | 99.88% | - | 3.84 MB |
+
+*TFLite float16 inference time on Apple M2 Pro CPU, batch size 1, averaged over 100 iterations.*
+
+### Key Insights
+
+- **SimCC Teacher** achieves the best accuracy with **0.95px corner error** and **97.4% R@95**
+- **SimCC Student** is **1.4x faster** than Teacher (3.7ms vs 5.3ms TFLite), trades ~0.7% IoU for 10% fewer params
+- **Regression baseline** has 35% more parameters, ~3% lower IoU, ~2.4× higher corner error, and ~2.5× larger model
+- All models achieve near-perfect document classification (F1 > 99.8%)
+
+### Why SimCC is More Accurate
+
+SimCC (Marginal Coordinate Classification) predicts 1D probability distributions over X/Y axes, while regression directly outputs coordinates. SimCC advantages:
+
+1. **Richer supervision**: SimCC uses soft Gaussian targets (224 bins per axis) vs 1 scalar per coordinate
+2. **Better gradient flow**: Cross-entropy on distributions vs L1/L2 on scalars
+3. **Spatial awareness**: FPN + 1D convolutions preserve spatial structure vs GAP which loses it
+4. **Sub-pixel precision**: Soft-argmax on distributions enables sub-bin accuracy
 
 ## Pretrained Models
 
@@ -44,14 +84,16 @@ Pretrained models are included in the `checkpoints/` directory:
 
 ```python
 import tensorflow as tf
-from model import create_model, create_inference_model
+from model import load_inference_model
 
 # Load the best model for inference
 model = tf.keras.models.load_model("checkpoints/best_model_inference.keras")
 
-# Or load weights into a new model
-model = create_inference_model(img_size=224, alpha=0.75, fpn_ch=48, simcc_ch=128)
-model.load_weights("checkpoints/best_model.weights.h5")
+# Or load weights into a new inference model
+model = load_inference_model(
+    "checkpoints/best_model.weights.h5",
+    img_size=224, alpha=0.75, fpn_ch=48, simcc_ch=128,
+)
 
 # Inference
 # Input: [B, 224, 224, 3] RGB image (ImageNet normalized)
@@ -162,6 +204,51 @@ python train.py \
 | `--fast_mode` | flag | GPU-accelerated augmentations |
 | `--warmup_epochs` | 5 | LR warmup epochs |
 | `--patience` | 15 | Early stopping patience |
+
+### Student Distillation (Faster Variant)
+
+If you need lower latency while keeping accuracy as close as possible, you can train a smaller
+**student** model using knowledge distillation from a pretrained **teacher**.
+
+The distillation loss mixes:
+- **Hard supervision** (ground truth): SimCC + coord L1 + score BCE
+- **Soft supervision** (teacher): SimCC logit distillation (+ optional score/coord distillation)
+
+**Requirements:**
+- A trained teacher weights file (e.g. `checkpoints/best_model.weights.h5`)
+- The teacher `config.json` is auto-detected if present next to the weights (recommended)
+- Teacher/student must use the same `img_size` and `num_bins` (default `224`)
+
+**Recommended student starting point (good speed/accuracy tradeoff):**
+- `--student_alpha 0.5 --student_fpn_ch 32 --student_simcc_ch 96`
+
+**Train student:**
+
+```bash
+python train_student.py \
+    --teacher_weights ./checkpoints/best_model.weights.h5 \
+    --data_root /path/to/dataset \
+    --student_alpha 0.5 --student_fpn_ch 32 --student_simcc_ch 96 \
+    --epochs 60 --batch_size 64 \
+    --augment --cache_images --fast_mode \
+    --output_dir ./checkpoints_student
+```
+
+**Key distillation knobs:**
+- `--distill_tau` (default `2.0`): higher = softer teacher distributions
+- `--w_distill_simcc` (default `1.0`): main distillation term (recommended to keep > 0)
+- `--w_distill_score` (default `0.1`): helps match document-presence confidence
+- `--w_distill_coord` (default `0.0`): optional (usually not needed if SimCC distillation is enabled)
+
+**Offline / no downloads:**
+- The teacher is reconstructed from weights; set `--teacher_backbone_weights none` to avoid
+  ImageNet weight downloads (default).
+- For the student: `--student_backbone_weights none` if you want to avoid downloading ImageNet weights.
+
+**Outputs (inside `output_dir/<experiment>_<timestamp>/`):**
+- `best_student.keras`, `best_student.weights.h5`, `best_student_inference.keras`
+- `final_student.keras`, `final_student.weights.h5`, `final_student_inference.keras`
+- `config.json`, `history.json`
 
 ### Evaluation
 
@@ -280,6 +367,7 @@ Configuration used for the reported results:
 ├── metrics.py                     # Evaluation metrics (IoU, corner error)
 ├── dataset.py                     # TF Dataset with augmentations
 ├── train.py                       # Training script
+├── train_student.py               # Student distillation training
 ├── evaluate.py                    # Evaluation script
 ├── export.py                      # Export to SavedModel/TFLite/ONNX
 ├── eval_tflite.py                 # TFLite evaluation

@@ -275,7 +275,7 @@ def apply_full_augmentation(
 # TensorFlow GPU Augmentations (fast, runs on GPU)
 # =============================================================================
 
-def tf_augment_batch(images, coords, has_doc, img_size=224):
+def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None):
     """
     Apply augmentation to a batch using TensorFlow ops (runs on GPU).
 
@@ -287,6 +287,7 @@ def tf_augment_batch(images, coords, has_doc, img_size=224):
         coords: [B, 8] float32 tensor
         has_doc: [B] float32 tensor
         img_size: Image size
+        is_outlier: [B] float32 tensor (1.0 for outlier, 0.0 for normal) or None
 
     Returns:
         augmented_images: [B, H, W, 3] float32
@@ -294,18 +295,39 @@ def tf_augment_batch(images, coords, has_doc, img_size=224):
     """
     batch_size = tf.shape(images)[0]
 
+    # Define augmentation strengths (normal vs outlier)
+    # Normal: brightness=0.2, contrast=0.8-1.2, saturation=0.85-1.15
+    # Outlier: brightness=0.3, contrast=0.7-1.3, saturation=0.8-1.2
+    if is_outlier is not None:
+        is_outlier = tf.reshape(tf.cast(is_outlier, tf.float32), [batch_size, 1, 1, 1])
+        # Interpolate augmentation strength based on outlier flag
+        brightness_range = 0.2 + 0.1 * tf.squeeze(is_outlier, axis=[1, 2, 3])  # 0.2 or 0.3
+        contrast_delta = 0.2 + 0.1 * tf.squeeze(is_outlier, axis=[1, 2, 3])    # 0.2 or 0.3
+        sat_delta = 0.15 + 0.05 * tf.squeeze(is_outlier, axis=[1, 2, 3])       # 0.15 or 0.2
+    else:
+        brightness_range = tf.fill([batch_size], 0.2)
+        contrast_delta = tf.fill([batch_size], 0.2)
+        sat_delta = tf.fill([batch_size], 0.15)
+
     # Random color augmentations (vectorized, per-sample random values)
-    # Brightness
-    brightness_delta = tf.random.uniform([batch_size, 1, 1, 1], -0.2, 0.2)
+    # Brightness (per-sample strength)
+    brightness_delta = tf.random.uniform([batch_size], -1.0, 1.0) * brightness_range
+    brightness_delta = tf.reshape(brightness_delta, [batch_size, 1, 1, 1])
     images = images + brightness_delta
 
-    # Contrast
-    contrast_factor = tf.random.uniform([batch_size, 1, 1, 1], 0.8, 1.2)
+    # Contrast (per-sample strength)
+    contrast_min = 1.0 - contrast_delta
+    contrast_max = 1.0 + contrast_delta
+    contrast_factor = tf.random.uniform([batch_size]) * (contrast_max - contrast_min) + contrast_min
+    contrast_factor = tf.reshape(contrast_factor, [batch_size, 1, 1, 1])
     mean = tf.reduce_mean(images, axis=[1, 2, 3], keepdims=True)
     images = (images - mean) * contrast_factor + mean
 
-    # Saturation (simplified: blend with grayscale)
-    sat_factor = tf.random.uniform([batch_size, 1, 1, 1], 0.8, 1.2)
+    # Saturation (per-sample strength)
+    sat_min = 1.0 - sat_delta
+    sat_max = 1.0 + sat_delta
+    sat_factor = tf.random.uniform([batch_size]) * (sat_max - sat_min) + sat_min
+    sat_factor = tf.reshape(sat_factor, [batch_size, 1, 1, 1])
     gray = tf.reduce_mean(images, axis=-1, keepdims=True)
     gray = tf.tile(gray, [1, 1, 1, 3])
     images = gray + sat_factor * (images - gray)
@@ -841,12 +863,12 @@ def create_fast_cached_dataset(
     batch_size: int = 32,
     shuffle: bool = True,
     drop_remainder: bool = True,
+    outlier_set: Optional[set] = None,
 ) -> tf.data.Dataset:
     """
-    Create ultra-fast dataset directly from numpy cache.
+    Create ultra-fast dataset from numpy cache.
 
-    This bypasses all PIL operations and loads directly from cached numpy arrays.
-    Augmentation should be done in TensorFlow after loading (on GPU).
+    Stores images as uint8 (~3.5GB for 23k images) and normalizes on GPU.
 
     Args:
         image_list: List of image names
@@ -856,27 +878,27 @@ def create_fast_cached_dataset(
         batch_size: Batch size
         shuffle: Whether to shuffle
         drop_remainder: Drop incomplete batches
+        outlier_set: Set of outlier image names (for stronger augmentation)
 
     Returns:
-        tf.data.Dataset yielding (image, {"has_doc": ..., "coords": ...})
+        tf.data.Dataset yielding (image, {"has_doc": ..., "coords": ..., "is_outlier": ...})
         Images are float32, normalized with ImageNet stats.
     """
-    # Pre-compute all data as numpy arrays
     n_samples = len(image_list)
-    all_images = np.zeros((n_samples, img_size, img_size, 3), dtype=np.float32)
+    outlier_set = outlier_set or set()
+
+    # Store images as uint8 to save memory (~3.5GB instead of ~14GB)
+    all_images = np.zeros((n_samples, img_size, img_size, 3), dtype=np.uint8)
     all_coords = np.zeros((n_samples, 8), dtype=np.float32)
     all_has_doc = np.zeros((n_samples,), dtype=np.float32)
+    all_is_outlier = np.zeros((n_samples,), dtype=np.float32)
 
-    mean = np.array(IMAGENET_MEAN, dtype=np.float32)
-    std = np.array(IMAGENET_STD, dtype=np.float32)
-
+    outlier_count = 0
     print(f"Preparing fast dataset with {n_samples} samples...")
     for i, name in enumerate(tqdm(image_list, desc="Preparing tensors", unit="img")):
-        # Get image from cache
+        # Get image from cache (keep as uint8)
         if name in shared_cache:
-            img = shared_cache[name].astype(np.float32) / 255.0
-            img = (img - mean) / std
-            all_images[i] = img
+            all_images[i] = shared_cache[name]
 
         # Get label
         if name in labels_dict:
@@ -884,20 +906,43 @@ def create_fast_cached_dataset(
             all_coords[i] = coords
             all_has_doc[i] = 1.0 if has_doc else 0.0
 
-    # Create TF dataset from tensors (FAST!)
+        # Check if outlier
+        if name in outlier_set:
+            all_is_outlier[i] = 1.0
+            outlier_count += 1
+
+    if outlier_count > 0:
+        print(f"  Outliers in dataset: {outlier_count}")
+
+    # Create TF dataset from uint8 images
     ds = tf.data.Dataset.from_tensor_slices({
-        "image": all_images,
+        "image": all_images,  # uint8, will normalize on GPU
         "coords": all_coords,
         "has_doc": all_has_doc,
+        "is_outlier": all_is_outlier,
     })
 
+    # Free the numpy arrays to save memory
+    del all_images
+
     if shuffle:
-        ds = ds.shuffle(buffer_size=n_samples, reshuffle_each_iteration=True)
+        ds = ds.shuffle(buffer_size=min(n_samples, 10000), reshuffle_each_iteration=True)
 
-    def format_sample(sample):
-        return sample["image"], {"has_doc": sample["has_doc"], "coords": sample["coords"]}
+    # ImageNet normalization constants as TF tensors
+    mean = tf.constant(IMAGENET_MEAN, dtype=tf.float32)
+    std = tf.constant(IMAGENET_STD, dtype=tf.float32)
 
-    ds = ds.map(format_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    def normalize_and_format(sample):
+        # Convert uint8 to float32 and normalize (fast on GPU)
+        image = tf.cast(sample["image"], tf.float32) / 255.0
+        image = (image - mean) / std
+        return image, {
+            "has_doc": sample["has_doc"],
+            "coords": sample["coords"],
+            "is_outlier": sample["is_outlier"],
+        }
+
+    ds = ds.map(normalize_and_format, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(batch_size, drop_remainder=drop_remainder)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
@@ -968,6 +1013,13 @@ def create_dataset(
                 label_path = label_dir / f"{Path(name).stem}.txt"
                 labels_dict[name] = load_yolo_label(str(label_path))
 
+        # Load outlier set if provided
+        outlier_set = None
+        if outlier_list:
+            outlier_set = load_outlier_list(outlier_list)
+            if outlier_set:
+                print(f"  Loaded {len(outlier_set)} outliers for fast_mode")
+
         return create_fast_cached_dataset(
             image_list=image_list,
             labels_dict=labels_dict,
@@ -976,6 +1028,7 @@ def create_dataset(
             batch_size=batch_size,
             shuffle=shuffle,
             drop_remainder=True,
+            outlier_set=outlier_set,
         )
 
     # Standard mode with PIL augmentations
