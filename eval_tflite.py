@@ -33,6 +33,13 @@ def parse_args():
                         help="Dataset split to evaluate")
     parser.add_argument("--img_size", type=int, default=224,
                         help="Input image size")
+    parser.add_argument(
+        "--input_norm",
+        type=str,
+        default="imagenet",
+        choices=["imagenet", "zero_one", "raw255"],
+        help="Input normalization applied before feeding the TFLite model",
+    )
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Max samples to evaluate (None = all)")
     parser.add_argument("--benchmark_runs", type=int, default=50,
@@ -110,16 +117,24 @@ def load_labels(data_root: Path, split: str):
     return samples
 
 
-def preprocess_image(image_path: Path, img_size: int) -> np.ndarray:
+def preprocess_image(image_path: Path, img_size: int, input_norm: str) -> np.ndarray:
     """Load and preprocess image for inference."""
     img = Image.open(image_path).convert("RGB")
     img = img.resize((img_size, img_size), Image.BILINEAR)
-    img = np.array(img, dtype=np.float32) / 255.0
+    img = np.array(img, dtype=np.float32)
 
-    # ImageNet normalization
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    img = (img - mean) / std
+    norm_mode = input_norm.lower().strip()
+    if norm_mode == "imagenet":
+        img = img / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img = (img - mean) / std
+    elif norm_mode in {"zero_one", "0_1", "01"}:
+        img = img / 255.0
+    elif norm_mode in {"raw255", "0_255", "0255"}:
+        pass
+    else:
+        raise ValueError(f"Unsupported input_norm='{input_norm}'. Use: imagenet, zero_one, raw255.")
 
     return img[np.newaxis, ...]  # Add batch dimension
 
@@ -291,8 +306,14 @@ class TFLiteModel:
         }
 
 
-def evaluate_model(model: TFLiteModel, samples: list, data_root: Path,
-                   img_size: int, num_samples: int = None) -> dict:
+def evaluate_model(
+    model: TFLiteModel,
+    samples: list,
+    data_root: Path,
+    img_size: int,
+    input_norm: str,
+    num_samples: int = None,
+) -> dict:
     """Evaluate model on samples."""
     if num_samples:
         samples = samples[:num_samples]
@@ -313,7 +334,7 @@ def evaluate_model(model: TFLiteModel, samples: list, data_root: Path,
         if not img_path.exists():
             continue
 
-        image = preprocess_image(img_path, img_size)
+        image = preprocess_image(img_path, img_size, input_norm=input_norm)
 
         # Run inference
         output = model.predict(image)
@@ -391,7 +412,14 @@ def main():
 
         # Evaluate accuracy
         print("\nEvaluating accuracy...")
-        metrics = evaluate_model(model, samples, data_root, args.img_size, args.num_samples)
+        metrics = evaluate_model(
+            model,
+            samples,
+            data_root,
+            args.img_size,
+            input_norm=args.input_norm,
+            num_samples=args.num_samples,
+        )
 
         print(f"\nResults:")
         print(f"  IoU:        {metrics['iou_mean']:.4f} ± {metrics['iou_std']:.4f}")

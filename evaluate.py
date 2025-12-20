@@ -35,6 +35,13 @@ def parse_args():
                         help="Dataset split to evaluate")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")
+    parser.add_argument(
+        "--input_norm",
+        type=str,
+        default="imagenet",
+        choices=["imagenet", "zero_one", "raw255"],
+        help="Input normalization for dataset images (must match how the checkpoint was trained)",
+    )
 
     # Model config (if loading weights only)
     parser.add_argument(
@@ -107,10 +114,14 @@ def load_model(args):
         with open(config_path) as f:
             config = json.load(f)
         backbone = config.get("backbone", args.backbone)
-        backbone_minimalistic = config.get("backbone_minimalistic", args.backbone_minimalistic)
-        backbone_include_preprocessing = config.get(
-            "backbone_include_preprocessing", args.backbone_include_preprocessing
+        backbone_minimalistic = args.backbone_minimalistic or config.get(
+            "backbone_minimalistic", False
         )
+        # CLI should be able to override config for backwards-compatible eval.
+        if args.backbone_include_preprocessing:
+            backbone_include_preprocessing = True
+        else:
+            backbone_include_preprocessing = bool(config.get("backbone_include_preprocessing", False))
         alpha = config.get("alpha", args.alpha)
         fpn_ch = config.get("fpn_ch", args.fpn_ch)
         simcc_ch = config.get("simcc_ch", args.simcc_ch)
@@ -147,7 +158,7 @@ def load_model(args):
                     img_size = inferred
             except Exception:
                 pass
-            return model, img_size
+            return model, img_size, backbone_include_preprocessing
         except Exception as e:
             print(f"Warning: failed to load serialized model from {model_path}: {e}")
 
@@ -188,7 +199,7 @@ def load_model(args):
     else:
         raise ValueError(f"Cannot load model from {model_path}")
 
-    return model, img_size
+    return model, img_size, backbone_include_preprocessing
 
 
 def main():
@@ -199,11 +210,13 @@ def main():
     print("=" * 60)
 
     # Load model
-    model, img_size = load_model(args)
+    model, img_size, backbone_include_preprocessing = load_model(args)
     print(f"Model parameters: {model.count_params():,}")
 
     # Create dataset
     print(f"\nLoading {args.split} dataset...")
+    input_norm = args.input_norm
+    print(f"Input normalization: {input_norm}")
     dataset = create_dataset(
         data_root=args.data_root,
         split=args.split,
@@ -212,6 +225,7 @@ def main():
         shuffle=False,
         augment=False,
         drop_remainder=False,
+        image_norm=input_norm,
     )
 
     # Evaluate

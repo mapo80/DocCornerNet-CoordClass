@@ -528,6 +528,7 @@ class DocCornerDataset:
         outlier_list: Optional[str] = None,
         negative_dir: str = "images-negative",
         shared_cache: Optional[Dict[str, np.ndarray]] = None,
+        image_norm: str = "imagenet",
     ):
         """
         Args:
@@ -546,6 +547,7 @@ class DocCornerDataset:
         self.augment = augment
         self.negative_dir = negative_dir
         self.shared_cache = shared_cache
+        self.image_norm = str(image_norm)
 
         # Setup directories
         self.image_dir = self.data_root / "images"
@@ -675,12 +677,26 @@ class DocCornerDataset:
             image = image.resize((self.img_size, self.img_size), Image.BILINEAR)
 
         # Convert to numpy
-        image_np = np.array(image, dtype=np.float32) / 255.0
+        image_np = np.array(image, dtype=np.float32)
 
-        # ImageNet normalization
-        mean = np.array(IMAGENET_MEAN, dtype=np.float32)
-        std = np.array(IMAGENET_STD, dtype=np.float32)
-        image_np = (image_np - mean) / std
+        # Input normalization
+        # - "imagenet": [0,255] -> [0,1] -> (x-mean)/std
+        # - "zero_one": [0,255] -> [0,1]
+        # - "raw255":   [0,255] (no scaling)
+        norm_mode = self.image_norm.lower().strip()
+        if norm_mode == "imagenet":
+            image_np = image_np / 255.0
+            mean = np.array(IMAGENET_MEAN, dtype=np.float32)
+            std = np.array(IMAGENET_STD, dtype=np.float32)
+            image_np = (image_np - mean) / std
+        elif norm_mode in {"zero_one", "0_1", "01"}:
+            image_np = image_np / 255.0
+        elif norm_mode in {"raw255", "0_255", "0255"}:
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported image_norm='{self.image_norm}'. Use: imagenet, zero_one, raw255."
+            )
 
         # Clamp coords
         coords = np.clip(coords, 0.0, 1.0)
@@ -865,6 +881,7 @@ def create_fast_cached_dataset(
     drop_remainder: bool = True,
     outlier_set: Optional[set] = None,
     outlier_weight: float = 1.0,
+    image_norm: str = "imagenet",
 ) -> tf.data.Dataset:
     """
     Create ultra-fast dataset from numpy cache.
@@ -935,14 +952,23 @@ def create_fast_cached_dataset(
     if shuffle:
         ds = ds.shuffle(buffer_size=min(n_samples, 10000), reshuffle_each_iteration=True)
 
-    # ImageNet normalization constants as TF tensors
-    mean = tf.constant(IMAGENET_MEAN, dtype=tf.float32)
-    std = tf.constant(IMAGENET_STD, dtype=tf.float32)
-
     def normalize_and_format(sample):
         # Convert uint8 to float32 and normalize (fast on GPU)
-        image = tf.cast(sample["image"], tf.float32) / 255.0
-        image = (image - mean) / std
+        norm_mode = image_norm.lower().strip()
+        image = tf.cast(sample["image"], tf.float32)
+        if norm_mode == "imagenet":
+            image = image / 255.0
+            mean = tf.constant(IMAGENET_MEAN, dtype=tf.float32)
+            std = tf.constant(IMAGENET_STD, dtype=tf.float32)
+            image = (image - mean) / std
+        elif norm_mode in {"zero_one", "0_1", "01"}:
+            image = image / 255.0
+        elif norm_mode in {"raw255", "0_255", "0255"}:
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported image_norm='{image_norm}'. Use: imagenet, zero_one, raw255."
+            )
         return image, {
             "has_doc": sample["has_doc"],
             "coords": sample["coords"],
@@ -971,6 +997,7 @@ def create_dataset(
     shared_cache: Optional[Dict[str, np.ndarray]] = None,
     fast_mode: bool = False,
     drop_remainder: bool = True,
+    image_norm: str = "imagenet",
 ) -> tf.data.Dataset:
     """
     Create TensorFlow dataset for DocCornerNetV3.
@@ -1038,6 +1065,7 @@ def create_dataset(
             drop_remainder=drop_remainder,
             outlier_set=outlier_set,
             outlier_weight=outlier_weight,
+            image_norm=image_norm,
         )
 
     # Standard mode with PIL augmentations
@@ -1051,6 +1079,7 @@ def create_dataset(
         outlier_list=outlier_list,
         negative_dir=negative_dir,
         shared_cache=shared_cache,
+        image_norm=image_norm,
     )
 
     if outlier_list and outlier_weight > 1.0 and shuffle:

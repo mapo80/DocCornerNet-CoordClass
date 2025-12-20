@@ -63,15 +63,25 @@ python train_student.py \
 python evaluate.py \
     --model_path ./checkpoints/best_model.weights.h5 \
     --data_root ./data \
-    --split test
+    --split test \
+    --input_norm imagenet \
+    --backbone_include_preprocessing
 
 # Student
 python evaluate.py \
     --model_path ./checkpoints_student/student_distill_*/best_student.weights.h5 \
     --data_root ./data \
     --split test \
+    --input_norm imagenet \
+    --backbone_include_preprocessing \
     --fpn_ch 32 \
     --simcc_ch 96
+
+# MobileNetV2 small
+python evaluate.py \
+    --model_path ./checkpoints/v3_mnv2_small_aug_outliers_20251220_111218 \
+    --data_root ./data \
+    --split test
 ```
 
 ### 6. Export to TFLite
@@ -80,18 +90,27 @@ python evaluate.py \
 # Teacher (float32)
 python export_tflite.py \
     --model_path ./checkpoints/best_model.weights.h5 \
-    --output ./exported_tflite/doccornernet_v3_224_float32.tflite
+    --output ./exported_tflite/doccornernet_v3_224_float32.tflite \
+    --backbone_include_preprocessing
 
 # Teacher (float16 - smaller)
 python export_tflite.py \
     --model_path ./checkpoints/best_model.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_224_float16.tflite \
-    --float16
+    --float16 \
+    --backbone_include_preprocessing
 
 # Student (float16)
 python export_tflite.py \
     --model_path ./checkpoints_student/student_distill_*/best_student.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_student_224_float16.tflite \
+    --float16 \
+    --backbone_include_preprocessing
+
+# MobileNetV2 small (float16)
+python export_tflite.py \
+    --model_path ./checkpoints/v3_mnv2_small_aug_outliers_20251220_111218/best_model.weights.h5 \
+    --output ./exported_tflite/doccornernet_v3_mnv2_small_float16.tflite \
     --float16
 ```
 
@@ -101,21 +120,25 @@ python export_tflite.py \
 
 ## Results
 
-### Expected Performance (after training)
+### Benchmarks (measured)
 
 | Model | Parameters | Mean IoU | Corner Error | R@90 | R@95 | TFLite (ms) | Size |
 |-------|------------|----------|--------------|------|------|-------------|------|
-| **Teacher** | 742,417 | ~98% | ~1.0 px | ~99% | ~97% | ~5 ms | 1.47 MB |
-| **Student** | 669,761 | ~97% | ~1.3 px | ~98% | ~95% | ~3.5 ms | 1.34 MB |
+| **Teacher (MNv3-S α=0.75)** | 742,417 | 98.27% | 0.95 px | 98.8% | 97.3% | 5.35 ms | 1.47 MB |
+| **Student (distill)** | 669,761 | 97.59% | 1.31 px | 98.3% | 94.4% | 4.02 ms | 1.34 MB |
+| **MobileNetV2 small (α=0.35)** | 495,353 | 97.90% | 1.18 px | 97.9% | 95.7% | 3.96 ms | 0.98 MB |
 
-*TFLite float16, Apple M2 Pro CPU, batch size 1.*
+Notes:
+- Accuracy: `evaluate.py` on `test_with_negative.txt` (IoU/Corner Error computed only on positives).
+- Latency/Size: `eval_tflite.py` float16, CPU (XNNPACK), batch size 1.
 
 ### Key Insights
 
-- **Teacher**: Best accuracy (~1px corner error, ~97% R@95)
-- **Student**: 1.5x faster, 10% fewer params, trades ~1% IoU
+- **Teacher**: best accuracy (≈0.95 px, R@95 ≈97.3%) but slower and larger.
+- **MobileNetV2 small**: best tradeoff (↓params, ↓size, fastest CPU; accuracy still ≥0.97 IoU).
+- **Student**: close to MNv2 on speed, but slightly worse IoU and recall.
 
-> **Note**: The pretrained checkpoints in this repo require retraining due to model architecture updates. Use the training commands above to train fresh models.
+> Note: `checkpoints/best_model.keras` may fail to load on Keras 3 due to legacy `Lambda` layers; use `checkpoints/best_model.weights.h5` for evaluation/export.
 
 ---
 

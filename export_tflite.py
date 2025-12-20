@@ -66,6 +66,11 @@ def parse_args():
     parser.add_argument("--backbone", type=str, default="mobilenetv3_small")
     parser.add_argument("--alpha", type=float, default=0.75)
     parser.add_argument("--backbone_minimalistic", action="store_true")
+    parser.add_argument(
+        "--backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing (legacy checkpoints may require this)",
+    )
     parser.add_argument("--fpn_ch", type=int, default=48)
     parser.add_argument("--simcc_ch", type=int, default=128)
     parser.add_argument("--img_size", type=int, default=224)
@@ -105,6 +110,10 @@ def find_config(model_path: Path, explicit_config: str = None) -> dict:
                 "backbone": raw_config.get("student_backbone", raw_config.get("backbone", "mobilenetv3_small")),
                 "alpha": raw_config.get("student_alpha", 0.75),
                 "backbone_minimalistic": raw_config.get("student_backbone_minimalistic", False),
+                "backbone_include_preprocessing": raw_config.get(
+                    "student_backbone_include_preprocessing",
+                    raw_config.get("backbone_include_preprocessing", False),
+                ),
                 "fpn_ch": raw_config.get("student_fpn_ch", 32),
                 "simcc_ch": raw_config.get("student_simcc_ch", 96),
                 "img_size": raw_config.get("img_size", 224),
@@ -261,6 +270,9 @@ def main():
     backbone = config.get("backbone", args.backbone)
     alpha = config.get("alpha", args.alpha)
     backbone_minimalistic = config.get("backbone_minimalistic", args.backbone_minimalistic)
+    backbone_include_preprocessing = args.backbone_include_preprocessing or config.get(
+        "backbone_include_preprocessing", False
+    )
     fpn_ch = config.get("fpn_ch", args.fpn_ch)
     simcc_ch = config.get("simcc_ch", args.simcc_ch)
     img_size = config.get("img_size", args.img_size)
@@ -271,6 +283,7 @@ def main():
     print(f"  backbone: {backbone}")
     print(f"  alpha: {alpha}")
     print(f"  backbone_minimalistic: {backbone_minimalistic}")
+    print(f"  backbone_include_preprocessing: {backbone_include_preprocessing}")
     print(f"  fpn_ch: {fpn_ch}")
     print(f"  simcc_ch: {simcc_ch}")
     print(f"  img_size: {img_size}")
@@ -282,7 +295,7 @@ def main():
         backbone=backbone,
         alpha=alpha,
         backbone_minimalistic=backbone_minimalistic,
-        backbone_include_preprocessing=False,
+        backbone_include_preprocessing=backbone_include_preprocessing,
         backbone_weights=None,  # Don't download weights
         fpn_ch=fpn_ch,
         simcc_ch=simcc_ch,
