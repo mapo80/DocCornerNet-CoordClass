@@ -2,7 +2,7 @@
 DocCornerNetV3: Document Corner Detection with SimCC (TensorFlow/Keras).
 
 Architecture:
-- Backbone: MobileNetV3Small (alpha=0.75) with ImageNet weights
+- Backbone: MobileNetV3Small/Large (alpha width multiplier, optional minimalistic variant)
 - Neck: Mini-FPN merging C2 (56x56), C3 (28x28), C4 (14x14)
 - Head: SimCC - direct 1D coordinate classification (MMPose style)
 - Output: 4 corner coordinates + document presence score
@@ -20,16 +20,116 @@ Target: <1M parameters, IoU >= 0.99 at 224x224
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from tensorflow.keras.utils import register_keras_serializable
 
 
-def _get_feature_layers(backbone):
+@register_keras_serializable(package="doccorner")
+class AxisMean(layers.Layer):
+    def __init__(self, axis: int, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = int(axis)
+
+    def call(self, inputs):
+        return tf.reduce_mean(inputs, axis=self.axis)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"axis": self.axis})
+        return config
+
+
+@register_keras_serializable(package="doccorner")
+class Resize1D(layers.Layer):
+    def __init__(self, target_length: int, method: str = "bilinear", **kwargs):
+        super().__init__(**kwargs)
+        self.target_length = int(target_length)
+        self.method = str(method)
+
+    def call(self, inputs):
+        # inputs: [B, L, C] -> [B, target_length, C]
+        x = tf.expand_dims(inputs, axis=2)  # [B, L, 1, C]
+        x = tf.image.resize(x, size=(self.target_length, 1), method=self.method)
+        return x[:, :, 0, :]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"target_length": self.target_length, "method": self.method})
+        return config
+
+
+@register_keras_serializable(package="doccorner")
+class Broadcast1D(layers.Layer):
+    def __init__(self, target_length: int, **kwargs):
+        super().__init__(**kwargs)
+        self.target_length = int(target_length)
+
+    def call(self, inputs):
+        # inputs: [B, C] -> [B, target_length, C]
+        x = inputs[:, None, :]
+        return tf.tile(x, [1, self.target_length, 1])
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"target_length": self.target_length})
+        return config
+
+
+@register_keras_serializable(package="doccorner")
+class SimCCDecode(layers.Layer):
+    """Decode SimCC logits to normalized coordinates using soft-argmax."""
+
+    def __init__(self, tau: float = 1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.tau = float(tau)
+
+    def call(self, inputs):
+        sx, sy = inputs  # [B, 4, num_bins]
+
+        sx = tf.cast(sx, tf.float32)
+        sy = tf.cast(sy, tf.float32)
+
+        bins = tf.shape(sx)[-1]
+        centers = tf.linspace(0.0, 1.0, bins)
+
+        px = tf.nn.softmax(sx / self.tau, axis=-1)
+        py = tf.nn.softmax(sy / self.tau, axis=-1)
+
+        x = tf.reduce_sum(px * centers[None, None, :], axis=-1)
+        y = tf.reduce_sum(py * centers[None, None, :], axis=-1)
+
+        coords = tf.stack(
+            [
+                x[:, 0],
+                y[:, 0],
+                x[:, 1],
+                y[:, 1],
+                x[:, 2],
+                y[:, 2],
+                x[:, 3],
+                y[:, 3],
+            ],
+            axis=-1,
+        )
+        return tf.clip_by_value(coords, 0.0, 1.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"tau": self.tau})
+        return config
+
+
+def _get_feature_layers(backbone, img_size: int):
     """
-    Extract multi-scale feature layers from MobileNetV3Small backbone.
+    Extract multi-scale feature layers from a conv backbone.
 
     Returns outputs at different scales:
-    - C2: 56x56, C3: 28x28, C4: 14x14, C5: 7x7
+    - C2: img/4, C3: img/8, C4: img/16, C5: img/32
     """
     c2 = c3 = c4 = c5 = None
+    c2_hw = img_size // 4
+    c3_hw = img_size // 8
+    c4_hw = img_size // 16
+    c5_hw = img_size // 32
 
     for layer in backbone.layers:
         out = layer.output
@@ -39,20 +139,75 @@ def _get_feature_layers(backbone):
         _, h, w, c = out.shape
         if h == 1 and w == 1:
             continue
+        if h is None or w is None:
+            continue
+        if h != w:
+            continue
 
-        if h == 56 and w == 56:
+        if h == c2_hw and w == c2_hw:
             c2 = out
-        elif h == 28 and w == 28:
+        elif h == c3_hw and w == c3_hw:
             c3 = out
-        elif h == 14 and w == 14:
+        elif h == c4_hw and w == c4_hw:
             c4 = out
-        elif h == 7 and w == 7:
+        elif h == c5_hw and w == c5_hw:
             c5 = out
 
     if c2 is None or c3 is None or c4 is None or c5 is None:
         raise ValueError("Could not find all feature scales in backbone")
 
     return c2, c3, c4, c5
+
+
+def _build_backbone(
+    inp,
+    backbone: str,
+    alpha: float,
+    backbone_weights,
+    backbone_minimalistic: bool,
+    backbone_include_preprocessing: bool,
+) -> keras.Model:
+    backbone_key = backbone.strip().lower().replace("-", "_")
+
+    if backbone_key in {"mobilenetv3_small", "mobilenet_v3_small", "mnetv3_small"}:
+        return keras.applications.MobileNetV3Small(
+            input_tensor=inp,
+            include_top=False,
+            weights=backbone_weights,
+            alpha=alpha,
+            minimalistic=backbone_minimalistic,
+            include_preprocessing=backbone_include_preprocessing,
+        )
+
+    if backbone_key in {"mobilenetv3_large", "mobilenet_v3_large", "mnetv3_large"}:
+        return keras.applications.MobileNetV3Large(
+            input_tensor=inp,
+            include_top=False,
+            weights=backbone_weights,
+            alpha=alpha,
+            minimalistic=backbone_minimalistic,
+            include_preprocessing=backbone_include_preprocessing,
+        )
+
+    if backbone_key in {"mobilenetv2", "mobilenet_v2", "mnetv2"}:
+        if backbone_minimalistic:
+            raise ValueError("backbone_minimalistic is only supported for MobileNetV3.")
+        if backbone_include_preprocessing:
+            x = layers.Rescaling(1.0 / 127.5, offset=-1.0, name="backbone_preprocess")(inp)
+            input_tensor = x
+        else:
+            input_tensor = inp
+        return keras.applications.MobileNetV2(
+            input_tensor=input_tensor,
+            include_top=False,
+            weights=backbone_weights,
+            alpha=alpha,
+        )
+
+    raise ValueError(
+        f"Unsupported backbone='{backbone}'. "
+        "Use one of: mobilenetv2, mobilenetv3_small, mobilenetv3_large."
+    )
 
 
 def _separable_conv_block(x, filters, name):
@@ -74,6 +229,9 @@ def build_doccorner_simcc_v3(
     tau: float = 1.0,
     score_init_bias: float = 1.75,
     backbone_weights="imagenet",
+    backbone: str = "mobilenetv3_small",
+    backbone_minimalistic: bool = False,
+    backbone_include_preprocessing: bool = False,
 ):
     """
     Build DocCornerNetV3 model with correct SimCC (MMPose style).
@@ -84,7 +242,11 @@ def build_doccorner_simcc_v3(
     - Soft-argmax → coords [B, 8]
 
     Args:
-        alpha: MobileNetV3 width multiplier (0.75 or 1.0)
+        backbone: Backbone architecture ('mobilenetv3_small' or 'mobilenetv3_large')
+        alpha: Backbone width multiplier (alpha)
+        backbone_minimalistic: Use MobileNetV3 minimalistic variant
+        backbone_include_preprocessing: Use built-in backbone preprocessing layers
+        backbone_weights: Backbone initialization weights ('imagenet' or None)
         fpn_ch: FPN intermediate channels
         simcc_ch: SimCC head hidden channels
         img_size: Input image size (default 224)
@@ -98,17 +260,18 @@ def build_doccorner_simcc_v3(
     inp = keras.Input((img_size, img_size, 3), name="image")
 
     # =========================================================================
-    # Backbone: MobileNetV3Small (optionally ImageNet pretrained)
+    # Backbone (optionally ImageNet pretrained)
     # =========================================================================
-    backbone = keras.applications.MobileNetV3Small(
-        input_tensor=inp,
-        include_top=False,
-        weights=backbone_weights,
+    backbone_model = _build_backbone(
+        inp=inp,
+        backbone=backbone,
         alpha=alpha,
-        include_preprocessing=True,
+        backbone_weights=backbone_weights,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
     )
 
-    c2, c3, c4, c5 = _get_feature_layers(backbone)
+    c2, c3, c4, c5 = _get_feature_layers(backbone_model, img_size=img_size)
 
     # =========================================================================
     # Mini-FPN: Merge multi-scale features
@@ -150,29 +313,16 @@ def build_doccorner_simcc_v3(
 
     # Generate X marginals: reduce along Y axis (vertical pooling)
     # [B, 56, 56, fpn_ch] -> [B, 56, fpn_ch] via mean along axis 1
-    x_marginal = layers.Lambda(
-        lambda t: tf.reduce_mean(t, axis=1),
-        name="x_marginal_pool"
-    )(p_fused)  # [B, 56, fpn_ch]
+    x_marginal = AxisMean(axis=1, name="x_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
 
     # Generate Y marginals: reduce along X axis (horizontal pooling)
     # [B, 56, 56, fpn_ch] -> [B, 56, fpn_ch] via mean along axis 2
-    y_marginal = layers.Lambda(
-        lambda t: tf.reduce_mean(t, axis=2),
-        name="y_marginal_pool"
-    )(p_fused)  # [B, 56, fpn_ch]
+    y_marginal = AxisMean(axis=2, name="y_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
 
     # Upsample marginals to num_bins resolution
     # [B, 56, fpn_ch] -> [B, num_bins, fpn_ch]
-    x_marginal = layers.Lambda(
-        lambda t, nb=num_bins: tf.image.resize(t[:, :, None, :], (nb, 1))[:, :, 0, :],
-        name="x_marginal_resize"
-    )(x_marginal)  # [B, 224, fpn_ch]
-
-    y_marginal = layers.Lambda(
-        lambda t, nb=num_bins: tf.image.resize(t[:, :, None, :], (nb, 1))[:, :, 0, :],
-        name="y_marginal_resize"
-    )(y_marginal)  # [B, 224, fpn_ch]
+    x_marginal = Resize1D(target_length=num_bins, name="x_marginal_resize")(x_marginal)  # [B, 224, fpn_ch]
+    y_marginal = Resize1D(target_length=num_bins, name="y_marginal_resize")(y_marginal)  # [B, 224, fpn_ch]
 
     # 1D convolutions for coordinate refinement along each axis
     x_feat = layers.Conv1D(simcc_ch, 5, padding="same", name="simcc_x_conv1")(x_marginal)
@@ -196,14 +346,8 @@ def build_doccorner_simcc_v3(
 
     # Broadcast global features to each position
     # [B, simcc_ch//2] -> [B, num_bins, simcc_ch//2]
-    global_x = layers.Lambda(
-        lambda t, nb=num_bins: tf.tile(t[:, None, :], [1, nb, 1]),
-        name="global_x_broadcast"
-    )(global_feat)
-    global_y = layers.Lambda(
-        lambda t, nb=num_bins: tf.tile(t[:, None, :], [1, nb, 1]),
-        name="global_y_broadcast"
-    )(global_feat)
+    global_x = Broadcast1D(target_length=num_bins, name="global_x_broadcast")(global_feat)
+    global_y = Broadcast1D(target_length=num_bins, name="global_y_broadcast")(global_feat)
 
     # Concatenate local and global features
     x_feat = layers.Concatenate(name="simcc_x_cat")([x_feat, global_x])  # [B, 224, simcc_ch]
@@ -227,42 +371,7 @@ def build_doccorner_simcc_v3(
     )(y_feat)  # [B, 224, 4]
     simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)  # [B, 4, 224]
 
-    # =========================================================================
-    # Coordinate Decode: Soft-argmax
-    # =========================================================================
-    def decode_coords(inputs):
-        """Decode SimCC logits to normalized coordinates using soft-argmax."""
-        sx, sy = inputs  # [B, 4, num_bins]
-
-        sx = tf.cast(sx, tf.float32)
-        sy = tf.cast(sy, tf.float32)
-
-        bins = tf.shape(sx)[-1]
-        centers = tf.linspace(0.0, 1.0, bins)
-
-        # Softmax with temperature
-        px = tf.nn.softmax(sx / tau, axis=-1)
-        py = tf.nn.softmax(sy / tau, axis=-1)
-
-        # Expected value (soft-argmax)
-        x = tf.reduce_sum(px * centers[None, None, :], axis=-1)
-        y = tf.reduce_sum(py * centers[None, None, :], axis=-1)
-
-        # Interleave to [x0, y0, x1, y1, x2, y2, x3, y3]
-        coords = tf.stack([
-            x[:, 0], y[:, 0],
-            x[:, 1], y[:, 1],
-            x[:, 2], y[:, 2],
-            x[:, 3], y[:, 3],
-        ], axis=-1)
-
-        return tf.clip_by_value(coords, 0.0, 1.0)
-
-    coords = layers.Lambda(
-        decode_coords,
-        output_shape=(8,),
-        name="coords"
-    )([simcc_x, simcc_y])
+    coords = SimCCDecode(tau=tau, name="coords")([simcc_x, simcc_y])
 
     # =========================================================================
     # Score Head: Document presence classification
@@ -300,6 +409,9 @@ def create_model(
     tau: float = 1.0,
     score_init_bias: float = 1.75,
     backbone_weights="imagenet",
+    backbone: str = "mobilenetv3_small",
+    backbone_minimalistic: bool = False,
+    backbone_include_preprocessing: bool = False,
 ):
     """
     Factory function to create DocCornerNetV3 training model with SimCC.
@@ -331,7 +443,20 @@ def create_model(
         tau=tau,
         score_init_bias=score_init_bias,
         backbone_weights=backbone_weights,
+        backbone=backbone,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
     )
+
+
+def build_doccorner_simcc_v3_inference(**model_kwargs) -> keras.Model:
+    """
+    Backwards-compatible inference-model builder.
+
+    Returns a model with outputs: [coords, score_logit].
+    """
+    train_model = create_model(**model_kwargs)
+    return create_inference_model(train_model)
 
 
 def create_inference_model(train_model):

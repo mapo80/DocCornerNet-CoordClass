@@ -864,6 +864,7 @@ def create_fast_cached_dataset(
     shuffle: bool = True,
     drop_remainder: bool = True,
     outlier_set: Optional[set] = None,
+    outlier_weight: float = 1.0,
 ) -> tf.data.Dataset:
     """
     Create ultra-fast dataset from numpy cache.
@@ -886,6 +887,12 @@ def create_fast_cached_dataset(
     """
     n_samples = len(image_list)
     outlier_set = outlier_set or set()
+
+    if shuffle and outlier_set and outlier_weight and outlier_weight > 1.0:
+        weights = [outlier_weight if name in outlier_set else 1.0 for name in image_list]
+        indices = list(range(n_samples))
+        sampled_indices = random.choices(indices, weights=weights, k=n_samples)
+        image_list = [image_list[i] for i in sampled_indices]
 
     # Store images as uint8 to save memory (~3.5GB instead of ~14GB)
     all_images = np.zeros((n_samples, img_size, img_size, 3), dtype=np.uint8)
@@ -963,6 +970,7 @@ def create_dataset(
     negative_dir: str = "images-negative",
     shared_cache: Optional[Dict[str, np.ndarray]] = None,
     fast_mode: bool = False,
+    drop_remainder: bool = True,
 ) -> tf.data.Dataset:
     """
     Create TensorFlow dataset for DocCornerNetV3.
@@ -1027,8 +1035,9 @@ def create_dataset(
             img_size=img_size,
             batch_size=batch_size,
             shuffle=shuffle,
-            drop_remainder=True,
+            drop_remainder=drop_remainder,
             outlier_set=outlier_set,
+            outlier_weight=outlier_weight,
         )
 
     # Standard mode with PIL augmentations
@@ -1049,14 +1058,14 @@ def create_dataset(
             dataset,
             batch_size=batch_size,
             outlier_weight=outlier_weight,
-            drop_remainder=True,
+            drop_remainder=drop_remainder,
         )
     else:
         return create_tf_dataset(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            drop_remainder=True,
+            drop_remainder=drop_remainder,
         )
 
 

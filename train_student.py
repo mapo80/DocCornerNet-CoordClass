@@ -108,6 +108,23 @@ def parse_args():
     parser.add_argument("--teacher_simcc_ch", type=int, default=128)
     parser.add_argument("--teacher_tau", type=float, default=1.0)
     parser.add_argument(
+        "--teacher_backbone",
+        type=str,
+        default="mobilenetv3_small",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"],
+        help="Teacher backbone architecture",
+    )
+    parser.add_argument(
+        "--teacher_backbone_minimalistic",
+        action="store_true",
+        help="Use MobileNetV3 minimalistic variant for teacher",
+    )
+    parser.add_argument(
+        "--teacher_backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing for teacher (expects raw uint8/0-255 inputs)",
+    )
+    parser.add_argument(
         "--teacher_backbone_weights",
         type=str,
         default=None,
@@ -121,6 +138,23 @@ def parse_args():
 
     # Student architecture
     parser.add_argument("--student_alpha", type=float, default=0.5, help="Student backbone width")
+    parser.add_argument(
+        "--student_backbone",
+        type=str,
+        default="mobilenetv3_small",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"],
+        help="Student backbone architecture",
+    )
+    parser.add_argument(
+        "--student_backbone_minimalistic",
+        action="store_true",
+        help="Use MobileNetV3 minimalistic variant for student",
+    )
+    parser.add_argument(
+        "--student_backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing for student (expects raw uint8/0-255 inputs)",
+    )
     parser.add_argument("--student_fpn_ch", type=int, default=32, help="Student FPN channels")
     parser.add_argument("--student_simcc_ch", type=int, default=96, help="Student head channels")
     parser.add_argument(
@@ -182,6 +216,9 @@ def _load_teacher_kwargs(args) -> dict:
             config_path = candidate
 
     teacher_kwargs = {
+        "backbone": args.teacher_backbone,
+        "backbone_minimalistic": args.teacher_backbone_minimalistic,
+        "backbone_include_preprocessing": args.teacher_backbone_include_preprocessing,
         "alpha": args.teacher_alpha,
         "fpn_ch": args.teacher_fpn_ch,
         "simcc_ch": args.teacher_simcc_ch,
@@ -193,6 +230,13 @@ def _load_teacher_kwargs(args) -> dict:
     if config_path and config_path.exists():
         with open(config_path) as f:
             cfg = json.load(f)
+        teacher_kwargs["backbone"] = cfg.get("backbone", teacher_kwargs["backbone"])
+        teacher_kwargs["backbone_minimalistic"] = cfg.get(
+            "backbone_minimalistic", teacher_kwargs["backbone_minimalistic"]
+        )
+        teacher_kwargs["backbone_include_preprocessing"] = cfg.get(
+            "backbone_include_preprocessing", teacher_kwargs["backbone_include_preprocessing"]
+        )
         teacher_kwargs["alpha"] = cfg.get("alpha", teacher_kwargs["alpha"])
         teacher_kwargs["fpn_ch"] = cfg.get("fpn_ch", teacher_kwargs["fpn_ch"])
         teacher_kwargs["simcc_ch"] = cfg.get("simcc_ch", teacher_kwargs["simcc_ch"])
@@ -686,7 +730,10 @@ def main():
     # Teacher
     print("\nLoading teacher...")
     teacher = create_model(
+        backbone=teacher_kwargs["backbone"],
         alpha=teacher_kwargs["alpha"],
+        backbone_minimalistic=teacher_kwargs["backbone_minimalistic"],
+        backbone_include_preprocessing=teacher_kwargs["backbone_include_preprocessing"],
         fpn_ch=teacher_kwargs["fpn_ch"],
         simcc_ch=teacher_kwargs["simcc_ch"],
         img_size=teacher_kwargs["img_size"],
@@ -701,7 +748,10 @@ def main():
     # Student
     print("\nCreating student...")
     student = create_model(
+        backbone=args.student_backbone,
         alpha=args.student_alpha,
+        backbone_minimalistic=args.student_backbone_minimalistic,
+        backbone_include_preprocessing=args.student_backbone_include_preprocessing,
         fpn_ch=args.student_fpn_ch,
         simcc_ch=args.student_simcc_ch,
         img_size=args.img_size,

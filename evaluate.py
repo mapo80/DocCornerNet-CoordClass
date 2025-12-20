@@ -7,6 +7,7 @@ Evaluates a trained model and reports detailed metrics.
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import tensorflow as tf
@@ -36,48 +37,131 @@ def parse_args():
                         help="Batch size")
 
     # Model config (if loading weights only)
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="mobilenetv3_small",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"],
+        help="Backbone architecture",
+    )
     parser.add_argument("--alpha", type=float, default=0.75,
-                        help="MobileNetV3 width multiplier (0.75 or 1.0)")
+                        help="Backbone width multiplier (alpha)")
+    parser.add_argument(
+        "--backbone_minimalistic",
+        action="store_true",
+        help="Use MobileNetV3 minimalistic variant (faster, more quantization-friendly)",
+    )
+    parser.add_argument(
+        "--backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing (expects raw uint8/0-255 inputs)",
+    )
+    parser.add_argument(
+        "--backbone_weights",
+        type=str,
+        default=None,
+        help="Backbone init weights ('imagenet' or None). None avoids downloads.",
+    )
     parser.add_argument("--fpn_ch", type=int, default=48,
                         help="FPN channels")
-    parser.add_argument("--dec_ch", type=int, default=32,
-                        help="Decoder channels")
+    parser.add_argument("--simcc_ch", type=int, default=128,
+                        help="SimCC head channels")
     parser.add_argument("--img_size", type=int, default=224,
                         help="Input image size")
+    parser.add_argument("--num_bins", type=int, default=224,
+                        help="Number of bins for coordinate classification")
     parser.add_argument("--tau", type=float, default=1.0,
                         help="Softmax temperature")
 
     return parser.parse_args()
 
 
+def _normalize_backbone_weights(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return None
+    return value
+
+
+def _find_config_path(model_path: Path) -> Optional[Path]:
+    candidates = []
+    if model_path.is_dir():
+        candidates.extend([model_path / "config.json", model_path.parent / "config.json"])
+    else:
+        candidates.extend([model_path.parent / "config.json"])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def load_model(args):
     """Load model from path (SavedModel or weights)."""
     model_path = Path(args.model_path)
 
-    # Try to load config if available
-    config_path = model_path.parent / "config.json"
-    if config_path.exists():
+    # Try to load config if available (to reconstruct architecture for weights-only)
+    config_path = _find_config_path(model_path)
+    if config_path and config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
+        backbone = config.get("backbone", args.backbone)
+        backbone_minimalistic = config.get("backbone_minimalistic", args.backbone_minimalistic)
+        backbone_include_preprocessing = config.get(
+            "backbone_include_preprocessing", args.backbone_include_preprocessing
+        )
         alpha = config.get("alpha", args.alpha)
         fpn_ch = config.get("fpn_ch", args.fpn_ch)
-        dec_ch = config.get("dec_ch", args.dec_ch)
+        simcc_ch = config.get("simcc_ch", args.simcc_ch)
         img_size = config.get("img_size", args.img_size)
+        num_bins = config.get("num_bins", args.num_bins)
         tau = config.get("tau", args.tau)
         print(f"Loaded config from {config_path}")
     else:
+        backbone = args.backbone
+        backbone_minimalistic = args.backbone_minimalistic
+        backbone_include_preprocessing = args.backbone_include_preprocessing
         alpha = args.alpha
         fpn_ch = args.fpn_ch
-        dec_ch = args.dec_ch
+        simcc_ch = args.simcc_ch
         img_size = args.img_size
+        num_bins = args.num_bins
         tau = args.tau
 
-    # Create model
+    # Load serialized model if possible (.keras or SavedModel directory)
+    def _try_load_serialized(p: Path):
+        try:
+            return keras.models.load_model(str(p), compile=False, safe_mode=False)
+        except TypeError:
+            # Older TF/Keras versions don't support safe_mode.
+            return keras.models.load_model(str(p), compile=False)
+
+    if model_path.is_dir() or model_path.suffix == ".keras":
+        try:
+            model = _try_load_serialized(model_path)
+            print(f"Loaded model from {model_path}")
+            try:
+                inferred = model.input_shape[1]
+                if isinstance(inferred, int):
+                    img_size = inferred
+            except Exception:
+                pass
+            return model, img_size
+        except Exception as e:
+            print(f"Warning: failed to load serialized model from {model_path}: {e}")
+
+    # Otherwise: create model and load weights
     model = create_model(
+        backbone=backbone,
         alpha=alpha,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_weights=_normalize_backbone_weights(args.backbone_weights),
         fpn_ch=fpn_ch,
-        dec_ch=dec_ch,
+        simcc_ch=simcc_ch,
         img_size=img_size,
+        num_bins=num_bins,
         tau=tau,
     )
 
@@ -86,18 +170,21 @@ def load_model(args):
         model.load_weights(str(model_path))
         print(f"Loaded weights from {model_path}")
     elif model_path.is_dir():
-        # Try to load as SavedModel
-        try:
-            model = keras.models.load_model(str(model_path))
-            print(f"Loaded SavedModel from {model_path}")
-        except:
-            # Try to find weights file
-            for weights_file in ["best_iou_weights.h5", "final_weights.h5", "latest_weights.h5"]:
-                weights_path = model_path / weights_file
-                if weights_path.exists():
-                    model.load_weights(str(weights_path))
-                    print(f"Loaded weights from {weights_path}")
-                    break
+        # Try to find weights file in directory
+        for weights_file in [
+            "best_model.weights.h5",
+            "final_model.weights.h5",
+            "latest_weights.h5",
+            "best_iou_weights.h5",
+            "final_weights.h5",
+        ]:
+            weights_path = model_path / weights_file
+            if weights_path.exists():
+                model.load_weights(str(weights_path))
+                print(f"Loaded weights from {weights_path}")
+                break
+        else:
+            raise ValueError(f"Cannot find weights in directory {model_path}")
     else:
         raise ValueError(f"Cannot load model from {model_path}")
 
@@ -124,6 +211,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         augment=False,
+        drop_remainder=False,
     )
 
     # Evaluate
@@ -133,8 +221,13 @@ def main():
     for images, targets in tqdm(dataset, desc="Evaluating"):
         outputs = model(images, training=False)
 
-        coords_pred = outputs["coords"].numpy()
-        score_logit = outputs["score_logit"].numpy()
+        # Support both training model (dict outputs) and inference model (tuple/list outputs)
+        if isinstance(outputs, (list, tuple)) and len(outputs) == 2:
+            coords_pred = outputs[0].numpy()
+            score_logit = outputs[1].numpy()
+        else:
+            coords_pred = outputs["coords"].numpy()
+            score_logit = outputs["score_logit"].numpy()
         score_pred = 1.0 / (1.0 + np.exp(-score_logit))  # sigmoid
 
         coords_gt = targets["coords"].numpy()

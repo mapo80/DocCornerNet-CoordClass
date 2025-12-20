@@ -11,12 +11,13 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from model import create_model, build_doccorner_simcc_v3_inference
+from model import create_model, create_inference_model
 
 
 def parse_args():
@@ -35,12 +36,37 @@ def parse_args():
                         help="Export formats")
 
     # Model config
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="mobilenetv3_small",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"],
+        help="Backbone architecture",
+    )
     parser.add_argument("--alpha", type=float, default=0.75,
-                        help="MobileNetV3 width multiplier (0.75 or 1.0)")
+                        help="Backbone width multiplier (alpha)")
+    parser.add_argument(
+        "--backbone_minimalistic",
+        action="store_true",
+        help="Use MobileNetV3 minimalistic variant (faster, more quantization-friendly)",
+    )
+    parser.add_argument(
+        "--backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing (expects raw uint8/0-255 inputs)",
+    )
+    parser.add_argument(
+        "--backbone_weights",
+        type=str,
+        default=None,
+        help="Backbone init weights ('imagenet' or None). None avoids downloads.",
+    )
     parser.add_argument("--fpn_ch", type=int, default=48,
                         help="FPN channels")
-    parser.add_argument("--dec_ch", type=int, default=32,
-                        help="Decoder channels")
+    parser.add_argument("--simcc_ch", type=int, default=128,
+                        help="SimCC head channels")
+    parser.add_argument("--num_bins", type=int, default=224,
+                        help="Number of bins for coordinate classification")
     parser.add_argument("--img_size", type=int, default=224,
                         help="Input image size")
     parser.add_argument("--tau", type=float, default=1.0,
@@ -53,60 +79,98 @@ def parse_args():
     return parser.parse_args()
 
 
+def _normalize_backbone_weights(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return None
+    return value
+
+
+def _find_config_path(weights_path: Path) -> Optional[Path]:
+    candidates = []
+    if weights_path.is_dir():
+        candidates.extend([weights_path / "config.json", weights_path.parent / "config.json"])
+    else:
+        candidates.extend([weights_path.parent / "config.json"])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def load_model_weights(args):
     """Load model with weights."""
     weights_path = Path(args.weights)
 
     # Try to load config
-    config_path = weights_path.parent / "config.json"
-    if config_path.exists():
+    config_path = _find_config_path(weights_path)
+    if config_path and config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
+        backbone = config.get("backbone", args.backbone)
+        backbone_minimalistic = config.get("backbone_minimalistic", args.backbone_minimalistic)
+        backbone_include_preprocessing = config.get(
+            "backbone_include_preprocessing", args.backbone_include_preprocessing
+        )
         alpha = config.get("alpha", args.alpha)
         fpn_ch = config.get("fpn_ch", args.fpn_ch)
-        dec_ch = config.get("dec_ch", args.dec_ch)
+        simcc_ch = config.get("simcc_ch", args.simcc_ch)
+        num_bins = config.get("num_bins", args.num_bins)
         img_size = config.get("img_size", args.img_size)
         tau = config.get("tau", args.tau)
         print(f"Loaded config from {config_path}")
     else:
+        backbone = args.backbone
+        backbone_minimalistic = args.backbone_minimalistic
+        backbone_include_preprocessing = args.backbone_include_preprocessing
         alpha = args.alpha
         fpn_ch = args.fpn_ch
-        dec_ch = args.dec_ch
+        simcc_ch = args.simcc_ch
+        num_bins = args.num_bins
         img_size = args.img_size
         tau = args.tau
 
-    # Create inference model (simpler outputs)
-    model = build_doccorner_simcc_v3_inference(
+    def _try_load_serialized(p: Path):
+        try:
+            return keras.models.load_model(str(p), compile=False, safe_mode=False)
+        except TypeError:
+            return keras.models.load_model(str(p), compile=False)
+
+    # If a full model was provided, load it directly.
+    if weights_path.is_dir() or weights_path.suffix == ".keras":
+        model = _try_load_serialized(weights_path)
+        print(f"Loaded model from {weights_path}")
+        try:
+            inferred = model.input_shape[1]
+            if isinstance(inferred, int):
+                img_size = inferred
+        except Exception:
+            pass
+        return model, img_size
+
+    # Otherwise, build training model, load weights, then derive inference model.
+    train_model = create_model(
+        backbone=backbone,
         alpha=alpha,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_weights=_normalize_backbone_weights(args.backbone_weights),
         fpn_ch=fpn_ch,
-        dec_ch=dec_ch,
+        simcc_ch=simcc_ch,
         img_size=img_size,
+        num_bins=num_bins,
         tau=tau,
     )
 
-    # Load weights
     if weights_path.suffix == ".h5":
-        # Load into training model first, then copy relevant weights
-        train_model = create_model(
-            alpha=alpha,
-            fpn_ch=fpn_ch,
-            dec_ch=dec_ch,
-            img_size=img_size,
-            tau=tau,
-        )
         train_model.load_weights(str(weights_path))
-
-        # The inference model shares the same backbone structure
-        # Copy weights layer by layer
-        for layer in model.layers:
-            try:
-                weights = train_model.get_layer(layer.name).get_weights()
-                if weights:
-                    layer.set_weights(weights)
-            except (ValueError, KeyError):
-                pass
-
         print(f"Loaded weights from {weights_path}")
+    else:
+        raise ValueError(f"Unsupported weights file: {weights_path}")
+
+    model = create_inference_model(train_model)
 
     return model, img_size
 
@@ -115,16 +179,10 @@ def export_savedmodel(model, output_path: Path, img_size: int):
     """Export to SavedModel format."""
     print(f"\nExporting SavedModel to {output_path}...")
 
-    # Define concrete function with fixed input shape
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, img_size, img_size, 3], dtype=tf.float32, name="input")
-    ])
-    def serving_fn(x):
-        outputs = model(x, training=False)
-        return outputs
-
-    # Save with signatures
-    model.save(str(output_path), save_format="tf")
+    if hasattr(model, "export"):
+        model.export(str(output_path))
+    else:
+        model.save(str(output_path), save_format="tf")
 
     # Get model size
     size_mb = sum(

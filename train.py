@@ -101,8 +101,31 @@ def parse_args():
                         help="Ultra-fast mode: load all data as tensors, augment on GPU")
 
     # Model
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="mobilenetv3_small",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"],
+        help="Backbone architecture",
+    )
     parser.add_argument("--alpha", type=float, default=0.75,
-                        help="MobileNetV3 width multiplier (0.75 or 1.0)")
+                        help="Backbone width multiplier (alpha)")
+    parser.add_argument(
+        "--backbone_minimalistic",
+        action="store_true",
+        help="Use MobileNetV3 minimalistic variant (faster, more quantization-friendly)",
+    )
+    parser.add_argument(
+        "--backbone_include_preprocessing",
+        action="store_true",
+        help="Enable built-in backbone preprocessing (expects raw uint8/0-255 inputs)",
+    )
+    parser.add_argument(
+        "--backbone_weights",
+        type=str,
+        default="imagenet",
+        help="Backbone init weights ('imagenet' or None). None avoids downloads.",
+    )
     parser.add_argument("--fpn_ch", type=int, default=48,
                         help="FPN channels")
     parser.add_argument("--simcc_ch", type=int, default=128,
@@ -153,6 +176,14 @@ def parse_args():
                         help="Experiment name")
 
     return parser.parse_args()
+
+
+def _normalize_backbone_weights(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return None
+    return value
 
 
 class DocCornerNetV3Trainer:
@@ -297,10 +328,12 @@ class DocCornerNetV3Trainer:
         """Single training step."""
         coords = targets["coords"]
         has_doc = targets["has_doc"]
+        # is_outlier may be present in fast_mode datasets
+        is_outlier = targets["is_outlier"] if "is_outlier" in targets else None
 
         # Apply TF augmentation on GPU (fast_mode)
         if apply_augment:
-            images, coords = tf_augment_batch(images, coords, has_doc, self.img_size)
+            images, coords = tf_augment_batch(images, coords, has_doc, self.img_size, is_outlier)
             targets = {"coords": coords, "has_doc": has_doc}
 
         with tf.GradientTape() as tape:
@@ -529,7 +562,7 @@ def main():
         augment=args.augment if not use_fast_mode else False,  # Augment on GPU in fast_mode
         augment_config=augment_config if args.augment and not use_fast_mode else None,
         augment_config_outlier=augment_config_outlier if args.augment and not use_fast_mode else None,
-        outlier_list=args.outlier_list if not use_fast_mode else None,
+        outlier_list=args.outlier_list,  # fast_mode uses this for is_outlier flag
         outlier_weight=args.outlier_weight,
         negative_dir=args.negative_dir,
         shared_cache=shared_cache,
@@ -550,7 +583,11 @@ def main():
     # Create model
     print("\nCreating model...")
     model = create_model(
+        backbone=args.backbone,
         alpha=args.alpha,
+        backbone_minimalistic=args.backbone_minimalistic,
+        backbone_include_preprocessing=args.backbone_include_preprocessing,
+        backbone_weights=_normalize_backbone_weights(args.backbone_weights),
         fpn_ch=args.fpn_ch,
         simcc_ch=args.simcc_ch,
         img_size=args.img_size,

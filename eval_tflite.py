@@ -218,32 +218,50 @@ class TFLiteModel:
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
 
-        # Identify output indices
+        # Detect output format
+        # Format 1: Single output [1, 9] = [coords[8], score[1]]
+        # Format 2: Two outputs [1, 8] coords and [1, 1] score
+        self.single_output = False
         self.coords_idx = None
         self.score_idx = None
 
-        for i, od in enumerate(self.output_details):
-            shape = od['shape']
-            if len(shape) == 2:
-                if shape[1] == 8:
-                    self.coords_idx = od['index']
-                elif shape[1] == 1:
-                    self.score_idx = od['index']
+        if len(self.output_details) == 1:
+            shape = self.output_details[0]['shape']
+            if len(shape) == 2 and shape[1] == 9:
+                # Single output format [1, 9]
+                self.single_output = True
+                self.output_idx = self.output_details[0]['index']
+        else:
+            # Two output format
+            for od in self.output_details:
+                shape = od['shape']
+                if len(shape) == 2:
+                    if shape[1] == 8:
+                        self.coords_idx = od['index']
+                    elif shape[1] == 1:
+                        self.score_idx = od['index']
 
-        if self.coords_idx is None:
-            raise ValueError("Could not find coords output (shape [N, 8])")
+        if not self.single_output and self.coords_idx is None:
+            raise ValueError("Could not find coords output (shape [N, 8] or [N, 9])")
 
     def predict(self, image: np.ndarray) -> dict:
         """Run inference on a single image."""
         self.interpreter.set_tensor(self.input_details[0]['index'], image)
         self.interpreter.invoke()
 
-        coords = self.interpreter.get_tensor(self.coords_idx)
-        score = self.interpreter.get_tensor(self.score_idx) if self.score_idx else None
+        if self.single_output:
+            # Single output [1, 9] = [coords[8], score[1]]
+            output = self.interpreter.get_tensor(self.output_idx)
+            coords = output[0, :8]
+            score = float(output[0, 8])
+        else:
+            # Two outputs
+            coords = self.interpreter.get_tensor(self.coords_idx)[0]
+            score = float(self.interpreter.get_tensor(self.score_idx)[0, 0]) if self.score_idx else 0.0
 
         return {
-            'coords': coords[0],  # [8]
-            'score': float(score[0, 0]) if score is not None else 0.0
+            'coords': coords,  # [8]
+            'score': score
         }
 
     def benchmark(self, img_size: int, num_runs: int = 100) -> dict:

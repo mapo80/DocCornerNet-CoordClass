@@ -1,168 +1,15 @@
 # DocCornerNet - Marginal Coordinate Classification
 
-A lightweight neural network for document corner detection using a novel **Marginal Coordinate Classification** approach.
+A lightweight neural network for document corner detection using **Marginal Coordinate Classification** (SimCC).
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.10+-orange.svg)](https://tensorflow.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-DocCornerDataset-yellow)](https://huggingface.co/datasets/mapo80/DocCornerDataset)
 
-## Results
+## Quick Start
 
-### Teacher Model (Full)
-
-| Metric | VAL | TEST |
-|--------|-----|------|
-| **Mean IoU** | 0.9825 | 0.9827 |
-| **Median IoU** | 0.9888 | 0.9884 |
-| **Corner Error (mean)** | 0.93 px | 0.95 px |
-| **Corner Error (p95)** | 2.06 px | 2.08 px |
-| **Recall@90** | 98.8% | 98.9% |
-| **Recall@95** | 97.2% | 97.4% |
-| **Classification Accuracy** | 100.0% | 99.7% |
-| **Classification F1** | 99.97% | 99.83% |
-| **Parameters** | 742,417 | 742,417 |
-
-### Student Model (Distilled)
-
-| Metric | VAL | TEST |
-|--------|-----|------|
-| **Mean IoU** | 0.9761 | 0.9761 |
-| **Median IoU** | 0.9844 | 0.9838 |
-| **Corner Error (mean)** | 1.29 px | 1.29 px |
-| **Corner Error (p95)** | 2.92 px | 3.03 px |
-| **Recall@90** | 98.1% | 98.5% |
-| **Recall@95** | 94.4% | 94.6% |
-| **Classification Accuracy** | 100.0% | 99.8% |
-| **Classification F1** | 99.97% | 99.87% |
-| **Parameters** | 669,761 | 669,761 |
-
-### Model Comparison (TEST set)
-
-| Model | Approach | Parameters | Mean IoU | Corner Error | R@90 | R@95 | Cls F1 | TFLite (ms) | Size |
-|-------|----------|------------|----------|--------------|------|------|--------|-------------|------|
-| **Teacher** | SimCC (TF) | 742,417 | **0.9827** | **0.95 px** | **98.9%** | **97.4%** | 99.83% | 5.3 | 1.46 MB |
-| **Student** | SimCC (TF) | **669,761** | 0.9761 | 1.29 px | 98.5% | 94.6% | **99.87%** | **3.7** | **1.33 MB** |
-| Regression | Direct (PyTorch) | 1,002,025 | 0.9546 | 2.29 px | 94.8% | 70.0% | 99.88% | - | 3.84 MB |
-
-*TFLite float16 inference time on Apple M2 Pro CPU, batch size 1, averaged over 100 iterations.*
-
-### Key Insights
-
-- **SimCC Teacher** achieves the best accuracy with **0.95px corner error** and **97.4% R@95**
-- **SimCC Student** is **1.4x faster** than Teacher (3.7ms vs 5.3ms TFLite), trades ~0.7% IoU for 10% fewer params
-- **Regression baseline** has 35% more parameters, ~3% lower IoU, ~2.4× higher corner error, and ~2.5× larger model
-- All models achieve near-perfect document classification (F1 > 99.8%)
-
-### Why SimCC is More Accurate
-
-SimCC (Marginal Coordinate Classification) predicts 1D probability distributions over X/Y axes, while regression directly outputs coordinates. SimCC advantages:
-
-1. **Richer supervision**: SimCC uses soft Gaussian targets (224 bins per axis) vs 1 scalar per coordinate
-2. **Better gradient flow**: Cross-entropy on distributions vs L1/L2 on scalars
-3. **Spatial awareness**: FPN + 1D convolutions preserve spatial structure vs GAP which loses it
-4. **Sub-pixel precision**: Soft-argmax on distributions enables sub-bin accuracy
-
-## Pretrained Models
-
-Pretrained models are included in the `checkpoints/` directory:
-
-### Model Files
-
-| File | Description | Size |
-|------|-------------|------|
-| `best_model.keras` | Best model (full, for training resume) | 3.5 MB |
-| `best_model.weights.h5` | Best model weights only | 3.3 MB |
-| `best_model_inference.keras` | Best model (inference optimized) | 3.5 MB |
-| `final_model.keras` | Final epoch model (full) | 3.5 MB |
-| `final_model.weights.h5` | Final epoch weights only | 3.3 MB |
-| `final_model_inference.keras` | Final model (inference optimized) | 3.5 MB |
-| `config.json` | Training configuration | 729 B |
-| `history.json` | Training history (loss, metrics per epoch) | 90 KB |
-
-### Quick Start with Pretrained Models
-
-```python
-import tensorflow as tf
-from model import load_inference_model
-
-# Load the best model for inference
-model = tf.keras.models.load_model("checkpoints/best_model_inference.keras")
-
-# Or load weights into a new inference model
-model = load_inference_model(
-    "checkpoints/best_model.weights.h5",
-    img_size=224, alpha=0.75, fpn_ch=48, simcc_ch=128,
-)
-
-# Inference
-# Input: [B, 224, 224, 3] RGB image (ImageNet normalized)
-# Output: coords [B, 8], score_logit [B, 1]
-coords, score_logit = model(image_tensor)
-score = tf.nn.sigmoid(score_logit)  # Apply sigmoid for probability
-```
-
-### Training Configuration
-
-The pretrained models were trained with:
-
-| Parameter | Value |
-|-----------|-------|
-| `alpha` | 0.75 |
-| `fpn_ch` | 48 |
-| `simcc_ch` | 128 |
-| `img_size` | 224 |
-| `sigma_px` | 3.0 |
-| `batch_size` | 64 |
-| `epochs` | 100 |
-| `lr` | 0.0002 |
-| `w_simcc` | 1.0 |
-| `w_coord` | 0.5 |
-| `w_score` | 0.5 |
-
-## Dataset
-
-This model is trained on the **DocCornerDataset** available on HuggingFace:
-
-**[mapo80/DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset)**
-
-### Download
-
-```bash
-# Using huggingface_hub
-pip install huggingface_hub
-huggingface-cli download mapo80/DocCornerDataset --repo-type dataset --local-dir ./data
-```
-
-## Architecture
-
-DocCornerNet uses **Marginal Coordinate Classification** combining:
-
-1. **MobileNetV3Small** backbone (α=0.75, ImageNet pretrained)
-2. **Mini-FPN** with 48 channels
-3. **Marginal Pooling**: 2D features → separate 1D distributions for X/Y
-4. **Conv1D Refinement** along each axis
-5. **SimCC Loss** for soft coordinate classification
-
-### Key Innovation: Marginal Pooling
-
-Instead of GAP→FC (loses spatial info), we project features to 1D marginals:
-
-```
-Feature Map [56×56×48]
-      │
-      ├── mean(axis=Y) → X marginal [56] → upsample [224] → Conv1D → logits_x
-      │
-      └── mean(axis=X) → Y marginal [56] → upsample [224] → Conv1D → logits_y
-```
-
-**Why it works:**
-- Each X position "sees" the sum of all rows → knows where vertical edges are
-- Each Y position "sees" the sum of all columns → knows where horizontal edges are
-- X and Y coordinates are predicted independently → less confusion
-- Conv1D captures local patterns along each axis → sub-pixel precision
-
-## Installation
+### 1. Install Dependencies
 
 ```bash
 git clone https://github.com/mapo80/DocCornerNet-CoordClass.git
@@ -170,13 +17,18 @@ cd DocCornerNet-CoordClass
 pip install -r requirements.txt
 ```
 
-## Usage
+### 2. Download Dataset
 
-### Training
+```bash
+pip install huggingface_hub
+huggingface-cli download mapo80/DocCornerDataset --repo-type dataset --local-dir ./data
+```
+
+### 3. Train Teacher Model
 
 ```bash
 python train.py \
-    --data_root /path/to/dataset \
+    --data_root ./data \
     --batch_size 64 \
     --epochs 100 \
     --lr 0.0002 \
@@ -186,134 +38,132 @@ python train.py \
     --output_dir ./checkpoints
 ```
 
-**Training Parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--data_root` | required | Path to dataset |
-| `--batch_size` | 32 | Batch size |
-| `--epochs` | 100 | Training epochs |
-| `--lr` | 2e-4 | Learning rate |
-| `--alpha` | 0.75 | MobileNetV3 width multiplier |
-| `--fpn_ch` | 48 | FPN channels |
-| `--simcc_ch` | 128 | SimCC head channels |
-| `--img_size` | 224 | Input image size |
-| `--sigma_px` | 3.0 | Gaussian sigma for SimCC targets |
-| `--augment` | flag | Enable data augmentation |
-| `--cache_images` | flag | Pre-load images to RAM |
-| `--fast_mode` | flag | GPU-accelerated augmentations |
-| `--warmup_epochs` | 5 | LR warmup epochs |
-| `--patience` | 15 | Early stopping patience |
-
-### Student Distillation (Faster Variant)
-
-If you need lower latency while keeping accuracy as close as possible, you can train a smaller
-**student** model using knowledge distillation from a pretrained **teacher**.
-
-The distillation loss mixes:
-- **Hard supervision** (ground truth): SimCC + coord L1 + score BCE
-- **Soft supervision** (teacher): SimCC logit distillation (+ optional score/coord distillation)
-
-**Requirements:**
-- A trained teacher weights file (e.g. `checkpoints/best_model.weights.h5`)
-- The teacher `config.json` is auto-detected if present next to the weights (recommended)
-- Teacher/student must use the same `img_size` and `num_bins` (default `224`)
-
-**Recommended student starting point (good speed/accuracy tradeoff):**
-- `--student_alpha 0.5 --student_fpn_ch 32 --student_simcc_ch 96`
-
-**Train student:**
+### 4. Train Student Model (Optional - Faster Inference)
 
 ```bash
 python train_student.py \
     --teacher_weights ./checkpoints/best_model.weights.h5 \
-    --data_root /path/to/dataset \
-    --student_alpha 0.5 --student_fpn_ch 32 --student_simcc_ch 96 \
-    --epochs 60 --batch_size 64 \
-    --augment --cache_images --fast_mode \
+    --data_root ./data \
+    --student_alpha 0.75 \
+    --student_fpn_ch 32 \
+    --student_simcc_ch 96 \
+    --epochs 60 \
+    --batch_size 64 \
+    --augment \
+    --cache_images \
+    --fast_mode \
+    --outlier_list ./data/outliers.txt \
     --output_dir ./checkpoints_student
 ```
 
-**Key distillation knobs:**
-- `--distill_tau` (default `2.0`): higher = softer teacher distributions
-- `--w_distill_simcc` (default `1.0`): main distillation term (recommended to keep > 0)
-- `--w_distill_score` (default `0.1`): helps match document-presence confidence
-- `--w_distill_coord` (default `0.0`): optional (usually not needed if SimCC distillation is enabled)
-
-**Offline / no downloads:**
-- The teacher is reconstructed from weights; set `--teacher_backbone_weights none` to avoid
-  ImageNet weight downloads (default).
-- For the student: `--student_backbone_weights none` if you want to avoid downloading ImageNet weights.
-
-**Outputs (inside `output_dir/<experiment>_<timestamp>/`):**
-- `best_student.keras`, `best_student.weights.h5`, `best_student_inference.keras`
-- `final_student.keras`, `final_student.weights.h5`, `final_student_inference.keras`
-- `config.json`, `history.json`
-
-### Evaluation
+### 5. Evaluate
 
 ```bash
+# Teacher
 python evaluate.py \
-    --model_path ./checkpoints/best_model.keras \
-    --data_root /path/to/dataset \
-    --split val \
-    --batch_size 32
+    --model_path ./checkpoints/best_model.weights.h5 \
+    --data_root ./data \
+    --split test
+
+# Student
+python evaluate.py \
+    --model_path ./checkpoints_student/student_distill_*/best_student.weights.h5 \
+    --data_root ./data \
+    --split test \
+    --fpn_ch 32 \
+    --simcc_ch 96
 ```
 
-### Export
+### 6. Export to TFLite
 
 ```bash
-# Export to SavedModel and TFLite
-python export.py \
-    --weights ./checkpoints/best_model.weights.h5 \
-    --output_dir ./exported \
-    --format savedmodel tflite
+# Teacher (float32)
+python export_tflite.py \
+    --model_path ./checkpoints/best_model.weights.h5 \
+    --output ./exported_tflite/doccornernet_v3_224_float32.tflite
 
-# Export with INT8 quantization
-python export.py \
-    --weights ./checkpoints/best_model.weights.h5 \
-    --output_dir ./exported \
-    --format tflite_int8 \
-    --representative_data /path/to/calibration/images
+# Teacher (float16 - smaller)
+python export_tflite.py \
+    --model_path ./checkpoints/best_model.weights.h5 \
+    --output ./exported_tflite/doccornernet_v3_224_float16.tflite \
+    --float16
+
+# Student (float16)
+python export_tflite.py \
+    --model_path ./checkpoints_student/student_distill_*/best_student.weights.h5 \
+    --output ./exported_tflite/doccornernet_v3_student_224_float16.tflite \
+    --float16
 ```
 
-### TFLite Evaluation
+**TFLite Output Format:** `[1, 9]` = `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
 
-```bash
-python eval_tflite.py \
-    --model_path ./exported/model_float32.tflite \
-    --data_root /path/to/dataset
+---
+
+## Results
+
+### Expected Performance (after training)
+
+| Model | Parameters | Mean IoU | Corner Error | R@90 | R@95 | TFLite (ms) | Size |
+|-------|------------|----------|--------------|------|------|-------------|------|
+| **Teacher** | 742,417 | ~98% | ~1.0 px | ~99% | ~97% | ~5 ms | 1.47 MB |
+| **Student** | 669,761 | ~97% | ~1.3 px | ~98% | ~95% | ~3.5 ms | 1.34 MB |
+
+*TFLite float16, Apple M2 Pro CPU, batch size 1.*
+
+### Key Insights
+
+- **Teacher**: Best accuracy (~1px corner error, ~97% R@95)
+- **Student**: 1.5x faster, 10% fewer params, trades ~1% IoU
+
+> **Note**: The pretrained checkpoints in this repo require retraining due to model architecture updates. Use the training commands above to train fresh models.
+
+---
+
+## Architecture
+
+```
+Input [224×224×3]
+       ↓
+MobileNetV3-Small (α=0.75)
+       ↓
+Mini-FPN (48 ch) → Feature Map [56×56×48]
+       ↓
+Marginal Pooling:
+  ├── mean(axis=Y) → X marginal → Conv1D → logits_x [224×4]
+  └── mean(axis=X) → Y marginal → Conv1D → logits_y [224×4]
+       ↓
+Soft-argmax → coords [8] + score [1]
 ```
 
-### TFLite V2-Compatible Export
+**Why SimCC works better than regression:**
+1. Richer supervision (224 bins per axis vs 1 scalar)
+2. Better gradient flow (cross-entropy vs L1/L2)
+3. Spatial awareness preserved (FPN + 1D conv vs GAP)
+4. Sub-pixel precision via soft-argmax
 
-The `convert_v2_compatible.py` script converts the model to TFLite with an output format **identical to [DocCornerNet-Regression](https://github.com/mapo80/DocCornerNet-Regression)**:
+---
 
-```bash
-# First export to SavedModel
-python export.py --weights ./checkpoints/best_model.weights.h5 --output_dir ./exported --format savedmodel
+## Training Parameters
 
-# Then convert to V2-compatible TFLite
-cd exported
-python convert_v2_compatible.py
-```
+| Parameter | Teacher | Student |
+|-----------|---------|---------|
+| `--alpha` | 0.75 | 0.75 |
+| `--fpn_ch` | 48 | 32 |
+| `--simcc_ch` | 128 | 96 |
+| `--batch_size` | 64 | 64 |
+| `--epochs` | 100 | 60 |
+| `--lr` | 0.0002 | 0.0002 |
 
-**V2-Compatible Format:**
+### Model Presets
 
-| Tensor | Name | Shape | Description |
-|--------|------|-------|-------------|
-| Input | `input` | `[1, 224, 224, 3]` | RGB image (float32) |
-| Output | `Identity` | `[1, 9]` | 8 coords + sigmoid(score) |
+| Preset | Flags | Params |
+|--------|-------|--------|
+| Teacher | `--alpha 0.75 --fpn_ch 48 --simcc_ch 128` | 742,417 |
+| Student | `--alpha 0.75 --fpn_ch 32 --simcc_ch 96` | 669,761 |
+| Lite | `--alpha 0.5 --fpn_ch 32 --simcc_ch 96` | 360,121 |
+| Tiny | `--alpha 0.35 --fpn_ch 24 --simcc_ch 64 --backbone_minimalistic` | 104,513 |
 
-**Output format:** `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
-- Coordinates: normalized [0, 1]
-- Score: sigmoid probability [0, 1] (already applied)
-
-This format is interchangeable with [DocCornerNet-Regression](https://github.com/mapo80/DocCornerNet-Regression) TFLite models.
-
-**Generated files:**
-- `model_float32.tflite` - Full precision
-- `model_float16.tflite` - Half precision (smaller size)
+---
 
 ## Output Format
 
@@ -322,67 +172,44 @@ This format is interchangeable with [DocCornerNet-Regression](https://github.com
 ```
 TL (x0, y0) ──── TR (x1, y1)
     │                │
-    │                │
 BL (x3, y3) ──── BR (x2, y2)
-
-coords = [x0, y0, x1, y1, x2, y2, x3, y3]  # normalized [0, 1]
 ```
 
-### Model Output
+### TFLite Output
 
-- `coords`: [B, 8] - Normalized corner coordinates
-- `score`: [B, 1] - Document presence probability (apply sigmoid)
+Single tensor `[1, 9]`:
+- `[0:8]`: Normalized coordinates [0, 1]
+- `[8]`: Document presence score (sigmoid applied)
 
-## Training Configuration
-
-Configuration used for the reported results:
-
-| Parameter | Value |
-|-----------|-------|
-| Input Size | 224×224 |
-| Backbone | MobileNetV3Small (α=0.75) |
-| FPN Channels | 48 |
-| SimCC Channels | 128 |
-| Batch Size | 64 |
-| Epochs | 100 |
-| Learning Rate | 2e-4 |
-| Weight Decay | 1e-4 |
-| Warmup Epochs | 5 |
-| Loss Weights | SimCC=1.0, Coord=0.5, Score=0.5 |
+---
 
 ## Files
 
 ```
-├── checkpoints/
-│   ├── best_model.keras           # Best model (full)
-│   ├── best_model.weights.h5      # Best model weights
-│   ├── best_model_inference.keras # Best model (inference)
-│   ├── final_model.keras          # Final epoch model
-│   ├── final_model.weights.h5     # Final epoch weights
-│   ├── final_model_inference.keras# Final model (inference)
-│   ├── config.json                # Training configuration
-│   └── history.json               # Training history
-├── model.py                       # Network architecture
-├── losses.py                      # Loss functions (SimCC, Coord, Score)
-├── metrics.py                     # Evaluation metrics (IoU, corner error)
-├── dataset.py                     # TF Dataset with augmentations
-├── train.py                       # Training script
-├── train_student.py               # Student distillation training
-├── evaluate.py                    # Evaluation script
-├── export.py                      # Export to SavedModel/TFLite/ONNX
-├── eval_tflite.py                 # TFLite evaluation
-├── convert_v2_compatible.py       # Convert to V2-compatible TFLite format
-├── train_qat.py                   # Quantization-Aware Training
-├── ptq_improved.py                # Post-Training Quantization
-├── visualize_*.py                 # Augmentation visualization
+├── checkpoints/                    # Teacher model
+│   ├── best_model.weights.h5
+│   └── config.json
+├── checkpoints_student/            # Student model
+│   └── student_distill_*/
+├── exported_tflite/                # TFLite exports
+│   ├── doccornernet_v3_224_float16.tflite
+│   └── doccornernet_v3_student_224_float16.tflite
+├── model.py                        # Network architecture
+├── dataset.py                      # Dataset with augmentations
+├── train.py                        # Teacher training
+├── train_student.py                # Student distillation
+├── evaluate.py                     # Evaluation
+├── export_tflite.py                # TFLite export
 └── README.md
 ```
 
+---
+
 ## References
 
-- [SimCC: A Simple Coordinate Classification Perspective for Human Pose Estimation](https://arxiv.org/abs/2107.03332) - ECCV 2022
+- [SimCC](https://arxiv.org/abs/2107.03332) - ECCV 2022
 - [MobileNetV3](https://arxiv.org/abs/1905.02244) - ICCV 2019
-- [Feature Pyramid Networks](https://arxiv.org/abs/1612.03144) - CVPR 2017
+- [FPN](https://arxiv.org/abs/1612.03144) - CVPR 2017
 
 ## License
 
