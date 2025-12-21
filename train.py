@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -95,6 +96,18 @@ def parse_args():
     )
     parser.add_argument("--negative_dir", type=str, default="images-negative",
                         help="Negative images directory name")
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default="train",
+        help="Train split name (resolved via *_with_negative_v2.txt fallback)",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="val",
+        help="Val split name (resolved via *_with_negative_v2.txt fallback)",
+    )
     parser.add_argument("--outlier_list", type=str, default=None,
                         help="Path to outlier list file")
     parser.add_argument("--outlier_weight", type=float, default=3.0,
@@ -246,6 +259,15 @@ def _find_init_weights_path(value: str) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"init_weights not found: {p}")
     return p
+
+
+def _find_split_file(data_root: Path, split: str) -> Path:
+    """Match the same split-file fallback logic as dataset.create_dataset()."""
+    for prefix in (f"{split}_with_negative_v2", f"{split}_with_negative", split):
+        candidate = data_root / f"{prefix}.txt"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"No split file found for split='{split}' in {data_root}")
 
 
 class DocCornerNetV3Trainer:
@@ -559,8 +581,10 @@ def main():
 
     # Count samples
     data_root = Path(args.data_root)
-    train_samples = load_split_file(str(data_root / "train_with_negative_v2.txt"))
-    val_samples = load_split_file(str(data_root / "val_with_negative_v2.txt"))
+    train_split_file = _find_split_file(data_root, args.train_split)
+    val_split_file = _find_split_file(data_root, args.val_split)
+    train_samples = load_split_file(str(train_split_file))
+    val_samples = load_split_file(str(val_split_file))
 
     num_train_batches = math.ceil(len(train_samples) / args.batch_size)
     num_val_batches = math.ceil(len(val_samples) / args.batch_size)
@@ -605,7 +629,7 @@ def main():
 
         # Load image lists for both splits
         all_images = []
-        for split_name in ["train", "val"]:
+        for split_name in [args.train_split, args.val_split]:
             for prefix in [f"{split_name}_with_negative_v2", f"{split_name}_with_negative", split_name]:
                 candidate = data_root_path / f"{prefix}.txt"
                 if candidate.exists():
@@ -636,7 +660,7 @@ def main():
 
     train_ds = create_dataset(
         data_root=args.data_root,
-        split="train",
+        split=args.train_split,
         img_size=args.img_size,
         batch_size=args.batch_size,
         shuffle=True,
@@ -652,7 +676,7 @@ def main():
     )
     val_ds = create_dataset(
         data_root=args.data_root,
-        split="val",
+        split=args.val_split,
         img_size=args.img_size,
         batch_size=args.batch_size,
         shuffle=False,
@@ -696,7 +720,18 @@ def main():
                 raise
             print(f"Warning: strict init load failed: {e}")
             print("Retrying with by_name=True, skip_mismatch=True...")
-            model.load_weights(str(init_path), by_name=True, skip_mismatch=True)
+            # Keras by_name loading only supports legacy HDF5 files ending in .h5/.hdf5.
+            # Our checkpoints typically use the newer '*.weights.h5' naming; the file is
+            # still HDF5, but Keras refuses by_name based on the filename. Create a
+            # legacy-named copy for partial loading.
+            init_for_by_name = init_path
+            if init_path.name.endswith(".weights.h5"):
+                legacy_name = init_path.name[: -len(".weights.h5")] + ".h5"
+                legacy_path = output_dir / legacy_name
+                if not legacy_path.exists():
+                    shutil.copy2(init_path, legacy_path)
+                init_for_by_name = legacy_path
+            model.load_weights(str(init_for_by_name), by_name=True, skip_mismatch=True)
             print("✓ Loaded init weights (partial)")
 
     # Optimizer

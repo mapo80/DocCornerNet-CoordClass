@@ -1,0 +1,20 @@
+mobilenetv2_256_best
+
+Source RunPod: /workspace/checkpoints/v3_mnv2_small_256_clean_plus_outliers_ft_w15_e200_20251221_184145
+Git commit: 47309076385eb83b243584726efb89f445220ef3
+Weights SHA256: 7e635c353cf0856946b88d2cc00a1495d7b3750a7ba332059ea5d9625ddb430a
+
+Model:
+  backbone=mobilenetv2 alpha=0.35 img_size=256 num_bins=256
+  fpn_ch=32 simcc_ch=96 tau=1.0 input_norm=imagenet
+
+Training:
+  train_split=train_cleaned_plus_outliers val_split=val_cleaned
+  outlier_weight=15.0 outlier_list=/workspace/doc-scanner-dataset-labeled/outliers.txt
+  init_weights=/workspace/checkpoints/v3_mnv2_small_256_aug_outliers_20251221_100332 init_partial=True
+
+Eval (GPU):
+  val_cleaned: mean_iou=0.9902 err_mean=0.60px R@95=100.0%
+  val: mean_iou=0.9819 err_mean=1.18px R@95=97.0%
+  val_removed: mean_iou=0.9341 err_mean=4.57px R@95=79.7%
+  val_outliers: mean_iou=0.6281 err_mean=49.54px R@95=0.0%

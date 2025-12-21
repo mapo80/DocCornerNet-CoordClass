@@ -25,12 +25,25 @@ def parse_args():
 
     parser.add_argument("--model_path", type=str, required=True, help="Model directory/.keras or .weights.h5")
     parser.add_argument(
+        "--unsafe_load",
+        action="store_true",
+        help=(
+            "Allow unsafe Keras deserialization (e.g., Lambda layers) when loading a serialized .keras model. "
+            "Use only for artifacts you trust."
+        ),
+    )
+    parser.add_argument(
         "--data_root",
         type=str,
         default="../../datasets/official/doc-scanner-dataset-labeled",
         help="Path to dataset root",
     )
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Split name (supports custom split files like val_cleaned)",
+    )
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--input_norm",
@@ -262,4 +275,3 @@ if __name__ == "__main__":
     # Silence TF excessive logs for CLI usage
     tf.get_logger().setLevel("ERROR")
     main()
-

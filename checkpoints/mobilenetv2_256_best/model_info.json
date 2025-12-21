@@ -1,0 +1,67 @@
+{
+  "name": "mobilenetv2_256_best",
+  "source": {
+    "runpod_checkpoint_dir": "/workspace/checkpoints/v3_mnv2_small_256_clean_plus_outliers_ft_w15_e200_20251221_184145",
+    "runpod_host": "root@69.30.85.214:22154"
+  },
+  "git": {
+    "repo_commit": "47309076385eb83b243584726efb89f445220ef3"
+  },
+  "model": {
+    "backbone": "mobilenetv2",
+    "alpha": 0.35,
+    "img_size": 256,
+    "num_bins": 256,
+    "fpn_ch": 32,
+    "simcc_ch": 96,
+    "tau": 1.0,
+    "input_norm": "imagenet",
+    "params_note": "Params can be re-derived via evaluate.py (printed at runtime).",
+    "best_model_weights_sha256": "7e635c353cf0856946b88d2cc00a1495d7b3750a7ba332059ea5d9625ddb430a"
+  },
+  "training": {
+    "train_split": "train_cleaned_plus_outliers",
+    "val_split": "val_cleaned",
+    "outlier_list": "/workspace/doc-scanner-dataset-labeled/outliers.txt",
+    "outlier_weight": 15.0,
+    "init_weights": "/workspace/checkpoints/v3_mnv2_small_256_aug_outliers_20251221_100332",
+    "init_partial": true,
+    "batch_size": 64,
+    "epochs": 200,
+    "lr": 5e-05,
+    "warmup_epochs": 2,
+    "patience": 20,
+    "lr_patience": 5,
+    "lr_factor": 0.5,
+    "min_lr": 1e-06,
+    "augment": true,
+    "fast_mode": true,
+    "cache_images": true,
+    "cache_dir": "/workspace/doc-scanner-dataset-labeled/.cache"
+  },
+  "eval_gpu": {
+    "splits": {
+      "val_cleaned": {
+        "mean_iou": 0.9902,
+        "corner_err_mean_px": 0.6,
+        "recall_95_pct": 100.0
+      },
+      "val": {
+        "mean_iou": 0.9819,
+        "corner_err_mean_px": 1.18,
+        "recall_95_pct": 97.0
+      },
+      "val_removed": {
+        "mean_iou": 0.9341,
+        "corner_err_mean_px": 4.57,
+        "recall_95_pct": 79.7
+      },
+      "val_outliers": {
+        "mean_iou": 0.6281,
+        "corner_err_mean_px": 49.54,
+        "recall_95_pct": 0.0
+      }
+    },
+    "log_file": "eval_gpu_v3_mnv2_small_256_clean_plus_outliers_ft_w15_e200_20251221_184145.log"
+  }
+}

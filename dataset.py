@@ -486,18 +486,17 @@ def preload_images_to_cache(
         for name in image_list
     ]
 
+    # Stream results directly into the dict to avoid holding a giant list of
+    # (name, image_array) tuples in memory.
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(tqdm(
+        for name, img_array in tqdm(
             executor.map(_load_and_resize_image, args_list),
             total=len(args_list),
             desc="Caching images",
-            unit="img"
-        ))
-
-    # Build cache dict
-    for name, img_array in results:
-        if img_array is not None:
-            cache[name] = img_array
+            unit="img",
+        ):
+            if img_array is not None:
+                cache[name] = img_array
 
     print(f"  Cached {len(cache)}/{len(image_list)} images")
 
@@ -508,13 +507,20 @@ def preload_images_to_cache(
         cache_file = cache_path / cache_filename
         print(f"Saving cache to disk: {cache_file}")
         try:
-            with open(cache_file, "wb") as f:
-                pickle.dump(cache, f)
+            tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+            with open(tmp_file, "wb") as f:
+                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_file, cache_file)
             # Print cache file size
             size_mb = cache_file.stat().st_size / (1024 * 1024)
             print(f"  Cache size: {size_mb:.1f} MB")
         except Exception as e:
             print(f"  Warning: Failed to save cache: {e}")
+            try:
+                if 'tmp_file' in locals() and tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
 
     return cache
 
@@ -1032,13 +1038,19 @@ def create_fast_cached_dataset(
     if outlier_count > 0:
         print(f"  Outliers in dataset: {outlier_count}")
 
-    # Create TF dataset from uint8 images
-    ds = tf.data.Dataset.from_tensor_slices({
-        "image": all_images,  # uint8, will normalize on GPU
-        "coords": all_coords,
-        "has_doc": all_has_doc,
-        "is_outlier": all_is_outlier,
-    })
+    # Create TF dataset from uint8 images.
+    # Important: place the backing tensors on CPU RAM. If this is created on GPU,
+    # TF may try to copy/keep the whole dataset in GPU memory and crash when the
+    # GPU is already busy (common when multiple trainings run).
+    with tf.device("/CPU:0"):
+        ds = tf.data.Dataset.from_tensor_slices(
+            {
+                "image": all_images,  # uint8, will normalize later
+                "coords": all_coords,
+                "has_doc": all_has_doc,
+                "is_outlier": all_is_outlier,
+            }
+        )
 
     # Free the numpy arrays to save memory
     del all_images

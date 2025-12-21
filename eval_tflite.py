@@ -37,7 +37,7 @@ def parse_args():
         required=True,
         help="Dataset root (contains images/, labels/, split files, images-negative/)",
     )
-    p.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    p.add_argument("--split", type=str, default="val", help="Split name (supports custom split files like val_cleaned)")
     p.add_argument(
         "--input_norm",
         type=str,
@@ -269,4 +269,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

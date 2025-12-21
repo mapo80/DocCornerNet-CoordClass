@@ -38,9 +38,12 @@ def parse_args():
     parser.add_argument("--data_root", type=str,
                         default="../../datasets/official/doc-scanner-dataset-labeled",
                         help="Path to dataset root")
-    parser.add_argument("--split", type=str, default="val",
-                        choices=["train", "val", "test"],
-                        help="Dataset split to evaluate")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="val",
+        help="Dataset split name to evaluate (supports custom split files like val_cleaned)",
+    )
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")
     parser.add_argument(
@@ -226,22 +229,35 @@ def load_model(args):
     if model_path.suffix == ".h5":
         model.load_weights(str(model_path))
         print(f"Loaded weights from {model_path}")
-    elif model_path.is_dir():
+    elif model_path.is_dir() or model_path.suffix == ".keras":
+        # If we couldn't load a serialized .keras, fall back to nearby weights.
+        # For directories, search within the directory. For .keras files, search next to the file.
+        search_dir = model_path if model_path.is_dir() else model_path.parent
+        preferred = []
+        if model_path.suffix == ".keras":
+            # Common convention: best_model.keras <-> best_model.weights.h5
+            preferred.append(f"{model_path.stem}.weights.h5")
+            preferred.append(f"{model_path.stem.replace('_inference', '')}.weights.h5")
+
         # Try to find weights file in directory
         for weights_file in [
+            *preferred,
             "best_model.weights.h5",
             "final_model.weights.h5",
             "latest_weights.h5",
             "best_iou_weights.h5",
             "final_weights.h5",
+            # Student/distillation artifacts
+            "best_student.weights.h5",
+            "final_student.weights.h5",
         ]:
-            weights_path = model_path / weights_file
+            weights_path = search_dir / weights_file
             if weights_path.exists():
                 model.load_weights(str(weights_path))
                 print(f"Loaded weights from {weights_path}")
                 break
         else:
-            raise ValueError(f"Cannot find weights in directory {model_path}")
+            raise ValueError(f"Cannot find weights in {search_dir}")
     else:
         raise ValueError(f"Cannot load model from {model_path}")
 

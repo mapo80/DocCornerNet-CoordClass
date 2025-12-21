@@ -19,6 +19,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tqdm import tqdm
@@ -92,6 +93,18 @@ def parse_args():
         default="images-negative",
         help="Negative images directory name",
     )
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default="train",
+        help="Train split name (resolved via *_with_negative_v2.txt fallback)",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="val",
+        help="Val split name (resolved via *_with_negative_v2.txt fallback)",
+    )
     parser.add_argument("--outlier_list", type=str, default=None, help="Path to outlier list file")
     parser.add_argument("--outlier_weight", type=float, default=3.0, help="Outlier sampling weight")
 
@@ -107,6 +120,32 @@ def parse_args():
         type=str,
         default="./checkpoints/best_model.weights.h5",
         help="Path to teacher weights (.weights.h5)",
+    )
+    parser.add_argument(
+        "--teacher_onnx",
+        type=str,
+        default=None,
+        help=(
+            "Optional ONNX teacher path. If set, distillation uses the ONNX teacher and "
+            "--teacher_weights/config/backbone args are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--teacher_onnx_input_norm",
+        type=str,
+        default="zero_one",
+        choices=["imagenet", "zero_one", "raw255", "m1p1"],
+        help=(
+            "Preprocessing expected by the ONNX teacher input. "
+            "For the provided FastViT heatmap teachers this is typically 'zero_one' (img/255)."
+        ),
+    )
+    parser.add_argument(
+        "--teacher_onnx_provider",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="onnxruntime provider selection (best-effort).",
     )
     parser.add_argument(
         "--teacher_config",
@@ -249,6 +288,160 @@ def _resolve_input_norm(value: str, teacher_cfg: dict, teacher_include_preproces
     if norm not in {"imagenet", "zero_one", "raw255"}:
         raise ValueError(f"Unsupported input_norm='{value}'. Use: auto, imagenet, zero_one, raw255.")
     return norm
+
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _convert_norm(images_nhwc: np.ndarray, src_norm: str, dst_norm: str) -> np.ndarray:
+    """
+    Convert NHWC float images between normalization modes.
+
+    Supported norms:
+    - imagenet: (img/255 - mean)/std
+    - zero_one: img/255
+    - raw255:   img
+    - m1p1:     img/127.5 - 1
+    """
+    src = _normalize_input_norm(src_norm)
+    dst = _normalize_input_norm(dst_norm)
+    if src == dst:
+        return images_nhwc
+
+    x = images_nhwc.astype(np.float32, copy=False)
+
+    # src -> raw255
+    if src == "imagenet":
+        x = (x * IMAGENET_STD[None, None, None, :]) + IMAGENET_MEAN[None, None, None, :]
+        x = x * 255.0
+    elif src == "zero_one":
+        x = x * 255.0
+    elif src == "raw255":
+        pass
+    elif src == "m1p1":
+        x = (x + 1.0) * 127.5
+    else:
+        raise ValueError(f"Unsupported src_norm='{src_norm}'")
+
+    # raw255 -> dst
+    if dst == "imagenet":
+        x = x / 255.0
+        x = (x - IMAGENET_MEAN[None, None, None, :]) / IMAGENET_STD[None, None, None, :]
+    elif dst == "zero_one":
+        x = x / 255.0
+    elif dst == "raw255":
+        pass
+    elif dst == "m1p1":
+        x = (x / 127.5) - 1.0
+    else:
+        raise ValueError(f"Unsupported dst_norm='{dst_norm}'")
+
+    return x
+
+
+class OnnxHeatmapTeacher:
+    """
+    Adapter to use an ONNX heatmap teacher inside the existing distillation loop.
+
+    Expected ONNX:
+      input:  img [B,3,H,W] float32
+      output: heatmap [B,4,h,w] float32 (typically after sigmoid)
+
+    Output dict matches keys expected by StudentDistillTrainer:
+      - simcc_x: [B,4,num_bins] float32 logits (from heatmap marginals)
+      - simcc_y: [B,4,num_bins] float32 logits
+      - coords:  [B,8] float32 in [0,1] (soft-argmax on heatmap marginals)
+      - score_logit: [B,1] float32 (derived confidence; optional)
+    """
+
+    def __init__(
+        self,
+        onnx_path: str,
+        num_bins: int,
+        teacher_input_norm: str,
+        dataset_input_norm: str,
+        provider: str = "auto",
+    ):
+        self.onnx_path = str(onnx_path)
+        self.num_bins = int(num_bins)
+        self.teacher_input_norm = _normalize_input_norm(teacher_input_norm)
+        self.dataset_input_norm = _normalize_input_norm(dataset_input_norm)
+
+        try:
+            import onnxruntime as ort
+        except Exception as e:
+            raise RuntimeError("onnxruntime is required for --teacher_onnx") from e
+
+        if provider == "cpu":
+            providers = ["CPUExecutionProvider"]
+        elif provider == "cuda":
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        self.sess = ort.InferenceSession(self.onnx_path, providers=providers)
+        self.input_name = self.sess.get_inputs()[0].name
+        self.output_name = self.sess.get_outputs()[0].name
+
+    def __call__(self, images, training: bool = False):
+        x = images.numpy().astype(np.float32, copy=False)  # [B,H,W,3] in dataset_input_norm
+        x = _convert_norm(x, src_norm=self.dataset_input_norm, dst_norm=self.teacher_input_norm)
+        x = np.transpose(x, (0, 3, 1, 2))  # NCHW
+
+        heat = self.sess.run([self.output_name], {self.input_name: x})[0]  # [B,4,h,w]
+        heat = heat.astype(np.float32, copy=False)
+        b, c, h, w = heat.shape
+        if c != 4:
+            raise RuntimeError(f"Unexpected teacher heatmap channels={c} (expected 4)")
+
+        # Marginals: [B,4,w] and [B,4,h]
+        x_m = heat.sum(axis=2)
+        y_m = heat.sum(axis=3)
+
+        # Upsample to num_bins via linear interpolation on index space.
+        src_x = np.linspace(0.0, float(w - 1), w, dtype=np.float32)
+        src_y = np.linspace(0.0, float(h - 1), h, dtype=np.float32)
+        dst_x = np.linspace(0.0, float(w - 1), self.num_bins, dtype=np.float32)
+        dst_y = np.linspace(0.0, float(h - 1), self.num_bins, dtype=np.float32)
+
+        def interp_last(arr, src_grid, dst_grid):
+            out = np.empty((arr.shape[0], arr.shape[1], len(dst_grid)), dtype=np.float32)
+            for bi in range(arr.shape[0]):
+                for ci in range(arr.shape[1]):
+                    out[bi, ci] = np.interp(dst_grid, src_grid, arr[bi, ci]).astype(np.float32)
+            return out
+
+        x_up = interp_last(x_m, src_x, dst_x)
+        y_up = interp_last(y_m, src_y, dst_y)
+
+        eps = 1e-9
+        simcc_x_logits = np.log(np.maximum(x_up, eps))
+        simcc_y_logits = np.log(np.maximum(y_up, eps))
+
+        # Soft-argmax coords (in [0,1]) from original marginals.
+        xs = np.arange(w, dtype=np.float32)
+        ys = np.arange(h, dtype=np.float32)
+        x_sum = x_m.sum(axis=-1) + eps
+        y_sum = y_m.sum(axis=-1) + eps
+        x_px = (x_m * xs[None, None, :]).sum(axis=-1) / x_sum
+        y_px = (y_m * ys[None, None, :]).sum(axis=-1) / y_sum
+        x01 = x_px / float(max(w - 1, 1))
+        y01 = y_px / float(max(h - 1, 1))
+
+        coords = np.stack([x01, y01], axis=-1).reshape(b, 8).astype(np.float32)
+        coords = np.clip(coords, 0.0, 1.0)
+
+        peak = np.max(heat, axis=(2, 3))  # [B,4]
+        conf = np.clip(np.mean(peak, axis=1), 1e-6, 1.0 - 1e-6)  # [B]
+        score_logit = np.log(conf / (1.0 - conf)).astype(np.float32)[:, None]  # [B,1]
+
+        return {
+            "simcc_x": tf.convert_to_tensor(simcc_x_logits),
+            "simcc_y": tf.convert_to_tensor(simcc_y_logits),
+            "coords": tf.convert_to_tensor(coords),
+            "score_logit": tf.convert_to_tensor(score_logit),
+        }
 
 
 def _find_init_weights_path(value: str) -> Path:
@@ -696,17 +889,24 @@ def main():
 
     print_device_info()
 
-    teacher_kwargs, teacher_cfg = _load_teacher_kwargs(args)
-    resolved_input_norm = _resolve_input_norm(
-        args.input_norm, teacher_cfg, teacher_kwargs["backbone_include_preprocessing"]
-    )
-    if args.input_norm != "auto" and teacher_cfg.get("input_norm"):
-        teacher_norm = _normalize_input_norm(teacher_cfg.get("input_norm"))
-        if teacher_norm != "auto" and teacher_norm != resolved_input_norm:
-            print(
-                f"Warning: --input_norm={resolved_input_norm} differs from teacher config input_norm={teacher_cfg.get('input_norm')}"
-            )
-    args.input_norm = resolved_input_norm
+    teacher_cfg = {}
+    if args.teacher_onnx:
+        # Keep student normalization explicit; default to imagenet (matches our TF models).
+        args.input_norm = "imagenet" if _normalize_input_norm(args.input_norm) == "auto" else _normalize_input_norm(args.input_norm)
+        teacher_kwargs = {"img_size": args.img_size, "num_bins": args.num_bins}
+        teacher_cfg = {"type": "onnx_heatmap", "input_norm": args.teacher_onnx_input_norm}
+    else:
+        teacher_kwargs, teacher_cfg = _load_teacher_kwargs(args)
+        resolved_input_norm = _resolve_input_norm(
+            args.input_norm, teacher_cfg, teacher_kwargs["backbone_include_preprocessing"]
+        )
+        if args.input_norm != "auto" and teacher_cfg.get("input_norm"):
+            teacher_norm = _normalize_input_norm(teacher_cfg.get("input_norm"))
+            if teacher_norm != "auto" and teacher_norm != resolved_input_norm:
+                print(
+                    f"Warning: --input_norm={resolved_input_norm} differs from teacher config input_norm={teacher_cfg.get('input_norm')}"
+                )
+        args.input_norm = resolved_input_norm
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / f"{args.experiment_name}_{timestamp}"
@@ -715,7 +915,11 @@ def main():
     print("=" * 80)
     print("DocCornerNetV3 Student Distillation")
     print("=" * 80)
-    print(f"Teacher weights: {args.teacher_weights}")
+    if args.teacher_onnx:
+        print(f"Teacher ONNX: {args.teacher_onnx}")
+        print(f"Teacher ONNX input_norm: {args.teacher_onnx_input_norm}")
+    else:
+        print(f"Teacher weights: {args.teacher_weights}")
     print(f"Output: {output_dir}")
 
     # Save config
@@ -726,8 +930,8 @@ def main():
 
     # Count samples (same naming scheme as train.py)
     data_root = Path(args.data_root)
-    train_split_file = _find_split_file(data_root, "train")
-    val_split_file = _find_split_file(data_root, "val")
+    train_split_file = _find_split_file(data_root, args.train_split)
+    val_split_file = _find_split_file(data_root, args.val_split)
     train_samples = load_split_file(str(train_split_file))
     val_samples = load_split_file(str(val_split_file))
     num_train_batches = math.ceil(len(train_samples) / args.batch_size)
@@ -767,7 +971,7 @@ def main():
         negative_dir = data_root_path / args.negative_dir
 
         all_images = []
-        for split_name in ["train", "val"]:
+        for split_name in [args.train_split, args.val_split]:
             for prefix in [f"{split_name}_with_negative_v2", f"{split_name}_with_negative", split_name]:
                 candidate = data_root_path / f"{prefix}.txt"
                 if candidate.exists():
@@ -795,7 +999,7 @@ def main():
 
     train_ds = create_dataset(
         data_root=args.data_root,
-        split="train",
+        split=args.train_split,
         img_size=args.img_size,
         batch_size=args.batch_size,
         shuffle=True,
@@ -811,7 +1015,7 @@ def main():
     )
     val_ds = create_dataset(
         data_root=args.data_root,
-        split="val",
+        split=args.val_split,
         img_size=args.img_size,
         batch_size=args.batch_size,
         shuffle=False,
@@ -824,21 +1028,31 @@ def main():
 
     # Teacher
     print("\nLoading teacher...")
-    teacher = create_model(
-        backbone=teacher_kwargs["backbone"],
-        alpha=teacher_kwargs["alpha"],
-        backbone_minimalistic=teacher_kwargs["backbone_minimalistic"],
-        backbone_include_preprocessing=teacher_kwargs["backbone_include_preprocessing"],
-        fpn_ch=teacher_kwargs["fpn_ch"],
-        simcc_ch=teacher_kwargs["simcc_ch"],
-        img_size=teacher_kwargs["img_size"],
-        num_bins=teacher_kwargs["num_bins"],
-        tau=teacher_kwargs["tau"],
-        backbone_weights=_normalize_backbone_weights(args.teacher_backbone_weights),
-    )
-    teacher.load_weights(args.teacher_weights)
-    teacher.trainable = False
-    print(f"Teacher parameters: {teacher.count_params():,}")
+    if args.teacher_onnx:
+        teacher = OnnxHeatmapTeacher(
+            onnx_path=args.teacher_onnx,
+            num_bins=args.num_bins,
+            teacher_input_norm=args.teacher_onnx_input_norm,
+            dataset_input_norm=args.input_norm,
+            provider=args.teacher_onnx_provider,
+        )
+        print("Teacher type: ONNX heatmap")
+    else:
+        teacher = create_model(
+            backbone=teacher_kwargs["backbone"],
+            alpha=teacher_kwargs["alpha"],
+            backbone_minimalistic=teacher_kwargs["backbone_minimalistic"],
+            backbone_include_preprocessing=teacher_kwargs["backbone_include_preprocessing"],
+            fpn_ch=teacher_kwargs["fpn_ch"],
+            simcc_ch=teacher_kwargs["simcc_ch"],
+            img_size=teacher_kwargs["img_size"],
+            num_bins=teacher_kwargs["num_bins"],
+            tau=teacher_kwargs["tau"],
+            backbone_weights=_normalize_backbone_weights(args.teacher_backbone_weights),
+        )
+        teacher.load_weights(args.teacher_weights)
+        teacher.trainable = False
+        print(f"Teacher parameters: {teacher.count_params():,}")
 
     # Student
     print("\nCreating student...")
