@@ -64,8 +64,7 @@ python evaluate.py \
     --model_path ./checkpoints/best_model.weights.h5 \
     --data_root ./data \
     --split test \
-    --input_norm imagenet \
-    --backbone_include_preprocessing
+    --input_norm imagenet
 
 # Student
 python evaluate.py \
@@ -73,7 +72,6 @@ python evaluate.py \
     --data_root ./data \
     --split test \
     --input_norm imagenet \
-    --backbone_include_preprocessing \
     --fpn_ch 32 \
     --simcc_ch 96
 
@@ -90,31 +88,59 @@ python evaluate.py \
 # Teacher (float32)
 python export_tflite.py \
     --model_path ./checkpoints/best_model.weights.h5 \
-    --output ./exported_tflite/doccornernet_v3_224_float32.tflite \
-    --backbone_include_preprocessing
+    --output ./exported_tflite/doccornernet_v3_224_float32.tflite
 
 # Teacher (float16 - smaller)
 python export_tflite.py \
     --model_path ./checkpoints/best_model.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_224_float16.tflite \
-    --float16 \
-    --backbone_include_preprocessing
+    --float16
 
 # Student (float16)
 python export_tflite.py \
     --model_path ./checkpoints_student/student_distill_*/best_student.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_student_224_float16.tflite \
-    --float16 \
-    --backbone_include_preprocessing
+    --float16
 
 # MobileNetV2 small (float16)
 python export_tflite.py \
     --model_path ./checkpoints/v3_mnv2_small_aug_outliers_20251220_111218/best_model.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_mnv2_small_float16.tflite \
     --float16
+
+# MobileNetV2 small @256 (WASM-friendly input: raw float32 in [0..255], normalization inside the model)
+python export_tflite.py \
+    --model_path ./checkpoints/v3_mnv2_small_256_aug_outliers_*/best_model.weights.h5 \
+    --output ./exported_tflite/doccornernet_v3_mnv2_small_256_raw255_float32.tflite \
+    --tflite_input_norm raw255
 ```
 
 **TFLite Output Format:** `[1, 9]` = `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
+
+### 7. Evaluate / Benchmark on TFLite
+
+```bash
+# Full metrics (mirrors evaluate.py, but runs inference via TFLite Interpreter)
+python eval_tflite.py \
+  --tflite_models ./exported_tflite/doccornernet_v3_mnv2_small_256_float32.tflite \
+  --data_root ./data \
+  --split val \
+  --input_norm imagenet \
+  --threads 1
+
+# If you exported a *_raw255_*.tflite model (preprocessing inside the model)
+python eval_tflite.py \
+  --tflite_models ./exported_tflite/doccornernet_v3_mnv2_small_256_raw255_float32.tflite \
+  --data_root ./data \
+  --split val \
+  --input_norm raw255 \
+  --threads 1
+
+# Microbenchmark (latency only, no image decoding/preprocess)
+python benchmark_tflite.py \
+  --model ./exported_tflite/doccornernet_v3_mnv2_small_256_float32.tflite \
+  --threads 1
+```
 
 ---
 
@@ -124,13 +150,16 @@ python export_tflite.py \
 
 | Model | Parameters | Mean IoU | Corner Error | R@90 | R@95 | TFLite (ms) | Size |
 |-------|------------|----------|--------------|------|------|-------------|------|
-| **Teacher (MNv3-S α=0.75)** | 742,417 | 98.27% | 0.95 px | 98.8% | 97.3% | 5.35 ms | 1.47 MB |
-| **Student (distill)** | 669,761 | 97.59% | 1.31 px | 98.3% | 94.4% | 4.02 ms | 1.34 MB |
-| **MobileNetV2 small (α=0.35)** | 495,353 | 97.90% | 1.18 px | 97.9% | 95.7% | 3.96 ms | 0.98 MB |
+| **Teacher (MNv3-S α=0.75)** | 742,417 | 98.25% | 0.93 px | 98.8% | 97.2% | 4.93 ms | 1.47 MB |
+| **Student (distill)** | 669,761 | 97.61% | 1.29 px | 98.1% | 94.4% | 3.38 ms | 1.34 MB |
+| **MobileNetV2 small (α=0.35) @224** | 495,353 | 98.05% | 1.14 px | 98.2% | 96.3% | 3.78 ms | 0.98 MB |
+| **MobileNetV2 small (α=0.35) @256** | 495,353 | 98.22% | 1.17 px | 98.5% | 97.0% | 4.81 ms | 0.98 MB |
 
 Notes:
-- Accuracy: `evaluate.py` on `test_with_negative.txt` (IoU/Corner Error computed only on positives).
-- Latency/Size: `eval_tflite.py` float16, CPU (XNNPACK), batch size 1.
+- Benchmarks above were measured on `doc-scanner-dataset-labeled` (`val_with_negative_v2.txt`).
+- Accuracy: `evaluate.py` (IoU/Corner Error computed only on positives).
+- Latency: `benchmark_tflite.py` p50, CPU (XNNPACK), batch size 1.
+- Size: `.tflite` float16 file size on disk.
 
 ### Key Insights
 
@@ -139,6 +168,61 @@ Notes:
 - **Student**: close to MNv2 on speed, but slightly worse IoU and recall.
 
 > Note: `checkpoints/best_model.keras` may fail to load on Keras 3 due to legacy `Lambda` layers; use `checkpoints/best_model.weights.h5` for evaluation/export.
+
+### 256px Recipe (targeting ~99% Mean IoU)
+
+The final deployment target (WASM/TFLite) benefits from a small backbone. A practical path is:
+1) fine-tune a strong teacher at 256
+2) distill into **MobileNetV2 small** at 256
+3) mine hard samples and fine-tune
+
+```bash
+# 1) Teacher @256 (warm-start from the 224 teacher)
+python train.py \
+  --data_root ./data \
+  --img_size 256 --num_bins 256 \
+  --backbone mobilenetv3_small --alpha 0.75 --fpn_ch 48 --simcc_ch 128 \
+  --init_weights ./checkpoints/best_model.weights.h5 \
+  --batch_size 64 --epochs 30 --lr 0.0001 \
+  --augment --cache_images --fast_mode \
+  --outlier_list ./data/outliers.txt --outlier_weight 3.0 \
+  --output_dir ./checkpoints --experiment_name v3_teacher_256_ft
+
+# 2) Student @256 (MobileNetV2 small, warm-start from the 224 MNv2 small)
+python train_student.py \
+  --teacher_weights ./checkpoints/v3_teacher_256_ft_*/best_model.weights.h5 \
+  --data_root ./data \
+  --img_size 256 --num_bins 256 \
+  --student_backbone mobilenetv2 --student_alpha 0.35 --student_fpn_ch 32 --student_simcc_ch 96 \
+  --student_init_weights ./checkpoints/v3_mnv2_small_aug_outliers_*/best_model.weights.h5 \
+  --batch_size 64 --epochs 60 --lr 0.0002 \
+  --augment --cache_images --fast_mode \
+  --outlier_list ./data/outliers.txt --outlier_weight 3.0 \
+  --output_dir ./checkpoints_student --experiment_name student_mnv2_256_distill
+
+# 3) Mine hard positives (low IoU) on train and fine-tune with higher outlier_weight
+python mine_outliers.py \
+  --model_path ./checkpoints_student/student_mnv2_256_distill_*/best_student.weights.h5 \
+  --data_root ./data \
+  --split train \
+  --batch_size 64 \
+  --input_norm imagenet \
+  --iou_threshold 0.98 \
+  --include_fn \
+  --output ./data/outliers_mined_256_iou98.txt \
+  --cache_images --fast_mode
+
+python train_student.py \
+  --teacher_weights ./checkpoints/v3_teacher_256_ft_*/best_model.weights.h5 \
+  --data_root ./data \
+  --img_size 256 --num_bins 256 \
+  --student_backbone mobilenetv2 --student_alpha 0.35 --student_fpn_ch 32 --student_simcc_ch 96 \
+  --student_init_weights ./checkpoints_student/student_mnv2_256_distill_*/best_student.weights.h5 \
+  --batch_size 64 --epochs 20 --lr 0.00005 \
+  --augment --cache_images --fast_mode \
+  --outlier_list ./data/outliers_mined_256_iou98.txt --outlier_weight 5.0 \
+  --output_dir ./checkpoints_student --experiment_name student_mnv2_256_ft_mined
+```
 
 ---
 
@@ -222,6 +306,9 @@ Single tensor `[1, 9]`:
 ├── train.py                        # Teacher training
 ├── train_student.py                # Student distillation
 ├── evaluate.py                     # Evaluation
+├── eval_tflite.py                  # Evaluation via TFLite Interpreter
+├── benchmark_tflite.py             # TFLite microbenchmark (CPU)
+├── mine_outliers.py                # Hard-sample mining (outlier list)
 ├── export_tflite.py                # TFLite export
 └── README.md
 ```

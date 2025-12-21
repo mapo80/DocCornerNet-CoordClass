@@ -31,6 +31,10 @@ from tensorflow import keras
 
 from model import create_model
 
+# ImageNet normalization constants (RGB, [0,1])
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -60,6 +64,17 @@ def parse_args():
         "--float16",
         action="store_true",
         help="Apply float16 quantization",
+    )
+    parser.add_argument(
+        "--tflite_input_norm",
+        type=str,
+        default="auto",
+        choices=["auto", "imagenet", "zero_one", "raw255"],
+        help=(
+            "Expected input normalization for the exported TFLite model. "
+            "'auto' means: do not add extra preprocessing (input must match training). "
+            "Use 'raw255' to export a model that accepts raw float32 pixels in [0,255]."
+        ),
     )
 
     # Model architecture (used if config not found)
@@ -138,7 +153,91 @@ def create_inference_model(model, single_output: bool = True):
         single_output: If True, concatenate coords and score into single [1, 9] output.
                       If False, output [coords, score] as separate tensors.
     """
-    inputs = model.input
+    raise RuntimeError("create_inference_model is deprecated; use create_tflite_inference_model().")
+
+
+def _apply_norm_transform(x, src_norm: str, dst_norm: str):
+    """
+    Transform input tensor x from src_norm to dst_norm.
+
+    Supported norms:
+      - raw255: float32 in [0,255]
+      - zero_one: float32 in [0,1]
+      - imagenet: float32 standardized with ImageNet mean/std (as in dataset.py)
+    """
+    src = (src_norm or "imagenet").lower().strip()
+    dst = (dst_norm or "imagenet").lower().strip()
+
+    if src == dst:
+        return x
+
+    def to_zero_one(t, src_mode: str):
+        if src_mode in {"raw255", "0_255", "0255"}:
+            return keras.layers.Rescaling(1.0 / 255.0, name="in_rescale_255_to_01")(t)
+        if src_mode in {"zero_one", "0_1", "01"}:
+            return t
+        if src_mode == "imagenet":
+            # x = (z * std) + mean  (still in [0,1] domain)
+            std = tf.constant(IMAGENET_STD.reshape(1, 1, 1, 3), dtype=tf.float32)
+            mean = tf.constant(IMAGENET_MEAN.reshape(1, 1, 1, 3), dtype=tf.float32)
+            t = keras.layers.Multiply(name="in_imagenet_to_01_mul_std")([t, std])
+            return keras.layers.Add(name="in_imagenet_to_01_add_mean")([t, mean])
+        raise ValueError(f"Unsupported src_norm='{src_mode}'")
+
+    if dst in {"zero_one", "0_1", "01"}:
+        return to_zero_one(x, src)
+
+    if dst in {"raw255", "0_255", "0255"}:
+        z = to_zero_one(x, src)
+        return keras.layers.Rescaling(255.0, name="in_rescale_01_to_255")(z)
+
+    if dst == "imagenet":
+        z = to_zero_one(x, src)
+        # Normalize (z - mean) / std
+        var = (IMAGENET_STD ** 2).astype(np.float32)
+        return keras.layers.Normalization(
+            axis=-1,
+            mean=IMAGENET_MEAN,
+            variance=var,
+            name="in_norm_imagenet",
+        )(z)
+
+    raise ValueError(f"Unsupported dst_norm='{dst_norm}'")
+
+
+def create_tflite_inference_model(
+    model: keras.Model,
+    img_size: int,
+    model_input_norm: str,
+    tflite_input_norm: str,
+    single_output: bool = True,
+):
+    """
+    Create an inference model suitable for TFLite export.
+
+    - Adds an optional preprocessing stack to map from `tflite_input_norm` -> `model_input_norm`.
+    - Applies sigmoid to the score output.
+    - Optionally concatenates outputs to a single [B, 9] tensor.
+    """
+    inputs = keras.Input(shape=(img_size, img_size, 3), dtype=tf.float32, name="image")
+
+    x = _apply_norm_transform(inputs, tflite_input_norm, model_input_norm)
+    outputs = model(x, training=False)
+
+    if isinstance(outputs, dict):
+        coords = outputs["coords"]
+        score_logit = outputs["score_logit"]
+    else:
+        coords = outputs[0]
+        score_logit = outputs[1]
+
+    score = keras.ops.sigmoid(score_logit)
+
+    if single_output:
+        output = keras.ops.concatenate([coords, score], axis=-1)
+        return keras.Model(inputs=inputs, outputs=output, name="doccornernet_inference")
+
+    return keras.Model(inputs=inputs, outputs=[coords, score], name="doccornernet_inference")
 
     # Get model outputs
     outputs = model(inputs, training=False)
@@ -174,13 +273,31 @@ def create_inference_model(model, single_output: bool = True):
     return inference_model
 
 
-def export_tflite(model, output_path: str, float16: bool = False):
+def export_tflite(
+    model,
+    output_path: str,
+    float16: bool = False,
+    img_size: int = 224,
+    model_input_norm: str = "imagenet",
+    tflite_input_norm: str = "auto",
+):
     """Export model to TFLite format."""
+    model_input_norm = (model_input_norm or "imagenet").lower().strip()
+    if tflite_input_norm == "auto":
+        tflite_input_norm = model_input_norm
+    tflite_input_norm = (tflite_input_norm or model_input_norm).lower().strip()
+
     # Create inference model with single [1, 9] output
-    inference_model = create_inference_model(model, single_output=True)
+    inference_model = create_tflite_inference_model(
+        model=model,
+        img_size=img_size,
+        model_input_norm=model_input_norm,
+        tflite_input_norm=tflite_input_norm,
+        single_output=True,
+    )
 
     # Get concrete function
-    @tf.function(input_signature=[tf.TensorSpec([1, model.input_shape[1], model.input_shape[2], 3], tf.float32)])
+    @tf.function(input_signature=[tf.TensorSpec([1, img_size, img_size, 3], tf.float32)])
     def inference_fn(x):
         # Single output: [x0, y0, x1, y1, x2, y2, x3, y3, score]
         return inference_model(x, training=False)
@@ -278,6 +395,7 @@ def main():
     img_size = config.get("img_size", args.img_size)
     num_bins = config.get("num_bins", args.num_bins)
     tau = config.get("tau", args.tau)
+    model_input_norm = config.get("input_norm", "imagenet")
 
     print(f"Model config:")
     print(f"  backbone: {backbone}")
@@ -289,6 +407,11 @@ def main():
     print(f"  img_size: {img_size}")
     print(f"  num_bins: {num_bins}")
     print(f"  tau: {tau}")
+    print(f"  model_input_norm: {model_input_norm}")
+    if args.tflite_input_norm == "auto":
+        print(f"  tflite_input_norm: auto (no extra preprocessing)")
+    else:
+        print(f"  tflite_input_norm: {args.tflite_input_norm}")
 
     # Create model
     model = create_model(
@@ -323,7 +446,14 @@ def main():
 
     # Export
     print(f"\nExporting to TFLite...")
-    output_path = export_tflite(model, args.output, float16=args.float16)
+    output_path = export_tflite(
+        model,
+        args.output,
+        float16=args.float16,
+        img_size=img_size,
+        model_input_norm=model_input_norm,
+        tflite_input_norm=args.tflite_input_norm,
+    )
 
     # Verify
     verify_tflite(output_path, img_size)

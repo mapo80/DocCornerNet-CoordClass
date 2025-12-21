@@ -275,7 +275,7 @@ def apply_full_augmentation(
 # TensorFlow GPU Augmentations (fast, runs on GPU)
 # =============================================================================
 
-def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None):
+def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, image_norm: str = "imagenet"):
     """
     Apply augmentation to a batch using TensorFlow ops (runs on GPU).
 
@@ -295,6 +295,18 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None):
     """
     batch_size = tf.shape(images)[0]
 
+    norm_mode = (image_norm or "imagenet").lower().strip()
+    if norm_mode in {"zero_one", "0_1", "01"}:
+        clip_min, clip_max = 0.0, 1.0
+        brightness_scale = 1.0
+    elif norm_mode in {"raw255", "0_255", "0255"}:
+        clip_min, clip_max = 0.0, 255.0
+        brightness_scale = 255.0
+    else:
+        # "imagenet" (or unknown): assume roughly standardized inputs
+        clip_min, clip_max = -3.0, 3.0
+        brightness_scale = 1.0
+
     # Define augmentation strengths (normal vs outlier)
     # Normal: brightness=0.2, contrast=0.8-1.2, saturation=0.85-1.15
     # Outlier: brightness=0.3, contrast=0.7-1.3, saturation=0.8-1.2
@@ -311,7 +323,7 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None):
 
     # Random color augmentations (vectorized, per-sample random values)
     # Brightness (per-sample strength)
-    brightness_delta = tf.random.uniform([batch_size], -1.0, 1.0) * brightness_range
+    brightness_delta = tf.random.uniform([batch_size], -1.0, 1.0) * brightness_range * brightness_scale
     brightness_delta = tf.reshape(brightness_delta, [batch_size, 1, 1, 1])
     images = images + brightness_delta
 
@@ -361,7 +373,7 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None):
     coords = coords * (1.0 - should_flip_coords) + coords_flipped * should_flip_coords
 
     # Clip values
-    images = tf.clip_by_value(images, -3.0, 3.0)
+    images = tf.clip_by_value(images, clip_min, clip_max)
     coords = tf.clip_by_value(coords, 0.0, 1.0)
 
     return images, coords
@@ -505,6 +517,88 @@ def preload_images_to_cache(
             print(f"  Warning: Failed to save cache: {e}")
 
     return cache
+
+
+def preload_labels_to_cache(
+    image_list: List[str],
+    label_dir: Path,
+    cache_dir: Optional[str],
+    split: str,
+    force_cache: bool = False,
+    num_workers: Optional[int] = None,
+) -> Dict[str, Tuple[np.ndarray, bool]]:
+    """
+    Pre-load YOLO label files into memory with optional disk cache.
+
+    Used by fast_mode to avoid repeatedly opening tens of thousands of small label
+    files (can be very slow on network filesystems).
+    """
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 8
+        # Labels are I/O-bound, so a bit of oversubscription is OK.
+        num_workers = min(32, max(8, cpu_count * 2))
+
+    # Cache filename based on split + image list hash
+    image_list_hash = hashlib.md5(",".join(sorted(image_list)).encode()).hexdigest()[:8]
+    cache_filename = f"labels_cache_{split}_{image_list_hash}.pkl"
+
+    cache_path: Optional[Path] = None
+    if cache_dir:
+        cache_dir_path = Path(cache_dir)
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir_path / cache_filename
+
+    # Try to load from disk
+    if cache_path and cache_path.exists() and not force_cache:
+        print(f"Loading label cache from disk: {cache_path}")
+        try:
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            if isinstance(cache, dict) and len(cache) == len(image_list):
+                print(f"  Loaded {len(cache)} labels from cache")
+                return cache
+            print(f"  Cache size mismatch ({len(cache)} vs {len(image_list)}), regenerating...")
+        except Exception as e:
+            print(f"  Failed to load label cache: {e}, regenerating...")
+
+    # Load labels in parallel
+    print(f"Pre-loading {len(image_list)} labels into cache...")
+
+    def load_one(name: str):
+        if name.startswith("negative_"):
+            return name, (np.zeros(8, dtype=np.float32), False)
+        label_path = label_dir / f"{Path(name).stem}.txt"
+        return name, load_yolo_label(str(label_path))
+
+    labels_dict: Dict[str, Tuple[np.ndarray, bool]] = {}
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for name, label in tqdm(
+            executor.map(load_one, image_list),
+            total=len(image_list),
+            desc=f"Loading labels ({split})",
+            unit="img",
+        ):
+            labels_dict[name] = label
+
+    # Save to disk
+    if cache_path:
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        print(f"Saving label cache to disk: {cache_path}")
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(labels_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+            size_mb = cache_path.stat().st_size / (1024 * 1024)
+            print(f"  Label cache size: {size_mb:.1f} MB")
+        except Exception as e:
+            print(f"  Warning: Failed to save label cache: {e}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+    return labels_dict
 
 
 class DocCornerDataset:
@@ -1039,14 +1133,13 @@ def create_dataset(
         image_list = load_split_file(str(split_file))
         label_dir = data_root_path / "labels"
 
-        # Pre-load all labels
-        labels_dict = {}
-        for name in image_list:
-            if name.startswith("negative_"):
-                labels_dict[name] = (np.zeros(8, dtype=np.float32), False)
-            else:
-                label_path = label_dir / f"{Path(name).stem}.txt"
-                labels_dict[name] = load_yolo_label(str(label_path))
+        # Pre-load all labels (can be slow on network FS; cache to disk).
+        labels_dict = preload_labels_to_cache(
+            image_list=image_list,
+            label_dir=label_dir,
+            cache_dir=str(data_root_path / ".cache"),
+            split=split,
+        )
 
         # Load outlier set if provided
         outlier_set = None

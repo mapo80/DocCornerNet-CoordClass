@@ -27,6 +27,14 @@ def parse_args():
 
     parser.add_argument("--model_path", type=str, required=True,
                         help="Path to saved model directory or weights file")
+    parser.add_argument(
+        "--unsafe_load",
+        action="store_true",
+        help=(
+            "Allow unsafe Keras deserialization (e.g., Lambda layers) when loading a serialized .keras model. "
+            "Use only for artifacts you trust."
+        ),
+    )
     parser.add_argument("--data_root", type=str,
                         default="../../datasets/official/doc-scanner-dataset-labeled",
                         help="Path to dataset root")
@@ -113,18 +121,51 @@ def load_model(args):
     if config_path and config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
-        backbone = config.get("backbone", args.backbone)
-        backbone_minimalistic = args.backbone_minimalistic or config.get(
-            "backbone_minimalistic", False
+
+        # Support distillation/student configs (train_student.py) which store student_* keys.
+        is_student = any(
+            k in config
+            for k in (
+                "student_backbone",
+                "student_alpha",
+                "student_fpn_ch",
+                "student_simcc_ch",
+                "student_backbone_minimalistic",
+                "student_backbone_include_preprocessing",
+            )
         )
-        # CLI should be able to override config for backwards-compatible eval.
-        if args.backbone_include_preprocessing:
-            backbone_include_preprocessing = True
+        if is_student:
+            backbone = config.get("student_backbone", config.get("backbone", args.backbone))
+            alpha = config.get("student_alpha", config.get("alpha", args.alpha))
+            fpn_ch = config.get("student_fpn_ch", config.get("fpn_ch", args.fpn_ch))
+            simcc_ch = config.get("student_simcc_ch", config.get("simcc_ch", args.simcc_ch))
+            backbone_minimalistic = args.backbone_minimalistic or config.get(
+                "student_backbone_minimalistic", config.get("backbone_minimalistic", False)
+            )
+            if args.backbone_include_preprocessing:
+                backbone_include_preprocessing = True
+            else:
+                backbone_include_preprocessing = bool(
+                    config.get(
+                        "student_backbone_include_preprocessing",
+                        config.get("backbone_include_preprocessing", False),
+                    )
+                )
         else:
-            backbone_include_preprocessing = bool(config.get("backbone_include_preprocessing", False))
-        alpha = config.get("alpha", args.alpha)
-        fpn_ch = config.get("fpn_ch", args.fpn_ch)
-        simcc_ch = config.get("simcc_ch", args.simcc_ch)
+            backbone = config.get("backbone", args.backbone)
+            alpha = config.get("alpha", args.alpha)
+            fpn_ch = config.get("fpn_ch", args.fpn_ch)
+            simcc_ch = config.get("simcc_ch", args.simcc_ch)
+            backbone_minimalistic = args.backbone_minimalistic or config.get(
+                "backbone_minimalistic", False
+            )
+            # CLI should be able to override config for backwards-compatible eval.
+            if args.backbone_include_preprocessing:
+                backbone_include_preprocessing = True
+            else:
+                backbone_include_preprocessing = bool(config.get("backbone_include_preprocessing", False))
+
+        # CLI should be able to override config for backwards-compatible eval.
         img_size = config.get("img_size", args.img_size)
         num_bins = config.get("num_bins", args.num_bins)
         tau = config.get("tau", args.tau)
@@ -143,7 +184,12 @@ def load_model(args):
     # Load serialized model if possible (.keras or SavedModel directory)
     def _try_load_serialized(p: Path):
         try:
-            return keras.models.load_model(str(p), compile=False, safe_mode=False)
+            if args.unsafe_load:
+                try:
+                    keras.config.enable_unsafe_deserialization()
+                except Exception:
+                    pass
+            return keras.models.load_model(str(p), compile=False, safe_mode=not args.unsafe_load)
         except TypeError:
             # Older TF/Keras versions don't support safe_mode.
             return keras.models.load_model(str(p), compile=False)
@@ -242,7 +288,8 @@ def main():
         else:
             coords_pred = outputs["coords"].numpy()
             score_logit = outputs["score_logit"].numpy()
-        score_pred = 1.0 / (1.0 + np.exp(-score_logit))  # sigmoid
+        # Numerically-stable sigmoid (avoid overflow warnings).
+        score_pred = 1.0 / (1.0 + np.exp(-np.clip(score_logit, -60.0, 60.0)))
 
         coords_gt = targets["coords"].numpy()
         has_doc = targets["has_doc"].numpy()

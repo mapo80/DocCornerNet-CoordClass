@@ -83,6 +83,16 @@ def parse_args():
     parser.add_argument("--data_root", type=str,
                         default="../../datasets/official/doc-scanner-dataset-labeled",
                         help="Path to dataset root")
+    parser.add_argument(
+        "--input_norm",
+        type=str,
+        default="auto",
+        choices=["auto", "imagenet", "zero_one", "raw255"],
+        help=(
+            "Input normalization for dataset images. "
+            "Use 'auto' to pick raw255 when --backbone_include_preprocessing is set, otherwise imagenet."
+        ),
+    )
     parser.add_argument("--negative_dir", type=str, default="images-negative",
                         help="Negative images directory name")
     parser.add_argument("--outlier_list", type=str, default=None,
@@ -125,6 +135,20 @@ def parse_args():
         type=str,
         default="imagenet",
         help="Backbone init weights ('imagenet' or None). None avoids downloads.",
+    )
+    parser.add_argument(
+        "--init_weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional warm-start weights (.weights.h5) or a checkpoint directory containing best_model.weights.h5. "
+            "Useful for fine-tuning at a different img_size/num_bins."
+        ),
+    )
+    parser.add_argument(
+        "--init_partial",
+        action="store_true",
+        help="If strict init load fails, retry with by_name=True, skip_mismatch=True (HDF5 only).",
     )
     parser.add_argument("--fpn_ch", type=int, default=48,
                         help="FPN channels")
@@ -186,6 +210,44 @@ def _normalize_backbone_weights(value):
     return value
 
 
+def _normalize_input_norm(value: str) -> str:
+    if value is None:
+        return "auto"
+    value = value.strip().lower()
+    if value in {"0_1", "01"}:
+        return "zero_one"
+    if value in {"0_255", "0255"}:
+        return "raw255"
+    return value
+
+
+def _resolve_input_norm(value: str, backbone_include_preprocessing: bool) -> str:
+    norm = _normalize_input_norm(value)
+    if norm == "auto":
+        return "raw255" if backbone_include_preprocessing else "imagenet"
+    if norm not in {"imagenet", "zero_one", "raw255"}:
+        raise ValueError(f"Unsupported input_norm='{value}'. Use: auto, imagenet, zero_one, raw255.")
+    return norm
+
+
+def _find_init_weights_path(value: str) -> Path:
+    p = Path(value)
+    if p.is_dir():
+        for candidate in [
+            p / "best_model.weights.h5",
+            p / "final_model.weights.h5",
+            p / "latest_weights.h5",
+            p / "best_iou_weights.h5",
+            p / "final_weights.h5",
+        ]:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"Cannot find a weights file in init_weights directory: {p}")
+    if not p.exists():
+        raise FileNotFoundError(f"init_weights not found: {p}")
+    return p
+
+
 class DocCornerNetV3Trainer:
     """
     Custom trainer with progress bar for each epoch.
@@ -202,6 +264,8 @@ class DocCornerNetV3Trainer:
         w_coord: float = 0.2,
         w_score: float = 1.0,
         fast_mode: bool = False,
+        augment: bool = False,
+        image_norm: str = "imagenet",
     ):
         self.model = model
         self.optimizer = optimizer
@@ -212,6 +276,8 @@ class DocCornerNetV3Trainer:
         self.w_coord = w_coord
         self.w_score = w_score
         self.fast_mode = fast_mode
+        self.augment = bool(augment)
+        self.image_norm = str(image_norm)
 
         # Metrics for tracking
         self.train_loss = keras.metrics.Mean(name="loss")
@@ -282,7 +348,7 @@ class DocCornerNetV3Trainer:
 
     def _compute_metrics(self, coords_pred, coords_gt, has_doc):
         """Compute IoU and corner error for positive samples."""
-        img_size = 224.0
+        img_size = tf.cast(self.img_size, tf.float32)
 
         mask_bool = tf.cast(has_doc, tf.bool)
         pred_pos = tf.boolean_mask(coords_pred, mask_bool)
@@ -333,7 +399,14 @@ class DocCornerNetV3Trainer:
 
         # Apply TF augmentation on GPU (fast_mode)
         if apply_augment:
-            images, coords = tf_augment_batch(images, coords, has_doc, self.img_size, is_outlier)
+            images, coords = tf_augment_batch(
+                images,
+                coords,
+                has_doc,
+                self.img_size,
+                is_outlier,
+                image_norm=self.image_norm,
+            )
             targets = {"coords": coords, "has_doc": has_doc}
 
         with tf.GradientTape() as tape:
@@ -343,7 +416,13 @@ class DocCornerNetV3Trainer:
         gradients = tape.gradient(losses["total"], self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
 
-        return losses, outputs
+        has_doc_1d = tf.cast(targets["has_doc"], tf.float32)
+        if len(has_doc_1d.shape) == 2:
+            has_doc_1d = tf.squeeze(has_doc_1d, axis=-1)
+
+        iou, corner_err = self._compute_metrics(outputs["coords"], targets["coords"], has_doc_1d)
+
+        return losses, iou, corner_err
 
     def train_epoch(self, train_ds, num_batches: int):
         """Train for one epoch with progress bar."""
@@ -367,7 +446,11 @@ class DocCornerNetV3Trainer:
         )
 
         for images, targets in pbar:
-            losses, outputs = self.train_step(images, targets, apply_augment=self.fast_mode)
+            losses, iou, corner_err = self.train_step(
+                images,
+                targets,
+                apply_augment=(self.fast_mode and self.augment),
+            )
 
             # Update metrics
             self.train_loss.update_state(losses["total"])
@@ -375,12 +458,6 @@ class DocCornerNetV3Trainer:
             self.train_coord_loss.update_state(losses["coord"])
             self.train_score_loss.update_state(losses["score"])
 
-            has_doc = tf.cast(targets["has_doc"], tf.float32)
-            if len(has_doc.shape) == 2:
-                has_doc = tf.squeeze(has_doc, axis=-1)
-            iou, corner_err = self._compute_metrics(
-                outputs["coords"], targets["coords"], has_doc
-            )
             self.train_iou.update_state(iou)
             self.train_corner_err.update_state(corner_err)
 
@@ -462,6 +539,9 @@ def main():
     # Print device info first
     print_device_info()
 
+    # Resolve input normalization early so it is persisted in config.json.
+    args.input_norm = _resolve_input_norm(args.input_norm, args.backbone_include_preprocessing)
+
     # Setup output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / f"{args.experiment_name}_{timestamp}"
@@ -490,6 +570,7 @@ def main():
 
     # Create datasets
     print("\nLoading datasets...")
+    print(f"Input normalization: {args.input_norm}")
 
     # Augmentation configs - stronger for better generalization
     augment_config = {
@@ -567,6 +648,7 @@ def main():
         negative_dir=args.negative_dir,
         shared_cache=shared_cache,
         fast_mode=use_fast_mode,
+        image_norm=args.input_norm,
     )
     val_ds = create_dataset(
         data_root=args.data_root,
@@ -578,6 +660,7 @@ def main():
         negative_dir=args.negative_dir,
         shared_cache=shared_cache,
         fast_mode=use_fast_mode,
+        image_norm=args.input_norm,
     )
 
     # Create model
@@ -601,6 +684,21 @@ def main():
     else:
         print("✗ Over 1M parameters target")
 
+    # Optional warm-start
+    if args.init_weights:
+        init_path = _find_init_weights_path(args.init_weights)
+        print(f"\nLoading init weights from: {init_path}")
+        try:
+            model.load_weights(str(init_path))
+            print("✓ Loaded init weights (strict)")
+        except Exception as e:
+            if not args.init_partial:
+                raise
+            print(f"Warning: strict init load failed: {e}")
+            print("Retrying with by_name=True, skip_mismatch=True...")
+            model.load_weights(str(init_path), by_name=True, skip_mismatch=True)
+            print("✓ Loaded init weights (partial)")
+
     # Optimizer
     optimizer = keras.optimizers.AdamW(
         learning_rate=args.lr,
@@ -618,6 +716,8 @@ def main():
         w_coord=args.w_coord,
         w_score=args.w_score,
         fast_mode=use_fast_mode,
+        augment=args.augment,
+        image_norm=args.input_norm,
     )
 
     # Training state

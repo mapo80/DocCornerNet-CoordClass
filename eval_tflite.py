@@ -1,12 +1,10 @@
 """
-Evaluate TFLite models on validation dataset.
+Evaluate DocCornerNetV3 TFLite models on dataset splits.
 
-Metrics:
-- IoU (Intersection over Union)
-- Pixel Error (L2 distance in pixels)
-- Recall@95 (% samples with IoU >= 0.95)
-- Inference time
+Goal: match `evaluate.py` metrics while running inference via TFLite Interpreter.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -14,358 +12,214 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 import tensorflow as tf
+from tqdm import tqdm
+
+from dataset import create_dataset
+from metrics import ValidationMetrics
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate TFLite models on validation dataset",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    p = argparse.ArgumentParser(
+        description="Evaluate DocCornerNetV3 TFLite models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    parser.add_argument("--tflite_models", type=str, nargs="+", required=True,
-                        help="Paths to TFLite models to evaluate")
-    parser.add_argument("--data_root", type=str, required=True,
-                        help="Path to dataset root (with images/ and labels.json)")
-    parser.add_argument("--split", type=str, default="val",
-                        choices=["train", "val", "test"],
-                        help="Dataset split to evaluate")
-    parser.add_argument("--img_size", type=int, default=224,
-                        help="Input image size")
-    parser.add_argument(
+    p.add_argument(
+        "--tflite_models",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Paths to TFLite models to evaluate",
+    )
+    p.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Dataset root (contains images/, labels/, split files, images-negative/)",
+    )
+    p.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    p.add_argument(
         "--input_norm",
         type=str,
         default="imagenet",
         choices=["imagenet", "zero_one", "raw255"],
-        help="Input normalization applied before feeding the TFLite model",
+        help="Normalization applied BEFORE feeding the TFLite model. "
+        "If your TFLite model includes preprocessing, use raw255.",
     )
-    parser.add_argument("--num_samples", type=int, default=None,
-                        help="Max samples to evaluate (None = all)")
-    parser.add_argument("--benchmark_runs", type=int, default=50,
-                        help="Number of runs for latency benchmark")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output JSON file for results")
+    p.add_argument("--batch_size", type=int, default=32, help="tf.data batch size (TFLite runs per-sample)")
+    p.add_argument("--num_samples", type=int, default=None, help="Limit number of evaluated samples")
+    p.add_argument("--threads", type=int, default=1, help="TFLite interpreter CPU threads")
+    p.add_argument("--warmup_runs", type=int, default=10, help="Warmup invokes before timing")
+    p.add_argument(
+        "--benchmark_runs",
+        type=int,
+        default=200,
+        help="Max number of samples used to report latency stats",
+    )
+    p.add_argument("--output", type=str, default=None, help="Write results JSON to this path")
+    return p.parse_args()
 
-    return parser.parse_args()
+
+def _infer_img_size(interpreter: tf.lite.Interpreter) -> int:
+    details = interpreter.get_input_details()
+    if not details:
+        raise RuntimeError("TFLite model has no inputs.")
+    shape = details[0]["shape"]
+    if len(shape) != 4:
+        raise RuntimeError(f"Unexpected input shape {shape} (expected [B,H,W,C])")
+    h = int(shape[1])
+    w = int(shape[2])
+    c = int(shape[3])
+    if c != 3:
+        raise RuntimeError(f"Unexpected input channels C={c} (expected 3)")
+    if h != w:
+        raise RuntimeError(f"Non-square input not supported: H={h}, W={w}")
+    return h
 
 
-def load_labels(data_root: Path, split: str):
-    """Load labels for the specified split.
+def _quantize_if_needed(x: np.ndarray, input_detail: dict) -> np.ndarray:
+    dtype = input_detail["dtype"]
+    if dtype not in (np.uint8, np.int8):
+        return x.astype(dtype, copy=False)
 
-    Supports two formats:
-    1. labels.json with {filename: {corners: [[x,y],...], split: "val"}}
-    2. {split}.txt with filenames, and labels/ folder with YOLO-style txt files
-    """
-    labels_json = data_root / "labels.json"
-    split_txt = data_root / f"{split}.txt"
+    scale, zero_point = input_detail.get("quantization", (0.0, 0))
+    if not scale:
+        raise RuntimeError("Quantized input without quantization parameters.")
 
-    samples = []
-
-    if labels_json.exists():
-        # JSON format
-        with open(labels_json) as f:
-            all_labels = json.load(f)
-
-        for filename, data in all_labels.items():
-            if data.get("split") == split:
-                corners = data.get("corners")
-                if corners:
-                    coords = np.array(corners, dtype=np.float32).flatten()
-                    samples.append({
-                        "filename": filename,
-                        "coords": coords,
-                        "has_document": True
-                    })
-
-    elif split_txt.exists():
-        # TXT format (YOLO-style)
-        labels_dir = data_root / "labels"
-
-        with open(split_txt) as f:
-            filenames = [line.strip() for line in f if line.strip()]
-
-        for filename in filenames:
-            # Get corresponding label file
-            label_file = labels_dir / filename.replace('.jpg', '.txt').replace('.png', '.txt')
-
-            if not label_file.exists():
-                continue
-
-            with open(label_file) as f:
-                line = f.readline().strip()
-
-            if not line:
-                continue
-
-            parts = line.split()
-            if len(parts) < 9:  # class + 8 coords
-                continue
-
-            # Format: class x0 y0 x1 y1 x2 y2 x3 y3
-            coords = np.array([float(x) for x in parts[1:9]], dtype=np.float32)
-
-            samples.append({
-                "filename": filename,
-                "coords": coords,
-                "has_document": True
-            })
-
+    xq = np.round(x / scale + zero_point)
+    if dtype == np.uint8:
+        xq = np.clip(xq, 0, 255)
     else:
-        raise FileNotFoundError(f"No labels.json or {split}.txt found in {data_root}")
-
-    return samples
-
-
-def preprocess_image(image_path: Path, img_size: int, input_norm: str) -> np.ndarray:
-    """Load and preprocess image for inference."""
-    img = Image.open(image_path).convert("RGB")
-    img = img.resize((img_size, img_size), Image.BILINEAR)
-    img = np.array(img, dtype=np.float32)
-
-    norm_mode = input_norm.lower().strip()
-    if norm_mode == "imagenet":
-        img = img / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img = (img - mean) / std
-    elif norm_mode in {"zero_one", "0_1", "01"}:
-        img = img / 255.0
-    elif norm_mode in {"raw255", "0_255", "0255"}:
-        pass
-    else:
-        raise ValueError(f"Unsupported input_norm='{input_norm}'. Use: imagenet, zero_one, raw255.")
-
-    return img[np.newaxis, ...]  # Add batch dimension
+        xq = np.clip(xq, -128, 127)
+    return xq.astype(dtype)
 
 
-def compute_iou(pred_coords: np.ndarray, gt_coords: np.ndarray, img_size: int = 224) -> float:
-    """
-    Compute IoU between predicted and ground truth quadrilaterals.
+def _parse_outputs(interpreter: tf.lite.Interpreter) -> tuple[np.ndarray, float]:
+    outs = interpreter.get_output_details()
+    if not outs:
+        raise RuntimeError("TFLite model has no outputs.")
 
-    Args:
-        pred_coords: [8] - predicted normalized coordinates (x0,y0,x1,y1,x2,y2,x3,y3)
-        gt_coords: [8] - ground truth normalized coordinates
-        img_size: image size for pixel conversion
-
-    Returns:
-        IoU score (0-1)
-    """
-    try:
-        from shapely.geometry import Polygon
-
-        # Convert to pixel coordinates
-        pred_pts = pred_coords.reshape(4, 2) * img_size
-        gt_pts = gt_coords.reshape(4, 2) * img_size
-
-        # Create polygons
-        pred_poly = Polygon(pred_pts)
-        gt_poly = Polygon(gt_pts)
-
-        if not pred_poly.is_valid or not gt_poly.is_valid:
-            return 0.0
-
-        # Compute IoU
-        intersection = pred_poly.intersection(gt_poly).area
-        union = pred_poly.union(gt_poly).area
-
-        if union == 0:
-            return 0.0
-
-        return intersection / union
-
-    except Exception as e:
-        # Fallback: simple bounding box IoU
-        return compute_bbox_iou(pred_coords, gt_coords)
-
-
-def compute_bbox_iou(pred_coords: np.ndarray, gt_coords: np.ndarray) -> float:
-    """Fallback: compute bounding box IoU."""
-    pred_pts = pred_coords.reshape(4, 2)
-    gt_pts = gt_coords.reshape(4, 2)
-
-    # Get bounding boxes
-    pred_x1, pred_y1 = pred_pts.min(axis=0)
-    pred_x2, pred_y2 = pred_pts.max(axis=0)
-    gt_x1, gt_y1 = gt_pts.min(axis=0)
-    gt_x2, gt_y2 = gt_pts.max(axis=0)
-
-    # Intersection
-    inter_x1 = max(pred_x1, gt_x1)
-    inter_y1 = max(pred_y1, gt_y1)
-    inter_x2 = min(pred_x2, gt_x2)
-    inter_y2 = min(pred_y2, gt_y2)
-
-    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
-        return 0.0
-
-    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-    pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
-    gt_area = (gt_x2 - gt_x1) * (gt_y2 - gt_y1)
-    union_area = pred_area + gt_area - inter_area
-
-    if union_area == 0:
-        return 0.0
-
-    return inter_area / union_area
-
-
-def compute_pixel_error(pred_coords: np.ndarray, gt_coords: np.ndarray, img_size: int = 224) -> float:
-    """Compute mean L2 pixel error across all corners."""
-    pred_px = pred_coords * img_size
-    gt_px = gt_coords * img_size
-
-    # Reshape to [4, 2] and compute per-corner distances
-    pred_pts = pred_px.reshape(4, 2)
-    gt_pts = gt_px.reshape(4, 2)
-
-    distances = np.linalg.norm(pred_pts - gt_pts, axis=1)
-    return float(np.mean(distances))
-
-
-class TFLiteModel:
-    """Wrapper for TFLite model inference."""
-
-    def __init__(self, model_path: str):
-        self.interpreter = tf.lite.Interpreter(model_path=model_path)
-        self.interpreter.allocate_tensors()
-
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-
-        # Detect output format
-        # Format 1: Single output [1, 9] = [coords[8], score[1]]
-        # Format 2: Two outputs [1, 8] coords and [1, 1] score
-        self.single_output = False
-        self.coords_idx = None
-        self.score_idx = None
-
-        if len(self.output_details) == 1:
-            shape = self.output_details[0]['shape']
-            if len(shape) == 2 and shape[1] == 9:
-                # Single output format [1, 9]
-                self.single_output = True
-                self.output_idx = self.output_details[0]['index']
+    if len(outs) == 1:
+        y = interpreter.get_tensor(outs[0]["index"])
+        y = np.asarray(y)
+        if y.ndim != 2 or y.shape[0] != 1:
+            raise RuntimeError(f"Unexpected output shape: {y.shape}")
+        if y.shape[1] == 9:
+            coords = y[0, :8].astype(np.float32)
+            score = float(y[0, 8])
+        elif y.shape[1] == 8:
+            coords = y[0, :8].astype(np.float32)
+            score = 1.0
         else:
-            # Two output format
-            for od in self.output_details:
-                shape = od['shape']
-                if len(shape) == 2:
-                    if shape[1] == 8:
-                        self.coords_idx = od['index']
-                    elif shape[1] == 1:
-                        self.score_idx = od['index']
+            raise RuntimeError(f"Unexpected output shape: {y.shape} (expected [1,9] or [1,8])")
+        return np.clip(coords, 0.0, 1.0), float(np.clip(score, 0.0, 1.0))
 
-        if not self.single_output and self.coords_idx is None:
-            raise ValueError("Could not find coords output (shape [N, 8] or [N, 9])")
-
-    def predict(self, image: np.ndarray) -> dict:
-        """Run inference on a single image."""
-        self.interpreter.set_tensor(self.input_details[0]['index'], image)
-        self.interpreter.invoke()
-
-        if self.single_output:
-            # Single output [1, 9] = [coords[8], score[1]]
-            output = self.interpreter.get_tensor(self.output_idx)
-            coords = output[0, :8]
-            score = float(output[0, 8])
-        else:
-            # Two outputs
-            coords = self.interpreter.get_tensor(self.coords_idx)[0]
-            score = float(self.interpreter.get_tensor(self.score_idx)[0, 0]) if self.score_idx else 0.0
-
-        return {
-            'coords': coords,  # [8]
-            'score': score
-        }
-
-    def benchmark(self, img_size: int, num_runs: int = 100) -> dict:
-        """Benchmark inference latency."""
-        dummy = np.random.randn(1, img_size, img_size, 3).astype(np.float32)
-
-        # Warmup
-        for _ in range(10):
-            self.predict(dummy)
-
-        # Benchmark
-        times = []
-        for _ in range(num_runs):
-            start = time.perf_counter()
-            self.predict(dummy)
-            times.append(time.perf_counter() - start)
-
-        times_ms = np.array(times) * 1000
-
-        return {
-            'mean_ms': float(np.mean(times_ms)),
-            'std_ms': float(np.std(times_ms)),
-            'p50_ms': float(np.percentile(times_ms, 50)),
-            'p95_ms': float(np.percentile(times_ms, 95)),
-            'min_ms': float(np.min(times_ms)),
-            'max_ms': float(np.max(times_ms)),
-        }
+    # Best-effort for legacy exports with two outputs (coords + score).
+    y0 = interpreter.get_tensor(outs[0]["index"])
+    y1 = interpreter.get_tensor(outs[1]["index"])
+    coords = np.asarray(y0).reshape(-1).astype(np.float32)[:8]
+    score = float(np.asarray(y1).reshape(-1)[0])
+    return np.clip(coords, 0.0, 1.0), float(np.clip(score, 0.0, 1.0))
 
 
-def evaluate_model(
-    model: TFLiteModel,
-    samples: list,
-    data_root: Path,
-    img_size: int,
+def _run_one(interpreter: tf.lite.Interpreter, x_nhwc: np.ndarray) -> tuple[np.ndarray, float, float]:
+    input_detail = interpreter.get_input_details()[0]
+    input_index = input_detail["index"]
+
+    x = _quantize_if_needed(x_nhwc, input_detail)
+    interpreter.set_tensor(input_index, x)
+    t0 = time.perf_counter()
+    interpreter.invoke()
+    t1 = time.perf_counter()
+    coords, score = _parse_outputs(interpreter)
+    return coords, score, (t1 - t0) * 1000.0
+
+
+def evaluate_tflite_model(
+    tflite_path: str,
+    data_root: str,
+    split: str,
     input_norm: str,
-    num_samples: int = None,
+    batch_size: int,
+    num_samples: int | None,
+    threads: int,
+    warmup_runs: int,
+    benchmark_runs: int,
 ) -> dict:
-    """Evaluate model on samples."""
+    interpreter = tf.lite.Interpreter(model_path=str(tflite_path), num_threads=threads)
+    interpreter.allocate_tensors()
+
+    img_size = _infer_img_size(interpreter)
+    input_dtype = interpreter.get_input_details()[0]["dtype"]
+
+    dataset = create_dataset(
+        data_root=data_root,
+        split=split,
+        img_size=img_size,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        augment=False,
+        drop_remainder=False,
+        image_norm=input_norm,
+    )
     if num_samples:
-        samples = samples[:num_samples]
+        dataset = dataset.take(int(np.ceil(num_samples / max(1, int(batch_size)))))
 
-    ious = []
-    pixel_errors = []
+    metrics = ValidationMetrics(img_size=img_size)
+    lat_ms: list[float] = []
 
-    image_dir = data_root / "images"
+    # Warmup on zeros (avoid measuring first-time allocations/compilation).
+    in_detail = interpreter.get_input_details()[0]
+    dummy = np.zeros(in_detail["shape"], dtype=in_detail["dtype"])
+    for _ in range(max(0, int(warmup_runs))):
+        interpreter.set_tensor(in_detail["index"], dummy)
+        interpreter.invoke()
 
-    print(f"  Evaluating {len(samples)} samples...")
+    seen = 0
+    for images, targets in tqdm(dataset, desc=f"TFLite eval ({Path(tflite_path).name})"):
+        x = images.numpy()
+        coords_gt = targets["coords"].numpy()
+        has_doc = targets["has_doc"].numpy()
 
-    for i, sample in enumerate(samples):
-        if (i + 1) % 100 == 0:
-            print(f"    {i+1}/{len(samples)}")
+        b = x.shape[0]
+        coords_pred = np.zeros((b, 8), dtype=np.float32)
+        score_pred = np.zeros((b,), dtype=np.float32)
 
-        # Load and preprocess image
-        img_path = image_dir / sample['filename']
-        if not img_path.exists():
-            continue
+        for j in range(b):
+            coords, score, ms = _run_one(interpreter, x[j : j + 1])
+            coords_pred[j] = coords
+            score_pred[j] = score
+            if len(lat_ms) < int(benchmark_runs):
+                lat_ms.append(float(ms))
 
-        image = preprocess_image(img_path, img_size, input_norm=input_norm)
+        metrics.update(coords_pred, coords_gt, score_pred, has_doc)
 
-        # Run inference
-        output = model.predict(image)
-        pred_coords = output['coords']
-        gt_coords = sample['coords']
+        seen += b
+        if num_samples and seen >= num_samples:
+            break
 
-        # Compute metrics
-        iou = compute_iou(pred_coords, gt_coords, img_size)
-        px_err = compute_pixel_error(pred_coords, gt_coords, img_size)
+    results = metrics.compute()
+    results.update(
+        {
+            "model": str(tflite_path),
+            "img_size": int(img_size),
+            "input_norm": str(input_norm),
+            "tflite_threads": int(threads),
+            "tflite_input_dtype": str(np.dtype(input_dtype)),
+        }
+    )
 
-        ious.append(iou)
-        pixel_errors.append(px_err)
-
-    ious = np.array(ious)
-    pixel_errors = np.array(pixel_errors)
-
-    # Compute aggregate metrics
-    results = {
-        'num_samples': len(ious),
-        'iou_mean': float(np.mean(ious)),
-        'iou_std': float(np.std(ious)),
-        'iou_median': float(np.median(ious)),
-        'iou_min': float(np.min(ious)),
-        'iou_max': float(np.max(ious)),
-        'pixel_error_mean': float(np.mean(pixel_errors)),
-        'pixel_error_std': float(np.std(pixel_errors)),
-        'pixel_error_median': float(np.median(pixel_errors)),
-        'recall_90': float(np.mean(ious >= 0.90) * 100),
-        'recall_95': float(np.mean(ious >= 0.95) * 100),
-        'recall_99': float(np.mean(ious >= 0.99) * 100),
-    }
+    if lat_ms:
+        arr = np.array(lat_ms, dtype=np.float32)
+        results["latency_ms_p50"] = float(np.percentile(arr, 50))
+        results["latency_ms_p95"] = float(np.percentile(arr, 95))
+        results["latency_ms_mean"] = float(arr.mean())
+        results["latency_ms_n"] = int(len(arr))
+    else:
+        results["latency_ms_p50"] = 0.0
+        results["latency_ms_p95"] = 0.0
+        results["latency_ms_mean"] = 0.0
+        results["latency_ms_n"] = 0
 
     return results
 
@@ -373,87 +227,46 @@ def evaluate_model(
 def main():
     args = parse_args()
 
-    data_root = Path(args.data_root)
+    print("=" * 60)
+    print("DocCornerNetV3 TFLite Evaluation")
+    print("=" * 60)
+    print(f"Split: {args.split}")
+    print(f"Input normalization (fed to TFLite): {args.input_norm}")
 
-    print("=" * 70)
-    print("TFLite Model Evaluation")
-    print("=" * 70)
-
-    # Load validation samples
-    print(f"\nLoading {args.split} samples from {data_root}...")
-    samples = load_labels(data_root, args.split)
-    print(f"  Found {len(samples)} samples")
-
-    if len(samples) == 0:
-        print("ERROR: No samples found!")
-        return
-
-    all_results = {}
-
+    all_results = []
     for model_path in args.tflite_models:
-        model_path = Path(model_path)
-        model_name = model_path.stem
-
-        print(f"\n{'='*70}")
-        print(f"Model: {model_name}")
-        print(f"  Path: {model_path}")
-        print(f"  Size: {model_path.stat().st_size / (1024*1024):.2f} MB")
-        print("=" * 70)
-
-        # Load model
-        model = TFLiteModel(str(model_path))
-
-        # Benchmark latency
-        print("\nBenchmarking latency...")
-        latency = model.benchmark(args.img_size, args.benchmark_runs)
-        print(f"  Mean: {latency['mean_ms']:.2f} ms")
-        print(f"  P50:  {latency['p50_ms']:.2f} ms")
-        print(f"  P95:  {latency['p95_ms']:.2f} ms")
-
-        # Evaluate accuracy
-        print("\nEvaluating accuracy...")
-        metrics = evaluate_model(
-            model,
-            samples,
-            data_root,
-            args.img_size,
+        r = evaluate_tflite_model(
+            tflite_path=model_path,
+            data_root=args.data_root,
+            split=args.split,
             input_norm=args.input_norm,
+            batch_size=args.batch_size,
             num_samples=args.num_samples,
+            threads=args.threads,
+            warmup_runs=args.warmup_runs,
+            benchmark_runs=args.benchmark_runs,
         )
+        all_results.append(r)
 
-        print(f"\nResults:")
-        print(f"  IoU:        {metrics['iou_mean']:.4f} ± {metrics['iou_std']:.4f}")
-        print(f"  Pixel Err:  {metrics['pixel_error_mean']:.2f} ± {metrics['pixel_error_std']:.2f} px")
-        print(f"  R@90:       {metrics['recall_90']:.1f}%")
-        print(f"  R@95:       {metrics['recall_95']:.1f}%")
-        print(f"  R@99:       {metrics['recall_99']:.1f}%")
-
-        all_results[model_name] = {
-            'path': str(model_path),
-            'size_mb': model_path.stat().st_size / (1024*1024),
-            'latency': latency,
-            'metrics': metrics,
-        }
-
-    # Summary table
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("=" * 70)
-    print(f"{'Model':<25} {'Size':>8} {'Latency':>10} {'IoU':>8} {'Err(px)':>8} {'R@95':>8}")
-    print("-" * 70)
+    print("=" * 60)
+    for r in all_results:
+        print(f"\nModel: {r['model']}")
+        print(f"  Mean IoU:          {r['mean_iou']:.4f}")
+        print(f"  Corner Err (mean): {r['corner_error_px']:.2f}px (p95={r['corner_error_p95_px']:.2f}px)")
+        print(f"  Recall@95:         {r['recall_95']*100:.1f}%")
+        print(f"  Cls acc:           {r['cls_accuracy']*100:.1f}% (F1={r['cls_f1']*100:.1f}%)")
+        print(f"  Latency p50/p95:   {r['latency_ms_p50']:.2f}/{r['latency_ms_p95']:.2f} ms (n={r['latency_ms_n']})")
 
-    for name, data in all_results.items():
-        print(f"{name:<25} {data['size_mb']:>7.2f}M {data['latency']['mean_ms']:>9.2f}ms "
-              f"{data['metrics']['iou_mean']:>7.4f} {data['metrics']['pixel_error_mean']:>7.2f} "
-              f"{data['metrics']['recall_95']:>7.1f}%")
-
-    # Save results
     if args.output:
-        output_path = Path(args.output)
-        with open(output_path, 'w') as f:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
             json.dump(all_results, f, indent=2)
-        print(f"\nResults saved to: {output_path}")
+        print(f"\nSaved: {out_path}")
 
 
 if __name__ == "__main__":
     main()
+

@@ -76,6 +76,17 @@ def parse_args():
         help="Path to dataset root",
     )
     parser.add_argument(
+        "--input_norm",
+        type=str,
+        default="auto",
+        choices=["auto", "imagenet", "zero_one", "raw255"],
+        help=(
+            "Input normalization for dataset images. "
+            "Use 'auto' to pick the teacher config value when available, otherwise "
+            "raw255 when teacher includes preprocessing, else imagenet."
+        ),
+    )
+    parser.add_argument(
         "--negative_dir",
         type=str,
         default="images-negative",
@@ -158,6 +169,20 @@ def parse_args():
     parser.add_argument("--student_fpn_ch", type=int, default=32, help="Student FPN channels")
     parser.add_argument("--student_simcc_ch", type=int, default=96, help="Student head channels")
     parser.add_argument(
+        "--student_init_weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional warm-start weights (.weights.h5) or a checkpoint directory containing best_model.weights.h5 "
+            "(strict load)."
+        ),
+    )
+    parser.add_argument(
+        "--student_init_partial",
+        action="store_true",
+        help="If strict student init load fails, retry with by_name=True, skip_mismatch=True (HDF5 only).",
+    )
+    parser.add_argument(
         "--student_backbone_weights",
         type=str,
         default="imagenet",
@@ -203,10 +228,52 @@ def _normalize_backbone_weights(value):
     return value
 
 
-def _load_teacher_kwargs(args) -> dict:
+def _normalize_input_norm(value: str) -> str:
+    if value is None:
+        return "auto"
+    value = value.strip().lower()
+    if value in {"0_1", "01"}:
+        return "zero_one"
+    if value in {"0_255", "0255"}:
+        return "raw255"
+    return value
+
+
+def _resolve_input_norm(value: str, teacher_cfg: dict, teacher_include_preprocessing: bool) -> str:
+    norm = _normalize_input_norm(value)
+    if norm == "auto":
+        cfg_norm = _normalize_input_norm(teacher_cfg.get("input_norm")) if teacher_cfg else "auto"
+        if cfg_norm != "auto":
+            return cfg_norm
+        return "raw255" if teacher_include_preprocessing else "imagenet"
+    if norm not in {"imagenet", "zero_one", "raw255"}:
+        raise ValueError(f"Unsupported input_norm='{value}'. Use: auto, imagenet, zero_one, raw255.")
+    return norm
+
+
+def _find_init_weights_path(value: str) -> Path:
+    p = Path(value)
+    if p.is_dir():
+        for candidate in [
+            p / "best_model.weights.h5",
+            p / "final_model.weights.h5",
+            p / "latest_weights.h5",
+            p / "best_iou_weights.h5",
+            p / "final_weights.h5",
+        ]:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"Cannot find a weights file in init_weights directory: {p}")
+    if not p.exists():
+        raise FileNotFoundError(f"init_weights not found: {p}")
+    return p
+
+
+def _load_teacher_kwargs(args) -> tuple[dict, dict]:
     """Load teacher model kwargs from config.json if available."""
     teacher_weights_path = Path(args.teacher_weights)
 
+    cfg = {}
     config_path = None
     if args.teacher_config:
         config_path = Path(args.teacher_config)
@@ -257,7 +324,7 @@ def _load_teacher_kwargs(args) -> dict:
             "Use matching bins for distillation."
         )
 
-    return teacher_kwargs
+    return teacher_kwargs, cfg
 
 
 def _find_split_file(data_root: Path, split: str) -> Path:
@@ -288,6 +355,8 @@ class StudentDistillTrainer:
         w_distill_coord: float = 0.0,
         w_distill_score: float = 0.1,
         fast_mode: bool = False,
+        augment: bool = False,
+        image_norm: str = "imagenet",
     ):
         self.student = student
         self.teacher = teacher
@@ -303,6 +372,8 @@ class StudentDistillTrainer:
         self.w_distill_coord = w_distill_coord
         self.w_distill_score = w_distill_score
         self.fast_mode = fast_mode
+        self.augment = bool(augment)
+        self.image_norm = str(image_norm)
 
         # Trackers
         self.train_loss = keras.metrics.Mean(name="loss")
@@ -416,10 +487,9 @@ class StudentDistillTrainer:
             "distill_score": loss_distill_score,
         }
 
-    @staticmethod
-    def _compute_metrics(coords_pred, coords_gt, has_doc):
+    def _compute_metrics(self, coords_pred, coords_gt, has_doc):
         """Compute coarse IoU + corner error for positive samples (fast)."""
-        img_size = 224.0
+        img_size = tf.cast(self.img_size, tf.float32)
 
         mask_bool = tf.cast(has_doc, tf.bool)
         pred_pos = tf.boolean_mask(coords_pred, mask_bool)
@@ -468,7 +538,14 @@ class StudentDistillTrainer:
         is_outlier = targets["is_outlier"] if "is_outlier" in targets else None
 
         if apply_augment:
-            images, coords = tf_augment_batch(images, coords, has_doc, self.img_size, is_outlier)
+            images, coords = tf_augment_batch(
+                images,
+                coords,
+                has_doc,
+                self.img_size,
+                is_outlier,
+                image_norm=self.image_norm,
+            )
             targets = {"coords": coords, "has_doc": has_doc}
 
         teacher_outputs = self.teacher(images, training=False)
@@ -492,8 +569,13 @@ class StudentDistillTrainer:
         gradients = tape.gradient(total_loss, self.student.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.student.trainable_variables))
 
+        has_doc_1d = tf.cast(targets["has_doc"], tf.float32)
+        if len(has_doc_1d.shape) == 2:
+            has_doc_1d = tf.squeeze(has_doc_1d, axis=-1)
+        iou, corner_err = self._compute_metrics(student_outputs["coords"], targets["coords"], has_doc_1d)
+
         losses = {"total": total_loss, **hard, **distill}
-        return losses, student_outputs
+        return losses, iou, corner_err
 
     def train_epoch(self, train_ds, num_batches: int):
         for metric in (
@@ -521,7 +603,11 @@ class StudentDistillTrainer:
         )
 
         for images, targets in pbar:
-            losses, outputs = self.train_step(images, targets, apply_augment=self.fast_mode)
+            losses, iou, corner_err = self.train_step(
+                images,
+                targets,
+                apply_augment=(self.fast_mode and self.augment),
+            )
 
             self.train_loss.update_state(losses["total"])
             self.train_loss_hard_simcc.update_state(losses["hard_simcc"])
@@ -531,10 +617,6 @@ class StudentDistillTrainer:
             self.train_loss_distill_coord.update_state(losses["distill_coord"])
             self.train_loss_distill_score.update_state(losses["distill_score"])
 
-            has_doc = tf.cast(targets["has_doc"], tf.float32)
-            if len(has_doc.shape) == 2:
-                has_doc = tf.squeeze(has_doc, axis=-1)
-            iou, corner_err = self._compute_metrics(outputs["coords"], targets["coords"], has_doc)
             self.train_iou.update_state(iou)
             self.train_corner_err.update_state(corner_err)
 
@@ -614,7 +696,17 @@ def main():
 
     print_device_info()
 
-    teacher_kwargs = _load_teacher_kwargs(args)
+    teacher_kwargs, teacher_cfg = _load_teacher_kwargs(args)
+    resolved_input_norm = _resolve_input_norm(
+        args.input_norm, teacher_cfg, teacher_kwargs["backbone_include_preprocessing"]
+    )
+    if args.input_norm != "auto" and teacher_cfg.get("input_norm"):
+        teacher_norm = _normalize_input_norm(teacher_cfg.get("input_norm"))
+        if teacher_norm != "auto" and teacher_norm != resolved_input_norm:
+            print(
+                f"Warning: --input_norm={resolved_input_norm} differs from teacher config input_norm={teacher_cfg.get('input_norm')}"
+            )
+    args.input_norm = resolved_input_norm
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / f"{args.experiment_name}_{timestamp}"
@@ -646,6 +738,7 @@ def main():
 
     # Create datasets
     print("\nLoading datasets...")
+    print(f"Input normalization: {args.input_norm}")
     augment_config = {
         "rotation_degrees": 10,
         "scale_range": (0.8, 1.1),
@@ -714,6 +807,7 @@ def main():
         negative_dir=args.negative_dir,
         shared_cache=shared_cache,
         fast_mode=use_fast_mode,
+        image_norm=args.input_norm,
     )
     val_ds = create_dataset(
         data_root=args.data_root,
@@ -725,6 +819,7 @@ def main():
         negative_dir=args.negative_dir,
         shared_cache=shared_cache,
         fast_mode=use_fast_mode,
+        image_norm=args.input_norm,
     )
 
     # Teacher
@@ -761,6 +856,20 @@ def main():
     )
     print(f"Student parameters: {student.count_params():,}")
 
+    if args.student_init_weights:
+        init_path = _find_init_weights_path(args.student_init_weights)
+        print(f"\nLoading student init weights from: {init_path}")
+        try:
+            student.load_weights(str(init_path))
+            print("✓ Loaded student init weights (strict)")
+        except Exception as e:
+            if not args.student_init_partial:
+                raise
+            print(f"Warning: strict student init load failed: {e}")
+            print("Retrying with by_name=True, skip_mismatch=True...")
+            student.load_weights(str(init_path), by_name=True, skip_mismatch=True)
+            print("✓ Loaded student init weights (partial)")
+
     optimizer = keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.weight_decay)
 
     trainer = StudentDistillTrainer(
@@ -778,6 +887,8 @@ def main():
         w_distill_coord=args.w_distill_coord,
         w_distill_score=args.w_distill_score,
         fast_mode=use_fast_mode,
+        augment=args.augment,
+        image_norm=args.input_norm,
     )
 
     best_iou = 0.0
