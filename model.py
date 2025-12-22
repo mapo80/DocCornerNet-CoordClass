@@ -18,6 +18,7 @@ Target: <1M parameters, IoU >= 0.99 at 224x224
 """
 
 import tensorflow as tf
+import numpy as np
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.utils import register_keras_serializable
@@ -47,9 +48,13 @@ class Resize1D(layers.Layer):
 
     def call(self, inputs):
         # inputs: [B, L, C] -> [B, target_length, C]
+        channels = inputs.shape[-1]
+        if channels is None:
+            raise ValueError("Resize1D requires a known channel dimension for TFLite/XNNPACK-friendly export.")
         x = tf.expand_dims(inputs, axis=2)  # [B, L, 1, C]
         x = tf.image.resize(x, size=(self.target_length, 1), method=self.method)
-        return x[:, :, 0, :]
+        # Avoid STRIDED_SLICE (often not delegated): reshape away the singleton width dimension.
+        return tf.reshape(x, [-1, self.target_length, int(channels)])
 
     def get_config(self):
         config = super().get_config()
@@ -62,11 +67,29 @@ class Broadcast1D(layers.Layer):
     def __init__(self, target_length: int, **kwargs):
         super().__init__(**kwargs)
         self.target_length = int(target_length)
+        self._channels = None
+        self._ones = None
+
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        if channels is None:
+            raise ValueError("Broadcast1D requires a known channel dimension for TFLite/XNNPACK-friendly export.")
+        self._channels = int(channels)
+        # Constant ones used to broadcast from [B,1,C] -> [B,target_length,C] via MUL broadcasting.
+        self._ones = tf.constant(
+            np.ones((1, self.target_length, 1), dtype=np.float32),
+            dtype=tf.float32,
+            name=f"{self.name}_ones",
+        )
+        super().build(input_shape)
 
     def call(self, inputs):
         # inputs: [B, C] -> [B, target_length, C]
-        x = inputs[:, None, :]
-        return tf.tile(x, [1, self.target_length, 1])
+        if self._channels is None or self._ones is None:
+            raise RuntimeError("Broadcast1D is not built.")
+        x = tf.reshape(inputs, [-1, 1, self._channels])
+        # Broadcast along the length dimension without TILE.
+        return x * self._ones
 
     def get_config(self):
         config = super().get_config()
@@ -75,46 +98,99 @@ class Broadcast1D(layers.Layer):
 
 
 @register_keras_serializable(package="doccorner")
+class NearestUpsample2x(layers.Layer):
+    """2x nearest-neighbor upsampling using only RESHAPE+MUL broadcasting (XNNPACK-friendly)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._h = None
+        self._w = None
+        self._c = None
+        self._ones_w = None
+        self._ones_h = None
+
+    def build(self, input_shape):
+        h, w, c = input_shape[1], input_shape[2], input_shape[3]
+        if h is None or w is None or c is None:
+            raise ValueError("NearestUpsample2x requires static H/W/C for TFLite/XNNPACK-friendly export.")
+        self._h = int(h)
+        self._w = int(w)
+        self._c = int(c)
+
+        self._ones_w = tf.constant(
+            np.ones((1, 1, 1, 2, 1), dtype=np.float32),
+            dtype=tf.float32,
+            name=f"{self.name}_ones_w",
+        )
+        self._ones_h = tf.constant(
+            np.ones((1, 1, 2, 1, 1), dtype=np.float32),
+            dtype=tf.float32,
+            name=f"{self.name}_ones_h",
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        if self._h is None or self._w is None or self._c is None or self._ones_w is None or self._ones_h is None:
+            raise RuntimeError("NearestUpsample2x is not built.")
+
+        # Repeat along width: [B,H,W,C] -> [B,H,W,2,C] -> [B,H,2W,C]
+        x = tf.reshape(inputs, [-1, self._h, self._w, 1, self._c])
+        x = x * self._ones_w
+        x = tf.reshape(x, [-1, self._h, self._w * 2, self._c])
+
+        # Repeat along height: [B,H,2W,C] -> [B,H,2,2W,C] -> [B,2H,2W,C]
+        x = tf.reshape(x, [-1, self._h, 1, self._w * 2, self._c])
+        x = x * self._ones_h
+        return tf.reshape(x, [-1, self._h * 2, self._w * 2, self._c])
+
+    def get_config(self):
+        return super().get_config()
+
+
+@register_keras_serializable(package="doccorner")
 class SimCCDecode(layers.Layer):
     """Decode SimCC logits to normalized coordinates using soft-argmax."""
 
-    def __init__(self, tau: float = 1.0, **kwargs):
+    def __init__(self, num_bins: int, tau: float = 1.0, **kwargs):
         super().__init__(**kwargs)
+        self.num_bins = int(num_bins)
         self.tau = float(tau)
+        self._centers_col = None
+
+    def build(self, input_shape):
+        # Constant bin centers in [0,1], used for expectation via matmul (avoids SUM/TILE).
+        centers = np.linspace(0.0, 1.0, self.num_bins, dtype=np.float32).reshape(self.num_bins, 1)
+        self._centers_col = tf.constant(centers, dtype=tf.float32, name=f"{self.name}_centers")
+        super().build(input_shape)
 
     def call(self, inputs):
+        if self._centers_col is None:
+            raise RuntimeError("SimCCDecode is not built.")
+
         sx, sy = inputs  # [B, 4, num_bins]
 
         sx = tf.cast(sx, tf.float32)
         sy = tf.cast(sy, tf.float32)
 
-        bins = tf.shape(sx)[-1]
-        centers = tf.linspace(0.0, 1.0, bins)
-
         px = tf.nn.softmax(sx / self.tau, axis=-1)
         py = tf.nn.softmax(sy / self.tau, axis=-1)
 
-        x = tf.reduce_sum(px * centers[None, None, :], axis=-1)
-        y = tf.reduce_sum(py * centers[None, None, :], axis=-1)
+        # Compute expected value with a constant matmul:
+        #   [B*4, num_bins] @ [num_bins, 1] -> [B*4, 1] -> [B, 4]
+        px2 = tf.reshape(px, [-1, self.num_bins])
+        py2 = tf.reshape(py, [-1, self.num_bins])
+        x = tf.reshape(tf.matmul(px2, self._centers_col), [-1, 4])
+        y = tf.reshape(tf.matmul(py2, self._centers_col), [-1, 4])
 
-        coords = tf.stack(
-            [
-                x[:, 0],
-                y[:, 0],
-                x[:, 1],
-                y[:, 1],
-                x[:, 2],
-                y[:, 2],
-                x[:, 3],
-                y[:, 3],
-            ],
-            axis=-1,
-        )
+        # Interleave without STRIDED_SLICE / PACK:
+        # [B,4] -> [B,4,1] concat -> [B,4,2] reshape -> [B,8] (x0,y0,x1,y1,...)
+        xy = tf.concat([tf.reshape(x, [-1, 4, 1]), tf.reshape(y, [-1, 4, 1])], axis=-1)
+        coords = tf.reshape(xy, [-1, 8])
         return tf.clip_by_value(coords, 0.0, 1.0)
 
     def get_config(self):
         config = super().get_config()
-        config.update({"tau": self.tau})
+        config.update({"num_bins": self.num_bins, "tau": self.tau})
         return config
 
 
@@ -286,11 +362,12 @@ def build_doccorner_simcc_v3(
     p2 = layers.BatchNormalization(name="fpn_lat_c2_bn")(p2)
 
     # Top-down pathway
-    p4_up = layers.UpSampling2D(size=2, interpolation="nearest", name="fpn_p4_up")(p4)
+    # 2x nearest without RESIZE_NEAREST_NEIGHBOR / TILE, so XNNPACK can fully delegate it.
+    p4_up = NearestUpsample2x(name="fpn_p4_up")(p4)
     p3 = layers.Add(name="fpn_p3_add")([p3, p4_up])
     p3 = _separable_conv_block(p3, fpn_ch, "fpn_p3_refine")
 
-    p3_up = layers.UpSampling2D(size=2, interpolation="nearest", name="fpn_p3_up")(p3)
+    p3_up = NearestUpsample2x(name="fpn_p3_up")(p3)
     p2 = layers.Add(name="fpn_p2_add")([p2, p3_up])
     p2 = _separable_conv_block(p2, fpn_ch, "fpn_p2_refine")  # [B, 56, 56, fpn_ch]
 
@@ -371,7 +448,7 @@ def build_doccorner_simcc_v3(
     )(y_feat)  # [B, 224, 4]
     simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)  # [B, 4, 224]
 
-    coords = SimCCDecode(tau=tau, name="coords")([simcc_x, simcc_y])
+    coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])
 
     # =========================================================================
     # Score Head: Document presence classification

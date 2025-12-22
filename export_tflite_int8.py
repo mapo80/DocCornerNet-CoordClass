@@ -1,0 +1,355 @@
+"""
+Export a DocCornerNet checkpoint to a quantized TFLite model (PTQ).
+
+This script is tailored for `checkpoints/mobilenetv2_256_best` but works for any
+checkpoint folder/weights that include a compatible `config.json`.
+
+Examples:
+  # Int8 PTQ with float32 I/O (easy integration; internal int8 subgraphs)
+  python export_tflite_int8.py \
+    --checkpoint checkpoints/mobilenetv2_256_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --output exported_tflite/doccornernet_v3_mnv2_256_best_int8.tflite
+
+  # Same, but allow float fallback for ops that don't quantize well (no SELECT_TF_OPS)
+  python export_tflite_int8.py \
+    --checkpoint checkpoints/mobilenetv2_256_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --output exported_tflite/doccornernet_v3_mnv2_256_best_int8_hybrid.tflite \
+    --allow_float_fallback
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+
+from dataset import create_dataset
+from model import create_model
+
+# ImageNet normalization constants (RGB, [0,1])
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Export DocCornerNet to quantized TFLite (PTQ)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Checkpoint directory (containing config.json + best_model.weights.h5) or weights .h5 file",
+    )
+    p.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Dataset root for representative dataset calibration",
+    )
+    p.add_argument(
+        "--split",
+        type=str,
+        default="val_cleaned",
+        help="Split used for representative dataset (e.g. val_cleaned, train_cleaned_plus_outliers)",
+    )
+    p.add_argument("--num_calib", type=int, default=500, help="Number of calibration samples")
+    p.add_argument(
+        "--tflite_input_norm",
+        type=str,
+        default="auto",
+        choices=["auto", "imagenet", "zero_one", "raw255"],
+        help="Input normalization expected by the exported TFLite model",
+    )
+    p.add_argument(
+        "--quantization",
+        type=str,
+        default="int8",
+        choices=["int8", "int16x8", "dynamic"],
+        help=(
+            "Quantization scheme. "
+            "'int8' = full-int8 where possible, "
+            "'int16x8' = activations int16 + weights int8 (often higher accuracy), "
+            "'dynamic' = dynamic range (weights-only) quantization."
+        ),
+    )
+    p.add_argument(
+        "--io_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "uint8", "int8"],
+        help="TFLite model input dtype (output is always float32 [1,9])",
+    )
+    p.add_argument(
+        "--allow_float_fallback",
+        action="store_true",
+        help="Allow float TFLite builtins fallback for ops that can't be quantized (avoids SELECT_TF_OPS)",
+    )
+    p.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Output TFLite file path",
+    )
+    p.add_argument("--threads", type=int, default=1, help="Threads for verification interpreter")
+    return p.parse_args()
+
+
+def find_config(checkpoint_path: Path) -> dict:
+    if checkpoint_path.is_dir():
+        candidates = [checkpoint_path / "config.json", checkpoint_path.parent / "config.json"]
+    else:
+        candidates = [checkpoint_path.parent / "config.json"]
+
+    for c in candidates:
+        if c.exists():
+            with open(c) as f:
+                cfg = json.load(f)
+            print(f"Loaded config from {c}")
+            return cfg
+
+    return {}
+
+
+def find_weights(checkpoint_path: Path) -> Path:
+    if checkpoint_path.suffix == ".h5":
+        return checkpoint_path
+    if checkpoint_path.is_dir():
+        for name in ("best_model.weights.h5", "final_model.weights.h5", "best_student.weights.h5"):
+            p = checkpoint_path / name
+            if p.exists():
+                return p
+    raise FileNotFoundError(f"Could not find weights under {checkpoint_path}")
+
+
+def _apply_norm_transform(x, src_norm: str, dst_norm: str):
+    """
+    Transform input tensor x from src_norm to dst_norm.
+
+    Supported norms:
+      - raw255: float32 in [0,255]
+      - zero_one: float32 in [0,1]
+      - imagenet: float32 standardized with ImageNet mean/std (as in dataset.py)
+    """
+    src = (src_norm or "imagenet").lower().strip()
+    dst = (dst_norm or "imagenet").lower().strip()
+
+    if src == dst:
+        return x
+
+    def to_zero_one(t, src_mode: str):
+        if src_mode in {"raw255", "0_255", "0255"}:
+            return keras.layers.Rescaling(1.0 / 255.0, name="in_rescale_255_to_01")(t)
+        if src_mode in {"zero_one", "0_1", "01"}:
+            return t
+        if src_mode == "imagenet":
+            std = tf.constant(IMAGENET_STD.reshape(1, 1, 1, 3), dtype=tf.float32)
+            mean = tf.constant(IMAGENET_MEAN.reshape(1, 1, 1, 3), dtype=tf.float32)
+            t = keras.layers.Multiply(name="in_imagenet_to_01_mul_std")([t, std])
+            return keras.layers.Add(name="in_imagenet_to_01_add_mean")([t, mean])
+        raise ValueError(f"Unsupported src_norm='{src_mode}'")
+
+    if dst in {"zero_one", "0_1", "01"}:
+        return to_zero_one(x, src)
+
+    if dst in {"raw255", "0_255", "0255"}:
+        z = to_zero_one(x, src)
+        return keras.layers.Rescaling(255.0, name="in_rescale_01_to_255")(z)
+
+    if dst == "imagenet":
+        z = to_zero_one(x, src)
+        var = (IMAGENET_STD**2).astype(np.float32)
+        return keras.layers.Normalization(
+            axis=-1,
+            mean=IMAGENET_MEAN,
+            variance=var,
+            name="in_norm_imagenet",
+        )(z)
+
+    raise ValueError(f"Unsupported dst_norm='{dst_norm}'")
+
+
+def create_tflite_inference_model(
+    model: keras.Model,
+    img_size: int,
+    model_input_norm: str,
+    tflite_input_norm: str,
+) -> keras.Model:
+    """
+    Build a TFLite-friendly inference model:
+    - Optional input preprocessing: `tflite_input_norm` -> `model_input_norm`
+    - Output: single [B, 9] tensor: [x0..y3, score]
+    """
+    inputs = keras.Input(shape=(img_size, img_size, 3), dtype=tf.float32, name="image")
+    x = _apply_norm_transform(inputs, tflite_input_norm, model_input_norm)
+
+    outputs = model(x, training=False)
+    if isinstance(outputs, dict):
+        coords = outputs["coords"]
+        score_logit = outputs["score_logit"]
+    else:
+        coords = outputs[0]
+        score_logit = outputs[1]
+
+    score = keras.ops.sigmoid(score_logit)
+    out = keras.ops.concatenate([coords, score], axis=-1)
+    return keras.Model(inputs=inputs, outputs=out, name="doccornernet_inference")
+
+
+def _io_dtype(value: str):
+    v = (value or "float32").lower().strip()
+    if v == "float32":
+        return tf.float32
+    if v == "uint8":
+        return tf.uint8
+    if v == "int8":
+        return tf.int8
+    raise ValueError(f"Unsupported io_dtype='{value}'")
+
+
+def main():
+    args = parse_args()
+
+    ckpt = Path(args.checkpoint)
+    cfg = find_config(ckpt)
+    weights_path = find_weights(ckpt)
+
+    backbone = cfg.get("backbone", "mobilenetv2")
+    alpha = cfg.get("alpha", 0.35)
+    backbone_minimalistic = bool(cfg.get("backbone_minimalistic", False))
+    backbone_include_preprocessing = bool(cfg.get("backbone_include_preprocessing", False))
+    fpn_ch = int(cfg.get("fpn_ch", 32))
+    simcc_ch = int(cfg.get("simcc_ch", 96))
+    img_size = int(cfg.get("img_size", 256))
+    num_bins = int(cfg.get("num_bins", img_size))
+    tau = float(cfg.get("tau", 1.0))
+    model_input_norm = str(cfg.get("input_norm", "imagenet")).lower().strip()
+
+    tflite_input_norm = args.tflite_input_norm
+    if tflite_input_norm == "auto":
+        tflite_input_norm = model_input_norm
+    tflite_input_norm = str(tflite_input_norm).lower().strip()
+
+    print("=" * 60)
+    print("Export int8 TFLite (PTQ)")
+    print("=" * 60)
+    print(f"Checkpoint: {ckpt}")
+    print(f"Weights:    {weights_path}")
+    print("Model config:")
+    print(f"  backbone={backbone} alpha={alpha}")
+    print(f"  img_size={img_size} num_bins={num_bins}")
+    print(f"  fpn_ch={fpn_ch} simcc_ch={simcc_ch} tau={tau}")
+    print(f"  model_input_norm={model_input_norm}")
+    print(f"  tflite_input_norm={tflite_input_norm}")
+    print(f"  quantization={args.quantization}")
+    print(f"  io_dtype={args.io_dtype} (output float32)")
+    print(f"  allow_float_fallback={args.allow_float_fallback}")
+
+    # Build + load model (avoid downloading backbone weights).
+    model = create_model(
+        backbone=backbone,
+        alpha=alpha,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_weights=None,
+        fpn_ch=fpn_ch,
+        simcc_ch=simcc_ch,
+        img_size=img_size,
+        num_bins=num_bins,
+        tau=tau,
+    )
+    model.load_weights(str(weights_path))
+    print(f"Loaded weights. Params: {model.count_params():,}")
+
+    infer_model = create_tflite_inference_model(
+        model=model,
+        img_size=img_size,
+        model_input_norm=model_input_norm,
+        tflite_input_norm=tflite_input_norm,
+    )
+
+    # Convert
+    converter = tf.lite.TFLiteConverter.from_keras_model(infer_model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    if args.quantization == "dynamic":
+        # Weights-only quantization. No representative dataset required.
+        pass
+    else:
+        # Representative dataset (calibration)
+        ds = create_dataset(
+            data_root=args.data_root,
+            split=args.split,
+            img_size=img_size,
+            batch_size=1,
+            shuffle=True,
+            augment=False,
+            drop_remainder=False,
+            image_norm=tflite_input_norm,
+        ).take(int(args.num_calib))
+
+        def representative_dataset():
+            for images, _targets in ds:
+                # images: [1,H,W,3] float32 in the domain expected by infer_model input.
+                yield [images]
+
+        converter.representative_dataset = representative_dataset
+
+    if args.quantization == "int16x8":
+        int_ops = tf.lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
+    else:
+        int_ops = tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+
+    if args.quantization == "dynamic":
+        # Let the converter choose (float builtins, with weights compressed).
+        pass
+    elif args.allow_float_fallback:
+        converter.target_spec.supported_ops = [int_ops, tf.lite.OpsSet.TFLITE_BUILTINS]
+    else:
+        converter.target_spec.supported_ops = [int_ops]
+
+    if args.quantization == "dynamic":
+        # Keep float32 I/O for dynamic range quantization.
+        converter.inference_input_type = tf.float32
+    else:
+        converter.inference_input_type = _io_dtype(args.io_dtype)
+    converter.inference_output_type = tf.float32
+
+    # Conversion tends to be more stable with this disabled for non-RNN models.
+    converter._experimental_lower_tensor_list_ops = False  # pylint: disable=protected-access
+
+    print("\nConverting...")
+    tflite_model = converter.convert()
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(tflite_model)
+    print(f"Saved: {output_path} ({len(tflite_model) / (1024 * 1024):.2f} MB)")
+
+    # Quick verification.
+    print("\nVerifying...")
+    interpreter = tf.lite.Interpreter(model_path=str(output_path), num_threads=int(args.threads))
+    interpreter.allocate_tensors()
+    in0 = interpreter.get_input_details()[0]
+    out0 = interpreter.get_output_details()[0]
+    print(f"  Input:  {in0['shape']} {in0['dtype']} quant={in0.get('quantization')}")
+    print(f"  Output: {out0['shape']} {out0['dtype']} quant={out0.get('quantization')}")
+
+    dummy = np.zeros(in0["shape"], dtype=in0["dtype"])
+    interpreter.set_tensor(in0["index"], dummy)
+    interpreter.invoke()
+    y = interpreter.get_tensor(out0["index"])
+    print(f"  Ran 1 inference. Output shape: {y.shape}")
+
+
+if __name__ == "__main__":
+    main()

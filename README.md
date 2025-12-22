@@ -113,6 +113,95 @@ python export_tflite.py \
     --model_path ./checkpoints/v3_mnv2_small_256_aug_outliers_*/best_model.weights.h5 \
     --output ./exported_tflite/doccornernet_v3_mnv2_small_256_raw255_float32.tflite \
     --tflite_input_norm raw255
+
+# MobileNetV2 @256 (PTQ quantization)
+# - int8 (hybrid): faster but may reduce accuracy
+python export_tflite_int8.py \
+    --checkpoint ./checkpoints/mobilenetv2_256_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --quantization int8 \
+    --allow_float_fallback \
+    --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_hybrid.tflite
+
+# - dynamic range (weights-only): matches float16/float32 accuracy, but can reduce XNNPACK coverage
+python export_tflite_int8.py \
+    --checkpoint ./checkpoints/mobilenetv2_256_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --quantization dynamic \
+    --output ./exported_tflite/doccornernet_v3_mnv2_256_best_dynamic.tflite
+```
+
+#### WASM / XNNPACK full delegation (float16)
+
+For the WebAssembly runtime (`document-scanner-wasm`), we want **100% of the TFLite graph delegated to XNNPACK** (i.e., the post-delegate execution plan contains only `DELEGATE` nodes). This required removing a few ops that XNNPACK does not delegate in practice (e.g. `STRIDED_SLICE`, `TILE`, `PACK`, `SUM`, `RESIZE_NEAREST_NEIGHBOR`).
+
+What changed in this repo (`model.py`) to enable full delegation:
+- `Resize1D`: avoids `STRIDED_SLICE` by reshaping away the singleton dimension after resize.
+- `Broadcast1D`: avoids `TILE` by using `MUL` broadcasting with a constant ones tensor.
+- `SimCCDecode`: avoids `SUM`/`PACK`/`STRIDED_SLICE` by computing the expectation via `matmul` and reshaping/concatenating.
+- `NearestUpsample2x`: implements 2× nearest upsampling via `RESHAPE+MUL` (no `RESIZE_NEAREST_NEIGHBOR`, no `TILE`).
+
+Accuracy sanity check (DocScannerDetection `val_cleaned`): the fully-delegated float16 exports match the baseline float16 mIoU for MNv2@224_best (0.9894), MNv2@256_best (0.9902), MNv2@320 (0.9855), MNv3@224 (0.9842). See `exported_tflite/eval_float16_full_delegate_improve.json` and `exported_tflite/eval_xnnpack_full_delegate_others.json`.
+
+Export the fully-delegated float16 models (always pass `--config` to avoid picking `./checkpoints/config.json` by mistake):
+
+```bash
+# MobileNetV2 @224 (best)
+python export_tflite.py \
+  --model_path ./checkpoints/mobilenetv2_224_best \
+  --config ./checkpoints/mobilenetv2_224_best/config.json \
+  --output ./exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite \
+  --float16
+
+# MobileNetV2 @256 (best)
+python export_tflite.py \
+  --model_path ./checkpoints/mobilenetv2_256_best \
+  --config ./checkpoints/mobilenetv2_256_best/config.json \
+  --output ./exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite \
+  --float16
+
+# MobileNetV2 @320
+python export_tflite.py \
+  --model_path ./checkpoints/mobilenetv2_320 \
+  --config ./checkpoints/mobilenetv2_320/config.json \
+  --output ./exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite \
+  --float16
+
+# MobileNetV3-Small @224
+python export_tflite.py \
+  --model_path ./checkpoints/mobilenetv3_224 \
+  --config ./checkpoints/mobilenetv3_224/config.json \
+  --output ./exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite \
+  --float16
+```
+
+Verify XNNPACK coverage using the helper in the WASM repo:
+
+```bash
+cd /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm
+cmake -S tests -B build-native
+cmake --build build-native --target xnnpack_delegate_report -j 8
+
+./build-native/xnnpack_delegate_report \
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite \
+  4
+
+# Expected: "Execution plan nodes: 1" and "Non-delegated builtin ops (plan):" empty.
+```
+
+Optional: update the WASM model files (used by the package) with the fully-delegated exports:
+
+```bash
+cp -f /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite \
+  /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm/models/mnv2_224_best_float16.tflite
+cp -f /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite \
+  /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm/models/mnv2_256_best_float16.tflite
+cp -f /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite \
+  /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm/models/mnv2_320_float16.tflite
+cp -f /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite \
+  /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm/models/mnv3_224_float16.tflite
 ```
 
 **TFLite Output Format:** `[1, 9]` = `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
@@ -337,6 +426,7 @@ Single tensor `[1, 9]`:
 ├── benchmark_tflite.py             # TFLite microbenchmark (CPU)
 ├── mine_outliers.py                # Hard-sample mining (outlier list)
 ├── export_tflite.py                # TFLite export
+├── export_tflite_int8.py           # PTQ export (int8/int16x8/dynamic)
 └── README.md
 ```
 
