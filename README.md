@@ -115,7 +115,11 @@ python export_tflite.py \
     --tflite_input_norm raw255
 
 # MobileNetV2 @256 (PTQ quantization)
-# - int8 (hybrid): faster but may reduce accuracy
+# NOTE: these "easy integration" exports are **not guaranteed** to be fully delegated to XNNPACK on WASM
+# (e.g. `coords9` output uses SimCC decoding which introduces `SOFTMAX`).
+#
+# - int8 (hybrid, float32 I/O, coords9 output): may be faster but can reduce accuracy and is often PARTIALLY delegated.
+#   If you need 100% delegation, use the **int8 full quant** recipe in the section below.
 python export_tflite_int8.py \
     --checkpoint ./checkpoints/mobilenetv2_256_best \
     --data_root /path/to/doc-scanner-dataset-labeled \
@@ -124,13 +128,30 @@ python export_tflite_int8.py \
     --allow_float_fallback \
     --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_hybrid.tflite
 
-# - dynamic range (weights-only): matches float16/float32 accuracy, but can reduce XNNPACK coverage
+# - dynamic range (weights-only): matches float16/float32 accuracy, but is expected to be PARTIALLY delegated
+#   (XNNPACK does not delegate the hybrid `DEPTHWISE_CONV_2D` kernels on WASM).
 python export_tflite_int8.py \
     --checkpoint ./checkpoints/mobilenetv2_256_best \
     --data_root /path/to/doc-scanner-dataset-labeled \
     --split val_cleaned \
     --quantization dynamic \
     --output ./exported_tflite/doccornernet_v3_mnv2_256_best_dynamic.tflite
+
+# - int8 FULL (WASM / XNNPACK full delegation): I/O int8 + SimCC logits output (decode outside the model)
+python export_tflite_int8.py \
+    --checkpoint ./checkpoints/mobilenetv2_256_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --num_calib 500 \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+    --threads 4
 ```
 
 #### Keras (.weights.h5 / checkpoint dir) → TFLite (float32 / float16 / int8 full / int8 dynamic)
@@ -171,6 +192,62 @@ python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_224_best --d
 python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_256_best --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite --threads 4
 python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_320      --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv2_320_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite      --threads 4
 python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv3_224      --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv3_224_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite      --threads 4
+```
+
+Why we export **full-int8** like this (and not as `coords9` like float models):
+- On WASM, XNNPACK does **not** fully delegate some ops in the `coords` decode path in int8 (notably `SOFTMAX`, plus clamps like `MINIMUM`/`RELU`), so an int8 model that outputs `coords9` is typically **partially delegated**.
+- Dynamic-range quantization is weights-only (hybrid kernels). On WASM, XNNPACK typically **does not delegate** those hybrid `DEPTHWISE_CONV_2D` ops → partial delegation.
+- Exporting logits (`simcc_logits`) keeps the TFLite graph in “conv-like” ops that XNNPACK delegates well, and we run the final decode in native code (C++/WASM) for speed and to match float accuracy.
+
+What the **full-int8** model returns (output contract):
+- Output 0: `simcc_xy` (quantized int8) packed logits, shape:
+  - `--simcc_packed_layout bins_first`: `[1, num_bins, 8]` where last dim is `[x0..x3, y0..y3]`
+  - `--simcc_packed_layout 8_first`: `[1, 8, num_bins]` where first 4 are X and next 4 are Y
+- Output 1: `score_logit` (quantized int8), shape `[1, 1]` (apply `sigmoid(dequantize(score_logit))` for probability).
+- Decode outside the model: `dequantize(simcc_xy)` → `softmax(logits / tau)` → expectation over bin centers `[0..1]` → coords `[8]` (normalized in `[0,1]`).
+
+Full-int8 configuration (for **100% XNNPACK delegation on WASM**):
+- `--quantization int8` (PTQ full-int8)
+- `--io_dtype int8 --output_dtype int8` (true int8 I/O; avoids float pre/post that can break delegation)
+- `--output_format simcc_logits --simcc_packed_layout bins_first` (keeps logits; avoids in-model SimCC decode which introduces `SOFTMAX` and other non-delegated ops)
+- `--axis_mean_impl dwconv_full --global_pool_impl dwconv_strided` (removes reduction ops that XNNPACK doesn’t fully delegate in practice)
+- `--num_calib 500` on `val_cleaned` (representative dataset for PTQ calibration; increase only if you see accuracy drop)
+
+Step-by-step (example: `mobilenetv2_256_best`):
+
+```bash
+# 1) Dataset root (for PTQ calibration)
+export DATA_ROOT=/Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-labeled
+
+# 2) Export FULL INT8 (this is the "100% delegated" variant)
+python export_tflite_int8.py \
+  --checkpoint ./checkpoints/mobilenetv2_256_best \
+  --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 \
+  --quantization int8 \
+  --io_dtype int8 --output_dtype int8 \
+  --output_format simcc_logits --simcc_packed_layout bins_first \
+  --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided \
+  --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+  --threads 4
+
+# 3) Verify XNNPACK FULL delegation (must show NO non-delegated ops)
+cd /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm
+cmake -S tests -B build-native
+cmake --build build-native --target xnnpack_delegate_report -j 8
+./build-native/xnnpack_delegate_report \
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+  4
+
+# 4) Evaluate (SimCC logits models use eval_tflite_simcc.py)
+cd /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass
+python eval_tflite_simcc.py \
+  --tflite_models ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+  --data_root "$DATA_ROOT" \
+  --split val_cleaned \
+  --input_norm imagenet \
+  --tau 1.0 \
+  --threads 4 \
+  --benchmark_runs 200
 ```
 
 **int8 dynamic range** (weights-only; float32 I/O; coords9 output `[1,9]`):
@@ -289,7 +366,9 @@ cp -f /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornern
   /Volumes/ZX20/ML-Models/document-scanner/document-scanner-wasm/models/mnv3_224_float16.tflite
 ```
 
-**TFLite Output Format:** `[1, 9]` = `[x0, y0, x1, y1, x2, y2, x3, y3, score]`
+**TFLite output formats**
+- `coords9` (float32/float16/dynamic/hybrid exports): one tensor `[1,9]` = `[x0, y0, x1, y1, x2, y2, x3, y3, score]` where coords are normalized in `[0,1]` and `score` is a probability.
+- `simcc_logits` (full-int8 exports): two tensors `[simcc_xy, score_logit]` (see above); decode logits outside the model to recover the same normalized coords + score.
 
 ### 7. Evaluate / Benchmark on TFLite
 
