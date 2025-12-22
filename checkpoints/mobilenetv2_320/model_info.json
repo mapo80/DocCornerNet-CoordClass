@@ -1,0 +1,92 @@
+{
+  "name": "mobilenetv2_320",
+  "source": {
+    "runpod_checkpoint_dir": "/workspace/checkpoints/v3_mnv2_320_a35_f16_s64_fromscratch_w15_e200_new_20251222_062343",
+    "runpod_host": "root@69.30.85.214:22154"
+  },
+  "git": {
+    "repo_commit": "6e86cdf54f6eb51b03f29f450d0ed5d8633b82a7"
+  },
+  "model": {
+    "backbone": "mobilenetv2",
+    "alpha": 0.35,
+    "img_size": 320,
+    "num_bins": 320,
+    "fpn_ch": 16,
+    "simcc_ch": 64,
+    "tau": 1.0,
+    "sigma_px": 3.0,
+    "w_simcc": 1.0,
+    "w_coord": 0.5,
+    "w_score": 0.5,
+    "input_norm": "imagenet",
+    "model_parameters": 444841,
+    "best_model_weights_sha256": "66f20b494f08c2104ea473ef96105d98eda3ced94a0a5e092e3f34facdd25f85"
+  },
+  "training": {
+    "train_split": "train_cleaned_plus_outliers",
+    "val_split": "val_cleaned",
+    "negative_dir": "images-negative",
+    "outlier_list": "/workspace/doc-scanner-dataset-labeled/outliers.txt",
+    "outlier_weight": 15.0,
+    "init_weights": null,
+    "init_partial": false,
+    "batch_size": 64,
+    "epochs": 200,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "warmup_epochs": 5,
+    "patience": 20,
+    "lr_patience": 5,
+    "lr_factor": 0.5,
+    "min_lr": 1e-06,
+    "augment": true,
+    "fast_mode": true,
+    "cache_images": true,
+    "cache_dir": "/workspace/doc-scanner-dataset-labeled/.cache"
+  },
+  "eval_local": {
+    "splits": {
+      "val_cleaned": {
+        "mean_iou": 0.9855,
+        "corner_err_mean_px": 1.13,
+        "recall_95_pct": 98.4
+      },
+      "val": {
+        "mean_iou": 0.9757,
+        "corner_err_mean_px": 2.07,
+        "recall_95_pct": 94.6
+      },
+      "val_removed": {
+        "mean_iou": 0.919,
+        "corner_err_mean_px": 7.54,
+        "recall_95_pct": 72.6
+      },
+      "val_outliers": {
+        "mean_iou": 0.5645,
+        "corner_err_mean_px": 66.18,
+        "recall_95_pct": 0.0
+      },
+      "test": {
+        "mean_iou": 0.9741,
+        "corner_err_mean_px": 2.35,
+        "recall_95_pct": 93.8
+      }
+    },
+    "log_files": {
+      "val_cleaned": "eval_val_cleaned.log",
+      "val": "eval_val.log",
+      "val_removed": "eval_val_removed.log",
+      "val_outliers": "eval_val_outliers.log",
+      "test": "eval_test.log"
+    },
+    "all_outliers_from_outliers_txt": {
+      "count": 40,
+      "mean_iou": 0.9085624814033508,
+      "median_iou": 0.9948804974555969,
+      "p05_iou": 0.4752330079674721,
+      "mean_corner_err_px": 13.526127815246582,
+      "p95_corner_err_px": 106.5741989135742
+    }
+  }
+}

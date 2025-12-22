@@ -14,6 +14,7 @@ import json
 import math
 import os
 import shutil
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -211,6 +212,26 @@ def parse_args():
                         help="Output directory")
     parser.add_argument("--experiment_name", type=str, default="v3_simcc",
                         help="Experiment name")
+    parser.add_argument(
+        "--resume_dir",
+        type=str,
+        default=None,
+        help=(
+            "Resume from an existing run directory (restores model + optimizer state). "
+            "When set, the run's config.json is used as the base configuration; any CLI "
+            "flags you provide override it."
+        ),
+    )
+    parser.add_argument(
+        "--resume_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Only used when --resume_dir is set but no TF checkpoint is found. "
+            "Sets the starting epoch index (0-based) for logging and LR schedule. "
+            "Example: --resume_epoch 42 will print 'Epoch 43/...'."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -259,6 +280,44 @@ def _find_init_weights_path(value: str) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"init_weights not found: {p}")
     return p
+
+
+def _cli_overrides_from_argv(argv: list[str]) -> set[str]:
+    """
+    Best-effort detection of which argparse options were explicitly provided.
+
+    Used for `--resume_dir`: load the previous run config and only override values
+    that the user actually specified on the CLI.
+    """
+    overrides: set[str] = set()
+    for token in argv[1:]:
+        if token.startswith("--"):
+            overrides.add(token.split("=", 1)[0])
+    return overrides
+
+
+def _load_resume_config(resume_dir: Path) -> dict:
+    config_path = resume_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"resume_dir missing config.json: {config_path}")
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Invalid config.json in resume_dir: {config_path}")
+    return cfg
+
+
+def _apply_resume_config(args, resume_cfg: dict, cli_overrides: set[str]):
+    """
+    Merge resume config into args, keeping any explicitly provided CLI values.
+    """
+    for key, value in resume_cfg.items():
+        flag = f"--{key}"
+        if flag in cli_overrides:
+            continue
+        if hasattr(args, key):
+            setattr(args, key, value)
+    return args
 
 
 def _find_split_file(data_root: Path, split: str) -> Path:
@@ -564,20 +623,40 @@ def main():
     # Resolve input normalization early so it is persisted in config.json.
     args.input_norm = _resolve_input_norm(args.input_norm, args.backbone_include_preprocessing)
 
-    # Setup output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) / f"{args.experiment_name}_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    cli_overrides = _cli_overrides_from_argv(sys.argv)
+    resume_dir = Path(args.resume_dir).expanduser().resolve() if args.resume_dir else None
+
+    # Resume mode: load previous config and continue in-place.
+    if resume_dir is not None:
+        resume_cfg = _load_resume_config(resume_dir)
+        args = _apply_resume_config(args, resume_cfg, cli_overrides)
+        output_dir = resume_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n↻ Resume enabled: {output_dir}")
+    else:
+        # Setup output directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(args.output_dir) / f"{args.experiment_name}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
     print("DocCornerNetV3 Training")
     print("=" * 80)
     print(f"Output: {output_dir}")
 
-    # Save config
-    config = vars(args)
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    # Save config (new runs only). For resume, keep the original config.json untouched.
+    if resume_dir is None:
+        config = vars(args)
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
+    else:
+        # Save resume CLI overrides for traceability.
+        overrides_path = output_dir / f"resume_overrides_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        effective = vars(args)
+        overrides = {k: effective[k] for k in effective.keys() if f"--{k}" in cli_overrides}
+        overrides["resume_dir"] = str(output_dir)
+        with open(overrides_path, "w") as f:
+            json.dump(overrides, f, indent=2)
 
     # Count samples
     data_root = Path(args.data_root)
@@ -708,8 +787,63 @@ def main():
     else:
         print("✗ Over 1M parameters target")
 
-    # Optional warm-start
-    if args.init_weights:
+    # Optimizer
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    # Resume checkpoint (model + optimizer + training counters)
+    ckpt_dir = output_dir / "tf_ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    latest_ckpt_path = tf.train.latest_checkpoint(str(ckpt_dir))
+
+    ckpt_epoch = tf.Variable(0, dtype=tf.int64, name="epoch")
+    ckpt_best_iou = tf.Variable(0.0, dtype=tf.float32, name="best_iou")
+    ckpt_best_epoch = tf.Variable(0, dtype=tf.int64, name="best_epoch")
+    ckpt_no_improve = tf.Variable(0, dtype=tf.int64, name="no_improve_count")
+    ckpt_lr_no_improve = tf.Variable(0, dtype=tf.int64, name="lr_no_improve_count")
+    ckpt_current_lr = tf.Variable(float(args.lr), dtype=tf.float32, name="current_lr")
+
+    # Ensure optimizer slot variables exist before restore (Keras 3).
+    try:
+        optimizer.build(model.trainable_variables)
+    except Exception:
+        pass
+
+    ckpt = tf.train.Checkpoint(
+        model=model,
+        optimizer=optimizer,
+        epoch=ckpt_epoch,
+        best_iou=ckpt_best_iou,
+        best_epoch=ckpt_best_epoch,
+        no_improve=ckpt_no_improve,
+        lr_no_improve=ckpt_lr_no_improve,
+        current_lr=ckpt_current_lr,
+    )
+    manager = tf.train.CheckpointManager(ckpt, str(ckpt_dir), max_to_keep=3)
+
+    did_restore = False
+    if resume_dir is not None and latest_ckpt_path:
+        print(f"\n↻ Restoring from checkpoint: {latest_ckpt_path}")
+        ckpt.restore(latest_ckpt_path).expect_partial()
+        did_restore = True
+        try:
+            optimizer.learning_rate.assign(float(ckpt_current_lr.numpy()))
+        except Exception:
+            pass
+    elif resume_dir is not None:
+        print("\n↻ Resume requested but no checkpoint found.")
+
+    # Optional warm-start (only when not restored from a checkpoint)
+    if (not did_restore) and (resume_dir is not None) and ("--init_weights" not in cli_overrides):
+        # If resuming but the previous run predates TF checkpointing, default to the
+        # run's own best/final weights (if present) so the user gets a sensible
+        # "pseudo-resume" experience.
+        if (output_dir / "best_model.weights.h5").exists() or (output_dir / "final_model.weights.h5").exists():
+            args.init_weights = str(output_dir)
+
+    if (not did_restore) and args.init_weights:
         init_path = _find_init_weights_path(args.init_weights)
         print(f"\nLoading init weights from: {init_path}")
         try:
@@ -734,11 +868,23 @@ def main():
             model.load_weights(str(init_for_by_name), by_name=True, skip_mismatch=True)
             print("✓ Loaded init weights (partial)")
 
-    # Optimizer
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-    )
+        # If we are in resume mode without a TF checkpoint, optionally bump the
+        # epoch counter for correct logging/LR schedule. This does NOT restore
+        # the optimizer state (not available).
+        if resume_dir is not None:
+            if args.resume_epoch is not None:
+                try:
+                    ckpt_epoch.assign(int(args.resume_epoch))
+                except Exception:
+                    pass
+
+            # Create an initial checkpoint so future resumes work, even if we crash mid-epoch.
+            ckpt_best_iou.assign(float(best_iou) if "best_iou" in locals() else 0.0)
+            ckpt_best_epoch.assign(int(best_epoch) if "best_epoch" in locals() else 0)
+            ckpt_no_improve.assign(int(no_improve_count) if "no_improve_count" in locals() else 0)
+            ckpt_lr_no_improve.assign(int(lr_no_improve_count) if "lr_no_improve_count" in locals() else 0)
+            ckpt_current_lr.assign(float(current_lr) if "current_lr" in locals() else float(args.lr))
+            manager.save()
 
     # Trainer
     trainer = DocCornerNetV3Trainer(
@@ -756,20 +902,45 @@ def main():
     )
 
     # Training state
-    best_iou = 0.0
-    best_epoch = 0
-    current_lr = args.lr
-    no_improve_count = 0
-    lr_no_improve_count = 0
+    best_iou = float(ckpt_best_iou.numpy()) if did_restore else 0.0
+    best_epoch = int(ckpt_best_epoch.numpy()) if did_restore else 0
+    current_lr = float(ckpt_current_lr.numpy()) if did_restore else float(args.lr)
+    no_improve_count = int(ckpt_no_improve.numpy()) if did_restore else 0
+    lr_no_improve_count = int(ckpt_lr_no_improve.numpy()) if did_restore else 0
+    # In resume mode without a TF checkpoint, allow resume_epoch to set the counter
+    # for correct logging/LR schedule (but optimizer state is fresh).
+    if (not did_restore) and (resume_dir is not None) and (args.resume_epoch is not None):
+        start_epoch = int(args.resume_epoch)
+    else:
+        start_epoch = int(ckpt_epoch.numpy()) if did_restore else 0
 
     # History
+    history_path = output_dir / "history.json"
     history = {"train": [], "val": []}
+    if did_restore and history_path.exists():
+        try:
+            with open(history_path, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and "train" in loaded and "val" in loaded:
+                history = loaded
+        except Exception:
+            pass
 
     print(f"\n{'=' * 80}")
-    print(f"Starting training for {args.epochs} epochs...")
+    if did_restore:
+        print(
+            f"Resuming at epoch {start_epoch + 1}/{args.epochs} "
+            f"(best_iou={best_iou:.4f} @ epoch {best_epoch}, lr={current_lr:.2e})"
+        )
+    else:
+        print(f"Starting training for {args.epochs} epochs...")
     print(f"{'=' * 80}")
 
-    for epoch in range(args.epochs):
+    if start_epoch >= int(args.epochs):
+        print(f"\nResume epoch ({start_epoch}) >= epochs ({args.epochs}). Nothing to do.")
+        return
+
+    for epoch in range(start_epoch, int(args.epochs)):
         # Warmup learning rate
         if epoch < args.warmup_epochs:
             warmup_lr = args.lr * (epoch + 1) / args.warmup_epochs
@@ -837,6 +1008,18 @@ def main():
                     lr_no_improve_count = 0
                     print(f"  ↓ Reduced LR to {current_lr:.2e}")
 
+        # Persist resume state each epoch (so crashes can resume cleanly)
+        ckpt_epoch.assign(epoch + 1)  # number of completed epochs
+        ckpt_best_iou.assign(float(best_iou))
+        ckpt_best_epoch.assign(int(best_epoch))
+        ckpt_no_improve.assign(int(no_improve_count))
+        ckpt_lr_no_improve.assign(int(lr_no_improve_count))
+        ckpt_current_lr.assign(float(current_lr))
+        manager.save()
+
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+
         # Early stopping
         if no_improve_count >= args.patience:
             print(f"\n⚠ Early stopping at epoch {epoch + 1} "
@@ -852,7 +1035,7 @@ def main():
     inference_model.save(output_dir / "final_model_inference.keras")
 
     # Save history
-    with open(output_dir / "history.json", "w") as f:
+    with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
 
     print(f"\n{'=' * 80}")

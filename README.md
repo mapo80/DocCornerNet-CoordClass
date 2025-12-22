@@ -146,26 +146,53 @@ python benchmark_tflite.py \
 
 ## Results
 
-### Benchmarks (measured)
+### Best Checkpoints (DocScannerDetection dataset)
 
-| Model | Parameters | Mean IoU | Corner Error | R@90 | R@95 | TFLite (ms) | Size |
-|-------|------------|----------|--------------|------|------|-------------|------|
-| **Teacher (MNv3-S α=0.75)** | 742,417 | 98.25% | 0.93 px | 98.8% | 97.2% | 4.93 ms | 1.47 MB |
-| **Student (distill)** | 669,761 | 97.61% | 1.29 px | 98.1% | 94.4% | 3.38 ms | 1.34 MB |
-| **MobileNetV2 small (α=0.35) @224** | 495,353 | 98.05% | 1.14 px | 98.2% | 96.3% | 3.78 ms | 0.98 MB |
-| **MobileNetV2 small (α=0.35) @256** | 495,353 | 98.22% | 1.17 px | 98.5% | 97.0% | 4.81 ms | 0.98 MB |
+These checkpoints are trained/evaluated on `doc-scanner-dataset-labeled` (with `train_cleaned_plus_outliers` / `val_cleaned` splits) and include outlier handling.
+
+| Checkpoint | Backbone | Img | Params | val_cleaned mIoU | val mIoU | val_removed mIoU | val_outliers mIoU |
+|-----------|----------|-----|--------|------------------|---------|------------------|-------------------|
+| `checkpoints/mobilenetv2_224_best` | MNv2 α=0.35 | 224 | 495,353 | 0.9894 | **0.9826** | **0.9429** | **0.7075** |
+| `checkpoints/mobilenetv2_256_best` | MNv2 α=0.35 | 256 | 495,353 | **0.9902** | 0.9819 | 0.9341 | 0.6281 |
+| `checkpoints/mobilenetv3_224` | MNv3-S α=0.75 | 224 | 742,417 | 0.9842 | 0.9734 | 0.9107 | 0.5960 |
+| `checkpoints/mobilenetv2_320` | MNv2 α=0.35 | 320 | 444,841 | 0.9855 | 0.9757 | 0.9190 | 0.5645 |
+
+**Winner (overall): `checkpoints/mobilenetv2_224_best`**
+- Best tradeoff for deployment: strongest robustness (`val_removed` / `val_outliers`) with the smallest model and 224px input.
+- If you must hit **Mean IoU ≥ 0.99 on `val_cleaned`**, pick `checkpoints/mobilenetv2_256_best` (slower due to 256px).
+
+### Previous Checkpoints (same dataset, for reference)
+
+| Checkpoint | Img | Params | val_cleaned mIoU | val mIoU | val_removed mIoU | val_outliers mIoU |
+|-----------|-----|--------|------------------|---------|------------------|-------------------|
+| `checkpoints/v3_mnv2_small_aug_outliers_20251220_111218` | 224 | 495,353 | 0.9876 | 0.9805 | 0.9398 | 0.6934 |
+| `checkpoints/v3_mnv2_small_256_aug_outliers_20251221_100332` | 256 | 495,353 | 0.9900 | 0.9822 | 0.9369 | 0.6856 |
+
+### Legacy (different dataset)
+
+- `checkpoints/best_model.weights.h5` and `checkpoints_student/student_distill_20251219_153437` are pretrained on the HuggingFace `DocCornerDataset` and are **not directly comparable** to the tables above (they perform poorly on `doc-scanner-dataset-labeled` without re-training).
+- PyTorch regression baselines live in `/Volumes/ZX20/ML-Models/DocCornerNet-Regression/checkpoints/` (e.g. `best_224.pth`, `best_320.pth`) and are trained/evaluated on `DocCornerDataset` (reported ≈95–96% mIoU in that repo’s `README.md`).
+
+### TFLite Benchmarks (measured)
+
+Latency/size are mostly architecture-dependent (weights and dataset don’t materially change them).
+
+| Model (architecture) | Parameters | TFLite (ms) | Size |
+|-------|------------|-------------|------|
+| **MNv3-S α=0.75 (teacher preset)** | 742,417 | 4.93 ms | 1.47 MB |
+| **Student (distill preset)** | 669,761 | 3.38 ms | 1.34 MB |
+| **MobileNetV2 small (α=0.35) @224** | 495,353 | 3.78 ms | 0.98 MB |
+| **MobileNetV2 small (α=0.35) @256** | 495,353 | 4.81 ms | 0.98 MB |
 
 Notes:
-- Benchmarks above were measured on `doc-scanner-dataset-labeled` (`val_with_negative_v2.txt`).
-- Accuracy: `evaluate.py` (IoU/Corner Error computed only on positives).
 - Latency: `benchmark_tflite.py` p50, CPU (XNNPACK), batch size 1.
 - Size: `.tflite` float16 file size on disk.
 
 ### Key Insights
 
-- **Teacher**: best accuracy (≈0.95 px, R@95 ≈97.3%) but slower and larger.
-- **MobileNetV2 small**: best tradeoff (↓params, ↓size, fastest CPU; accuracy still ≥0.97 IoU).
-- **Student**: close to MNv2 on speed, but slightly worse IoU and recall.
+- For `doc-scanner-dataset-labeled`, prefer **`checkpoints/mobilenetv2_224_best`** unless you explicitly need 256px.
+- 256px gives slightly higher `val_cleaned` mIoU, but it’s slower (more pixels) and is less robust on outliers in our current best checkpoint.
+- `checkpoints/mobilenetv3_224` is heavier and underperforms MNv2 on this dataset as trained so far.
 
 > Note: `checkpoints/best_model.keras` may fail to load on Keras 3 due to legacy `Lambda` layers; use `checkpoints/best_model.weights.h5` for evaluation/export.
 

@@ -197,10 +197,21 @@ def load_model(args):
             # Older TF/Keras versions don't support safe_mode.
             return keras.models.load_model(str(p), compile=False)
 
-    if model_path.is_dir() or model_path.suffix == ".keras":
+    # Prefer loading a serialized model when explicitly given a `.keras` file or a SavedModel dir.
+    # If a directory is provided, avoid calling `load_model()` on arbitrary checkpoint folders
+    # (it can throw confusing internal errors and/or noisy deserialization traces); fall back to
+    # weight-loading instead unless this is a real SavedModel export.
+    serialized_path: Path | None = None
+    if model_path.suffix == ".keras":
+        serialized_path = model_path
+    elif model_path.is_dir():
+        if (model_path / "saved_model.pb").exists():
+            serialized_path = model_path
+
+    if serialized_path is not None:
         try:
-            model = _try_load_serialized(model_path)
-            print(f"Loaded model from {model_path}")
+            model = _try_load_serialized(serialized_path)
+            print(f"Loaded model from {serialized_path}")
             try:
                 inferred = model.input_shape[1]
                 if isinstance(inferred, int):
@@ -209,7 +220,7 @@ def load_model(args):
                 pass
             return model, img_size, backbone_include_preprocessing
         except Exception as e:
-            print(f"Warning: failed to load serialized model from {model_path}: {e}")
+            print(f"Warning: failed to load serialized model from {serialized_path}: {e}")
 
     # Otherwise: create model and load weights
     model = create_model(

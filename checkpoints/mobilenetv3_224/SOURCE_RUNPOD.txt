@@ -1,0 +1,2 @@
+runpod_host=root@69.30.85.214:22154
+runpod_checkpoint_dir=/workspace/checkpoints/v3_mnv3_small_224_clean_plus_outliers_ft_w10_e200_20251221_225508

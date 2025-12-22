@@ -1,0 +1,2 @@
+runpod_host=root@69.30.85.214:22154
+runpod_checkpoint_dir=/workspace/checkpoints/v3_mnv2_320_a35_f16_s64_fromscratch_w15_e200_new_20251222_062343

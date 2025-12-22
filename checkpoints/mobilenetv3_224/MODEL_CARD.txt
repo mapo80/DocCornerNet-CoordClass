@@ -1,0 +1,26 @@
+mobilenetv3_224
+
+Source RunPod: /workspace/checkpoints/v3_mnv3_small_224_clean_plus_outliers_ft_w10_e200_20251221_225508
+Source Host: root@69.30.85.214:22154
+Git commit: 6e86cdf54f6eb51b03f29f450d0ed5d8633b82a7
+Weights SHA256: b5f984ad044d6386415ab516d05ea7b92a10f9b8e628bef699f63edba31313fa
+
+Model:
+  backbone=mobilenetv3_small alpha=0.75 img_size=224 num_bins=224
+  fpn_ch=48 simcc_ch=128 tau=1.0 input_norm=imagenet
+  loss_weights: w_simcc=1.0 w_coord=0.5 w_score=0.5 sigma_px=3.0
+  params=742,417
+
+Training:
+  train_split=train_cleaned_plus_outliers val_split=val_cleaned
+  outlier_weight=10.0 outlier_list=/workspace/doc-scanner-dataset-labeled/outliers.txt
+  init_weights=/workspace/checkpoints/mobilenetv2_224_best init_partial=True
+  batch_size=64 epochs=200 lr=1e-4 weight_decay=1e-4 warmup_epochs=2
+
+Eval (local):
+  val_cleaned: mean_iou=0.9842 err_mean=0.86px R@95=97.9%
+  val: mean_iou=0.9734 err_mean=1.56px R@95=93.1%
+  val_removed: mean_iou=0.9107 err_mean=5.56px R@95=65.5%
+  val_outliers: mean_iou=0.5960 err_mean=34.78px R@95=12.5%
+  test: mean_iou=0.9716 err_mean=1.63px R@95=92.3%
+  all_outliers(40): mean_iou=0.9125 p05_iou=0.4692 mean_err=7.28px
