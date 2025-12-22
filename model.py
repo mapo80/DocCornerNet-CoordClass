@@ -26,16 +26,164 @@ from tensorflow.keras.utils import register_keras_serializable
 
 @register_keras_serializable(package="doccorner")
 class AxisMean(layers.Layer):
-    def __init__(self, axis: int, **kwargs):
+    def __init__(self, axis: int, impl: str = "mean", **kwargs):
         super().__init__(**kwargs)
         self.axis = int(axis)
+        self.impl = str(impl).lower().strip()
+        self._h = None
+        self._w = None
+        self._c = None
+        self._filter_full = None
+        self._filter_2 = None
+        self._filter_rem = None
+        self._filters_strided = None
+        self._strides_strided = None
+        self._steps = 0
+        self._rem = 1
+
+    def build(self, input_shape):
+        if len(input_shape) != 4:
+            raise ValueError(f"AxisMean expects rank-4 NHWC input, got shape={input_shape}")
+        h, w, c = input_shape[1], input_shape[2], input_shape[3]
+        if h is None or w is None or c is None:
+            raise ValueError("AxisMean requires static H/W/C for TFLite/XNNPACK-friendly export.")
+        self._h = int(h)
+        self._w = int(w)
+        self._c = int(c)
+
+        impl = self.impl
+        if impl == "mean":
+            super().build(input_shape)
+            return
+
+        if self.axis not in (1, 2):
+            raise ValueError(f"AxisMean supports only axis=1 or axis=2, got axis={self.axis}")
+
+        if impl == "avgpool":
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_full":
+            if self.axis == 1:
+                k = np.ones((self._h, 1, self._c, 1), dtype=np.float32) / float(self._h)
+            else:
+                k = np.ones((1, self._w, self._c, 1), dtype=np.float32) / float(self._w)
+            self._filter_full = tf.constant(k, dtype=tf.float32, name=f"{self.name}_dwfilter_full")
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_strided":
+            length = self._h if self.axis == 1 else self._w
+            filters = []
+            strides = []
+            factors = (8, 4, 2)
+            while length > 1:
+                k = None
+                for f in factors:
+                    if length % f == 0:
+                        k = f
+                        break
+                if k is None:
+                    k = int(length)
+                if self.axis == 1:
+                    kk = np.ones((k, 1, self._c, 1), dtype=np.float32) / float(k)
+                    filters.append(tf.constant(kk, dtype=tf.float32, name=f"{self.name}_dwfilter_k{k}"))
+                    strides.append([1, k, 1, 1])
+                else:
+                    kk = np.ones((1, k, self._c, 1), dtype=np.float32) / float(k)
+                    filters.append(tf.constant(kk, dtype=tf.float32, name=f"{self.name}_dwfilter_k{k}"))
+                    strides.append([1, 1, k, 1])
+                length //= k
+            self._filters_strided = filters
+            self._strides_strided = strides
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_pyramid":
+            length = self._h if self.axis == 1 else self._w
+            steps = 0
+            while length > 1 and (length % 2 == 0):
+                steps += 1
+                length //= 2
+            self._steps = int(steps)
+            self._rem = int(length)
+
+            if self.axis == 1:
+                k2 = np.ones((2, 1, self._c, 1), dtype=np.float32) * 0.5
+                self._filter_2 = tf.constant(k2, dtype=tf.float32, name=f"{self.name}_dwfilter2")
+                if self._rem > 1:
+                    krem = np.ones((self._rem, 1, self._c, 1), dtype=np.float32) / float(self._rem)
+                    self._filter_rem = tf.constant(krem, dtype=tf.float32, name=f"{self.name}_dwfilter_rem")
+            else:
+                k2 = np.ones((1, 2, self._c, 1), dtype=np.float32) * 0.5
+                self._filter_2 = tf.constant(k2, dtype=tf.float32, name=f"{self.name}_dwfilter2")
+                if self._rem > 1:
+                    krem = np.ones((1, self._rem, self._c, 1), dtype=np.float32) / float(self._rem)
+                    self._filter_rem = tf.constant(krem, dtype=tf.float32, name=f"{self.name}_dwfilter_rem")
+            super().build(input_shape)
+            return
+
+        raise ValueError(f"Unsupported AxisMean impl='{self.impl}'")
+        super().build(input_shape)
 
     def call(self, inputs):
-        return tf.reduce_mean(inputs, axis=self.axis)
+        if self.impl == "mean":
+            return tf.reduce_mean(inputs, axis=self.axis)
+
+        if self._h is None or self._w is None or self._c is None:
+            raise RuntimeError("AxisMean is not built.")
+
+        if self.impl == "avgpool":
+            if self.axis == 1:
+                x = tf.nn.avg_pool2d(inputs, ksize=(self._h, 1), strides=(1, 1), padding="VALID")
+                return tf.reshape(x, [-1, self._w, self._c])
+            x = tf.nn.avg_pool2d(inputs, ksize=(1, self._w), strides=(1, 1), padding="VALID")
+            return tf.reshape(x, [-1, self._h, self._c])
+
+        if self.impl == "dwconv_full":
+            if self._filter_full is None:
+                raise RuntimeError("AxisMean dwconv_full filter missing.")
+            x = tf.nn.depthwise_conv2d(inputs, self._filter_full, strides=[1, 1, 1, 1], padding="VALID")
+            if self.axis == 1:
+                return tf.reshape(x, [-1, self._w, self._c])
+            return tf.reshape(x, [-1, self._h, self._c])
+
+        if self.impl == "dwconv_strided":
+            if self._filters_strided is None or self._strides_strided is None:
+                raise RuntimeError("AxisMean dwconv_strided filters missing.")
+            x = inputs
+            for f, s in zip(self._filters_strided, self._strides_strided, strict=False):
+                x = tf.nn.depthwise_conv2d(x, f, strides=s, padding="VALID")
+            if self.axis == 1:
+                return tf.reshape(x, [-1, self._w, self._c])
+            return tf.reshape(x, [-1, self._h, self._c])
+
+        if self.impl == "dwconv_pyramid":
+            if self._filter_2 is None:
+                raise RuntimeError("AxisMean dwconv_pyramid filter2 missing.")
+            x = inputs
+            if self.axis == 1:
+                for _ in range(self._steps):
+                    x = tf.nn.depthwise_conv2d(x, self._filter_2, strides=[1, 2, 1, 1], padding="VALID")
+                if self._rem > 1:
+                    if self._filter_rem is None:
+                        raise RuntimeError("AxisMean dwconv_pyramid filter_rem missing.")
+                    x = tf.nn.depthwise_conv2d(x, self._filter_rem, strides=[1, 1, 1, 1], padding="VALID")
+                return tf.reshape(x, [-1, self._w, self._c])
+
+            for _ in range(self._steps):
+                x = tf.nn.depthwise_conv2d(x, self._filter_2, strides=[1, 1, 2, 1], padding="VALID")
+            if self._rem > 1:
+                if self._filter_rem is None:
+                    raise RuntimeError("AxisMean dwconv_pyramid filter_rem missing.")
+                x = tf.nn.depthwise_conv2d(x, self._filter_rem, strides=[1, 1, 1, 1], padding="VALID")
+            return tf.reshape(x, [-1, self._h, self._c])
+
+        raise ValueError(f"Unsupported AxisMean impl='{self.impl}'")
 
     def get_config(self):
         config = super().get_config()
-        config.update({"axis": self.axis})
+        config.update({"axis": self.axis, "impl": self.impl})
         return config
 
 
@@ -51,7 +199,11 @@ class Resize1D(layers.Layer):
         channels = inputs.shape[-1]
         if channels is None:
             raise ValueError("Resize1D requires a known channel dimension for TFLite/XNNPACK-friendly export.")
-        x = tf.expand_dims(inputs, axis=2)  # [B, L, 1, C]
+        length = inputs.shape[1]
+        if length is None:
+            raise ValueError("Resize1D requires a known length dimension for TFLite/XNNPACK-friendly export.")
+        # Avoid EXPAND_DIMS: reshape to 4D for RESIZE_BILINEAR.
+        x = tf.reshape(inputs, [-1, int(length), 1, int(channels)])  # [B, L, 1, C]
         x = tf.image.resize(x, size=(self.target_length, 1), method=self.method)
         # Avoid STRIDED_SLICE (often not delegated): reshape away the singleton width dimension.
         return tf.reshape(x, [-1, self.target_length, int(channels)])
@@ -94,6 +246,298 @@ class Broadcast1D(layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update({"target_length": self.target_length})
+        return config
+
+
+@register_keras_serializable(package="doccorner")
+class Conv1DAsConv2D(layers.Layer):
+    """
+    XNNPACK-friendly Conv1D equivalent implemented as:
+      [B,L,C] -> RESHAPE -> [B,1,L,C] -> CONV_2D -> RESHAPE -> [B,L,F]
+
+    This avoids EXPAND_DIMS/SQUEEZE patterns that prevent full delegation for int8 graphs.
+    """
+
+    def __init__(
+        self,
+        filters: int,
+        kernel_size: int,
+        strides: int = 1,
+        padding: str = "same",
+        use_bias: bool = True,
+        kernel_initializer="glorot_uniform",
+        bias_initializer="zeros",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.filters = int(filters)
+        self.kernel_size = int(kernel_size)
+        self.strides = int(strides)
+        self.padding = str(padding).lower().strip()
+        self.use_bias = bool(use_bias)
+        self.kernel_initializer = keras.initializers.get(kernel_initializer)
+        self.bias_initializer = keras.initializers.get(bias_initializer)
+
+        self._length = None
+        self._in_ch = None
+        self._out_len = None
+        self.kernel = None
+        self.bias = None
+
+    def build(self, input_shape):
+        if len(input_shape) != 3:
+            raise ValueError(f"Conv1DAsConv2D expects rank-3 input [B,L,C], got shape={input_shape}")
+        length = input_shape[1]
+        in_ch = input_shape[2]
+        if length is None or in_ch is None:
+            raise ValueError("Conv1DAsConv2D requires static L/C for TFLite/XNNPACK-friendly export.")
+        if self.padding not in {"same", "valid"}:
+            raise ValueError(f"Unsupported padding='{self.padding}'")
+        if self.strides < 1:
+            raise ValueError("strides must be >= 1")
+
+        self._length = int(length)
+        self._in_ch = int(in_ch)
+
+        if self.padding == "same":
+            self._out_len = int(np.ceil(self._length / self.strides))
+        else:
+            self._out_len = max(0, int(np.floor((self._length - self.kernel_size) / self.strides) + 1))
+
+        self.kernel = self.add_weight(
+            name="kernel",
+            shape=(self.kernel_size, self._in_ch, self.filters),
+            initializer=self.kernel_initializer,
+            trainable=True,
+        )
+        if self.use_bias:
+            self.bias = self.add_weight(
+                name="bias",
+                shape=(self.filters,),
+                initializer=self.bias_initializer,
+                trainable=True,
+            )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        if self._length is None or self._in_ch is None or self._out_len is None or self.kernel is None:
+            raise RuntimeError("Conv1DAsConv2D is not built.")
+
+        x = tf.reshape(inputs, [-1, 1, self._length, self._in_ch])
+        k = tf.reshape(self.kernel, [1, self.kernel_size, self._in_ch, self.filters])
+        y = tf.nn.conv2d(
+            x,
+            k,
+            strides=[1, 1, self.strides, 1],
+            padding=self.padding.upper(),
+        )
+        if self.use_bias and self.bias is not None:
+            y = tf.nn.bias_add(y, self.bias)
+        return tf.reshape(y, [-1, self._out_len, self.filters])
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "filters": self.filters,
+                "kernel_size": self.kernel_size,
+                "strides": self.strides,
+                "padding": self.padding,
+                "use_bias": self.use_bias,
+                "kernel_initializer": keras.initializers.serialize(self.kernel_initializer),
+                "bias_initializer": keras.initializers.serialize(self.bias_initializer),
+            }
+        )
+        return config
+
+
+@register_keras_serializable(package="doccorner")
+class GlobalAveragePool2DAsAvgPool(layers.Layer):
+    """GlobalAveragePooling2D replacement with multiple implementations."""
+
+    def __init__(self, impl: str = "mean", **kwargs):
+        super().__init__(**kwargs)
+        self.impl = str(impl).lower().strip()
+        self._h = None
+        self._w = None
+        self._c = None
+        self._filter_full = None
+        self._filters_strided = None
+        self._strides_strided = None
+        self._filter_2x2 = None
+        self._filter_2x1 = None
+        self._filter_1x2 = None
+        self._filter_final = None
+        self._plan = None
+
+    def build(self, input_shape):
+        if len(input_shape) != 4:
+            raise ValueError(f"GlobalAveragePool2DAsAvgPool expects rank-4 NHWC input, got shape={input_shape}")
+        h, w, c = input_shape[1], input_shape[2], input_shape[3]
+        if h is None or w is None or c is None:
+            raise ValueError("GlobalAveragePool2DAsAvgPool requires static H/W/C for TFLite/XNNPACK-friendly export.")
+        self._h = int(h)
+        self._w = int(w)
+        self._c = int(c)
+
+        impl = self.impl
+        if impl == "mean":
+            super().build(input_shape)
+            return
+
+        if impl == "avgpool":
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_full":
+            k = np.ones((self._h, self._w, self._c, 1), dtype=np.float32) / float(self._h * self._w)
+            self._filter_full = tf.constant(k, dtype=tf.float32, name=f"{self.name}_dwfilter_full")
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_strided":
+            hh = int(self._h)
+            ww = int(self._w)
+            filters = []
+            strides = []
+            factors = (8, 4, 2)
+            while hh > 1 or ww > 1:
+                if hh <= 1:
+                    kh = 1
+                else:
+                    kh = None
+                    for f in factors:
+                        if hh % f == 0:
+                            kh = f
+                            break
+                    if kh is None:
+                        kh = int(hh)
+                if ww <= 1:
+                    kw = 1
+                else:
+                    kw = None
+                    for f in factors:
+                        if ww % f == 0:
+                            kw = f
+                            break
+                if kw is None:
+                    kw = int(ww)
+
+                k = np.ones((kh, kw, self._c, 1), dtype=np.float32) / float(kh * kw)
+                filters.append(tf.constant(k, dtype=tf.float32, name=f"{self.name}_dwfilter_{kh}x{kw}"))
+                strides.append([1, kh, kw, 1])
+                hh //= kh
+                ww //= kw
+
+            self._filters_strided = filters
+            self._strides_strided = strides
+            super().build(input_shape)
+            return
+
+        if impl == "dwconv_pyramid":
+            self._filter_2x2 = tf.constant(
+                np.ones((2, 2, self._c, 1), dtype=np.float32) * 0.25,
+                dtype=tf.float32,
+                name=f"{self.name}_dwfilter2x2",
+            )
+            self._filter_2x1 = tf.constant(
+                np.ones((2, 1, self._c, 1), dtype=np.float32) * 0.5,
+                dtype=tf.float32,
+                name=f"{self.name}_dwfilter2x1",
+            )
+            self._filter_1x2 = tf.constant(
+                np.ones((1, 2, self._c, 1), dtype=np.float32) * 0.5,
+                dtype=tf.float32,
+                name=f"{self.name}_dwfilter1x2",
+            )
+
+            plan = []
+            hh = self._h
+            ww = self._w
+            while (hh > 1) or (ww > 1):
+                if (hh > 1) and (ww > 1) and (hh % 2 == 0) and (ww % 2 == 0):
+                    plan.append(("2x2", 2, 2))
+                    hh //= 2
+                    ww //= 2
+                    continue
+                if (hh > 1) and (hh % 2 == 0):
+                    plan.append(("2x1", 2, 1))
+                    hh //= 2
+                    continue
+                if (ww > 1) and (ww % 2 == 0):
+                    plan.append(("1x2", 1, 2))
+                    ww //= 2
+                    continue
+                break
+
+            if hh > 1 or ww > 1:
+                plan.append(("final", hh, ww))
+                k = np.ones((hh, ww, self._c, 1), dtype=np.float32) / float(hh * ww)
+                self._filter_final = tf.constant(k, dtype=tf.float32, name=f"{self.name}_dwfilter_final")
+                hh = 1
+                ww = 1
+
+            if hh != 1 or ww != 1:
+                raise RuntimeError(f"GlobalAveragePool2DAsAvgPool reduction plan did not reach 1x1: got {hh}x{ww}")
+
+            self._plan = plan
+            super().build(input_shape)
+            return
+
+        raise ValueError(f"Unsupported GlobalAveragePool2DAsAvgPool impl='{self.impl}'")
+        super().build(input_shape)
+
+    def call(self, inputs):
+        if self._h is None or self._w is None or self._c is None:
+            raise RuntimeError("GlobalAveragePool2DAsAvgPool is not built.")
+        if self.impl == "mean":
+            return tf.reduce_mean(inputs, axis=(1, 2))
+
+        if self.impl == "avgpool":
+            x = tf.nn.avg_pool2d(inputs, ksize=(self._h, self._w), strides=(1, 1), padding="VALID")
+            return tf.reshape(x, [-1, self._c])
+
+        if self.impl == "dwconv_full":
+            if self._filter_full is None:
+                raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_full filter missing.")
+            x = tf.nn.depthwise_conv2d(inputs, self._filter_full, strides=[1, 1, 1, 1], padding="VALID")
+            return tf.reshape(x, [-1, self._c])
+
+        if self.impl == "dwconv_strided":
+            if self._filters_strided is None or self._strides_strided is None:
+                raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_strided filters missing.")
+            x = inputs
+            for f, s in zip(self._filters_strided, self._strides_strided, strict=False):
+                x = tf.nn.depthwise_conv2d(x, f, strides=s, padding="VALID")
+            return tf.reshape(x, [-1, self._c])
+
+        if self.impl == "dwconv_pyramid":
+            if self._plan is None:
+                raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_pyramid plan missing.")
+            if self._filter_2x2 is None or self._filter_2x1 is None or self._filter_1x2 is None:
+                raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_pyramid filters missing.")
+
+            x = inputs
+            for kind, _kh, _kw in self._plan:
+                if kind == "2x2":
+                    x = tf.nn.depthwise_conv2d(x, self._filter_2x2, strides=[1, 2, 2, 1], padding="VALID")
+                elif kind == "2x1":
+                    x = tf.nn.depthwise_conv2d(x, self._filter_2x1, strides=[1, 2, 1, 1], padding="VALID")
+                elif kind == "1x2":
+                    x = tf.nn.depthwise_conv2d(x, self._filter_1x2, strides=[1, 1, 2, 1], padding="VALID")
+                elif kind == "final":
+                    if self._filter_final is None:
+                        raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_pyramid final filter missing.")
+                    x = tf.nn.depthwise_conv2d(x, self._filter_final, strides=[1, 1, 1, 1], padding="VALID")
+                else:
+                    raise RuntimeError(f"Unexpected reduction kind='{kind}'")
+            return tf.reshape(x, [-1, self._c])
+
+        raise ValueError(f"Unsupported GlobalAveragePool2DAsAvgPool impl='{self.impl}'")
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"impl": self.impl})
         return config
 
 
@@ -308,6 +752,11 @@ def build_doccorner_simcc_v3(
     backbone: str = "mobilenetv3_small",
     backbone_minimalistic: bool = False,
     backbone_include_preprocessing: bool = False,
+    conv1d_as_conv2d: bool = False,
+    axis_mean_impl: str = "mean",
+    global_pool_impl: str = "mean",
+    score_pool_impl: str | None = None,
+    simcc_output_layout: str = "corners_first",
 ):
     """
     Build DocCornerNetV3 model with correct SimCC (MMPose style).
@@ -329,11 +778,18 @@ def build_doccorner_simcc_v3(
         num_bins: Number of bins for coordinate classification
         tau: Temperature for softmax in coordinate decode
         score_init_bias: Initial bias for score head
+        axis_mean_impl: Axis reduction impl ('mean', 'avgpool', 'dwconv_full', 'dwconv_strided', 'dwconv_pyramid')
+        global_pool_impl: Global pooling impl ('mean', 'avgpool', 'dwconv_full', 'dwconv_strided', 'dwconv_pyramid')
+        score_pool_impl: Pooling impl override for score_gap (defaults to global_pool_impl)
+        simcc_output_layout: SimCC tensor layout ('corners_first' => [B,4,num_bins], 'bins_first' => [B,num_bins,4])
 
     Returns:
         Keras Model with outputs dict
     """
     inp = keras.Input((img_size, img_size, 3), name="image")
+    conv1d_layer = Conv1DAsConv2D if bool(conv1d_as_conv2d) else layers.Conv1D
+    score_pool_impl_resolved = global_pool_impl if score_pool_impl in (None, "") else str(score_pool_impl)
+    simcc_layout = str(simcc_output_layout).lower().strip()
 
     # =========================================================================
     # Backbone (optionally ImageNet pretrained)
@@ -390,11 +846,11 @@ def build_doccorner_simcc_v3(
 
     # Generate X marginals: reduce along Y axis (vertical pooling)
     # [B, 56, 56, fpn_ch] -> [B, 56, fpn_ch] via mean along axis 1
-    x_marginal = AxisMean(axis=1, name="x_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
+    x_marginal = AxisMean(axis=1, impl=axis_mean_impl, name="x_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
 
     # Generate Y marginals: reduce along X axis (horizontal pooling)
     # [B, 56, 56, fpn_ch] -> [B, 56, fpn_ch] via mean along axis 2
-    y_marginal = AxisMean(axis=2, name="y_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
+    y_marginal = AxisMean(axis=2, impl=axis_mean_impl, name="y_marginal_pool")(p_fused)  # [B, 56, fpn_ch]
 
     # Upsample marginals to num_bins resolution
     # [B, 56, fpn_ch] -> [B, num_bins, fpn_ch]
@@ -402,22 +858,22 @@ def build_doccorner_simcc_v3(
     y_marginal = Resize1D(target_length=num_bins, name="y_marginal_resize")(y_marginal)  # [B, 224, fpn_ch]
 
     # 1D convolutions for coordinate refinement along each axis
-    x_feat = layers.Conv1D(simcc_ch, 5, padding="same", name="simcc_x_conv1")(x_marginal)
+    x_feat = conv1d_layer(simcc_ch, 5, padding="same", name="simcc_x_conv1")(x_marginal)
     x_feat = layers.BatchNormalization(name="simcc_x_bn1")(x_feat)
     x_feat = layers.ReLU(name="simcc_x_relu1")(x_feat)
-    x_feat = layers.Conv1D(simcc_ch // 2, 3, padding="same", name="simcc_x_conv2")(x_feat)
+    x_feat = conv1d_layer(simcc_ch // 2, 3, padding="same", name="simcc_x_conv2")(x_feat)
     x_feat = layers.BatchNormalization(name="simcc_x_bn2")(x_feat)
     x_feat = layers.ReLU(name="simcc_x_relu2")(x_feat)
 
-    y_feat = layers.Conv1D(simcc_ch, 5, padding="same", name="simcc_y_conv1")(y_marginal)
+    y_feat = conv1d_layer(simcc_ch, 5, padding="same", name="simcc_y_conv1")(y_marginal)
     y_feat = layers.BatchNormalization(name="simcc_y_bn1")(y_feat)
     y_feat = layers.ReLU(name="simcc_y_relu1")(y_feat)
-    y_feat = layers.Conv1D(simcc_ch // 2, 3, padding="same", name="simcc_y_conv2")(y_feat)
+    y_feat = conv1d_layer(simcc_ch // 2, 3, padding="same", name="simcc_y_conv2")(y_feat)
     y_feat = layers.BatchNormalization(name="simcc_y_bn2")(y_feat)
     y_feat = layers.ReLU(name="simcc_y_relu2")(y_feat)
 
     # Global context via GAP (auxiliary, for corner disambiguation)
-    global_feat = layers.GlobalAveragePooling2D(name="simcc_global_gap")(p_fused)  # [B, fpn_ch]
+    global_feat = GlobalAveragePool2DAsAvgPool(impl=global_pool_impl, name="simcc_global_gap")(p_fused)  # [B, fpn_ch]
     global_feat = layers.Dense(simcc_ch // 2, name="simcc_global_fc")(global_feat)
     global_feat = layers.ReLU(name="simcc_global_relu")(global_feat)
 
@@ -432,28 +888,40 @@ def build_doccorner_simcc_v3(
 
     # Output heads: 4 corners for each axis
     # [B, num_bins, simcc_ch] -> [B, num_bins, 4]
-    simcc_x = layers.Conv1D(
+    simcc_x = conv1d_layer(
         4, 1,
         kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
         bias_initializer=keras.initializers.Zeros(),
         name="simcc_x_out"
     )(x_feat)  # [B, 224, 4]
-    simcc_x = layers.Permute((2, 1), name="simcc_x")(simcc_x)  # [B, 4, 224]
+    if simcc_layout in {"corners_first", "corner_first", "channels_first", "first"}:
+        simcc_x = layers.Permute((2, 1), name="simcc_x")(simcc_x)  # [B, 4, num_bins]
+    elif simcc_layout in {"bins_first", "bin_first", "channels_last", "last"}:
+        # Keep as [B, num_bins, 4] (no TRANSPOSE op).
+        pass
+    else:
+        raise ValueError(f"Unsupported simcc_output_layout='{simcc_output_layout}'")
 
-    simcc_y = layers.Conv1D(
+    simcc_y = conv1d_layer(
         4, 1,
         kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
         bias_initializer=keras.initializers.Zeros(),
         name="simcc_y_out"
     )(y_feat)  # [B, 224, 4]
-    simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)  # [B, 4, 224]
+    if simcc_layout in {"corners_first", "corner_first", "channels_first", "first"}:
+        simcc_y = layers.Permute((2, 1), name="simcc_y")(simcc_y)  # [B, 4, num_bins]
+    elif simcc_layout in {"bins_first", "bin_first", "channels_last", "last"}:
+        # Keep as [B, num_bins, 4] (no TRANSPOSE op).
+        pass
+    else:
+        raise ValueError(f"Unsupported simcc_output_layout='{simcc_output_layout}'")
 
     coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])
 
     # =========================================================================
     # Score Head: Document presence classification
     # =========================================================================
-    score_features = layers.GlobalAveragePooling2D(name="score_gap")(c5)
+    score_features = GlobalAveragePool2DAsAvgPool(impl=score_pool_impl_resolved, name="score_gap")(c5)
     score_logit = layers.Dense(
         1,
         bias_initializer=keras.initializers.Constant(score_init_bias),
@@ -489,6 +957,11 @@ def create_model(
     backbone: str = "mobilenetv3_small",
     backbone_minimalistic: bool = False,
     backbone_include_preprocessing: bool = False,
+    conv1d_as_conv2d: bool = False,
+    axis_mean_impl: str = "mean",
+    global_pool_impl: str = "mean",
+    score_pool_impl: str | None = None,
+    simcc_output_layout: str = "corners_first",
 ):
     """
     Factory function to create DocCornerNetV3 training model with SimCC.
@@ -523,6 +996,11 @@ def create_model(
         backbone=backbone,
         backbone_minimalistic=backbone_minimalistic,
         backbone_include_preprocessing=backbone_include_preprocessing,
+        conv1d_as_conv2d=conv1d_as_conv2d,
+        axis_mean_impl=axis_mean_impl,
+        global_pool_impl=global_pool_impl,
+        score_pool_impl=score_pool_impl,
+        simcc_output_layout=simcc_output_layout,
     )
 
 

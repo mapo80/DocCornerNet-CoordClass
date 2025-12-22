@@ -87,12 +87,62 @@ def parse_args():
         type=str,
         default="float32",
         choices=["float32", "uint8", "int8"],
-        help="TFLite model input dtype (output is always float32 [1,9])",
+        help="TFLite model input dtype",
+    )
+    p.add_argument(
+        "--output_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "uint8", "int8"],
+        help="TFLite model output dtype",
+    )
+    p.add_argument(
+        "--output_format",
+        type=str,
+        default="coords9",
+        choices=["coords9", "simcc_logits"],
+        help=(
+            "TFLite output format. "
+            "'coords9' outputs a single [B,9] tensor: [x0..y3, score]. "
+            "'simcc_logits' outputs [simcc_x, simcc_y, score_logit] and expects decoding outside the model."
+        ),
+    )
+    p.add_argument(
+        "--simcc_packed_layout",
+        type=str,
+        default="8_first",
+        choices=["8_first", "bins_first"],
+        help=(
+            "Only for output_format=simcc_logits: "
+            "'8_first' packs logits as [B,8,num_bins] (X corners then Y corners), "
+            "'bins_first' packs logits as [B,num_bins,8] to avoid TRANSPOSE ops."
+        ),
     )
     p.add_argument(
         "--allow_float_fallback",
         action="store_true",
         help="Allow float TFLite builtins fallback for ops that can't be quantized (avoids SELECT_TF_OPS)",
+    )
+    p.add_argument(
+        "--axis_mean_impl",
+        type=str,
+        default="dwconv_full",
+        choices=["mean", "avgpool", "dwconv_full", "dwconv_strided", "dwconv_pyramid"],
+        help="Axis reduction implementation used for x/y marginals in the export model (XNNPACK coverage vs speed).",
+    )
+    p.add_argument(
+        "--global_pool_impl",
+        type=str,
+        default="dwconv_full",
+        choices=["mean", "avgpool", "dwconv_full", "dwconv_strided", "dwconv_pyramid"],
+        help="Global pooling implementation used for simcc_global_gap/score_gap in the export model (XNNPACK coverage vs speed).",
+    )
+    p.add_argument(
+        "--score_pool_impl",
+        type=str,
+        default="auto",
+        choices=["auto", "mean", "avgpool", "dwconv_full", "dwconv_strided", "dwconv_pyramid"],
+        help="Override pooling impl for score_gap only (default: use --global_pool_impl).",
     )
     p.add_argument(
         "--output",
@@ -183,6 +233,8 @@ def create_tflite_inference_model(
     img_size: int,
     model_input_norm: str,
     tflite_input_norm: str,
+    output_format: str = "coords9",
+    simcc_packed_layout: str = "8_first",
 ) -> keras.Model:
     """
     Build a TFLite-friendly inference model:
@@ -193,16 +245,45 @@ def create_tflite_inference_model(
     x = _apply_norm_transform(inputs, tflite_input_norm, model_input_norm)
 
     outputs = model(x, training=False)
+
     if isinstance(outputs, dict):
-        coords = outputs["coords"]
+        simcc_x = outputs["simcc_x"]
+        simcc_y = outputs["simcc_y"]
         score_logit = outputs["score_logit"]
+        coords = outputs["coords"]
     else:
+        # Legacy: [coords, score_logit]
+        simcc_x = None
+        simcc_y = None
         coords = outputs[0]
         score_logit = outputs[1]
 
-    score = keras.ops.sigmoid(score_logit)
-    out = keras.ops.concatenate([coords, score], axis=-1)
-    return keras.Model(inputs=inputs, outputs=out, name="doccornernet_inference")
+    fmt = (output_format or "coords9").lower().strip()
+    if fmt == "coords9":
+        score = keras.ops.sigmoid(score_logit)
+        out = keras.ops.concatenate([coords, score], axis=-1)
+        return keras.Model(inputs=inputs, outputs=out, name="doccornernet_inference")
+
+    if fmt == "simcc_logits":
+        if simcc_x is None or simcc_y is None:
+            raise ValueError("output_format='simcc_logits' requires model dict outputs with simcc_x/simcc_y.")
+        # NOTE: we decode outside the model; keep logits as-is (can be quantized).
+        layout = str(simcc_packed_layout).lower().strip()
+        if layout == "bins_first":
+            # simcc_x/y: [B, num_bins, 4] -> simcc_xy: [B, num_bins, 8]
+            simcc_xy = keras.ops.concatenate([simcc_x, simcc_y], axis=-1)
+        elif layout == "8_first":
+            # simcc_x/y: [B, 4, num_bins] -> simcc_xy: [B, 8, num_bins]
+            simcc_xy = keras.ops.concatenate([simcc_x, simcc_y], axis=1)
+        else:
+            raise ValueError(f"Unsupported simcc_packed_layout='{simcc_packed_layout}'")
+        return keras.Model(
+            inputs=inputs,
+            outputs=[simcc_xy, score_logit],
+            name="doccornernet_simcc_logits",
+        )
+
+    raise ValueError(f"Unsupported output_format='{output_format}'")
 
 
 def _io_dtype(value: str):
@@ -214,6 +295,37 @@ def _io_dtype(value: str):
     if v == "int8":
         return tf.int8
     raise ValueError(f"Unsupported io_dtype='{value}'")
+
+
+def _copy_weights_by_path(src: keras.Model, dst: keras.Model) -> None:
+    """
+    Copy weights from src to dst by variable path.
+
+    This is more robust than `set_weights()` when model graph traversal order changes
+    (e.g., when toggling non-weight layers like Permute/Reshape).
+    """
+    src_map = {w.path: w.numpy() for w in src.weights}
+    missing = []
+    mismatched = []
+
+    for w in dst.weights:
+        v = src_map.get(w.path)
+        if v is None:
+            missing.append(w.path)
+            continue
+        if tuple(w.shape) != tuple(v.shape):
+            mismatched.append((w.path, tuple(w.shape), tuple(v.shape)))
+            continue
+        w.assign(v)
+
+    if mismatched:
+        msg = "\n".join(f"  {p}: dst={ds} src={ss}" for p, ds, ss in mismatched[:20])
+        raise ValueError(f"Weight shape mismatches while copying by path (showing up to 20):\n{msg}")
+    if missing:
+        # Some layers may be absent due to config differences; warn but continue.
+        print(f"WARNING: {len(missing)} dst weights not found in src (showing up to 20):")
+        for p in missing[:20]:
+            print(f"  - {p}")
 
 
 def main():
@@ -251,11 +363,17 @@ def main():
     print(f"  model_input_norm={model_input_norm}")
     print(f"  tflite_input_norm={tflite_input_norm}")
     print(f"  quantization={args.quantization}")
-    print(f"  io_dtype={args.io_dtype} (output float32)")
+    print(f"  io_dtype={args.io_dtype} output_dtype={args.output_dtype}")
     print(f"  allow_float_fallback={args.allow_float_fallback}")
+    print(
+        f"  axis_mean_impl={args.axis_mean_impl} global_pool_impl={args.global_pool_impl} score_pool_impl={args.score_pool_impl}"
+    )
+    print(f"  simcc_packed_layout={args.simcc_packed_layout}")
 
     # Build + load model (avoid downloading backbone weights).
-    model = create_model(
+    # NOTE: we load weights into the "standard" model first for compatibility with checkpoints,
+    # then copy them into an XNNPACK-friendly variant that avoids EXPAND_DIMS patterns from Conv1D.
+    base_model = create_model(
         backbone=backbone,
         alpha=alpha,
         backbone_minimalistic=backbone_minimalistic,
@@ -267,14 +385,40 @@ def main():
         num_bins=num_bins,
         tau=tau,
     )
-    model.load_weights(str(weights_path))
-    print(f"Loaded weights. Params: {model.count_params():,}")
+    base_model.load_weights(str(weights_path))
+    print(f"Loaded weights. Params: {base_model.count_params():,}")
+
+    export_model = create_model(
+        backbone=backbone,
+        alpha=alpha,
+        backbone_minimalistic=backbone_minimalistic,
+        backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_weights=None,
+        fpn_ch=fpn_ch,
+        simcc_ch=simcc_ch,
+        img_size=img_size,
+        num_bins=num_bins,
+        tau=tau,
+        conv1d_as_conv2d=True,
+        axis_mean_impl=str(args.axis_mean_impl),
+        global_pool_impl=str(args.global_pool_impl),
+        score_pool_impl=None if str(args.score_pool_impl).lower().strip() == "auto" else str(args.score_pool_impl),
+        simcc_output_layout=(
+            "bins_first"
+            if (str(args.output_format).lower().strip() == "simcc_logits")
+            and (str(args.simcc_packed_layout).lower().strip() == "bins_first")
+            else "corners_first"
+        ),
+    )
+    _copy_weights_by_path(base_model, export_model)
 
     infer_model = create_tflite_inference_model(
-        model=model,
+        model=export_model,
         img_size=img_size,
         model_input_norm=model_input_norm,
         tflite_input_norm=tflite_input_norm,
+        output_format=args.output_format,
+        simcc_packed_layout=str(args.simcc_packed_layout),
     )
 
     # Convert
@@ -320,9 +464,10 @@ def main():
     if args.quantization == "dynamic":
         # Keep float32 I/O for dynamic range quantization.
         converter.inference_input_type = tf.float32
+        converter.inference_output_type = tf.float32
     else:
         converter.inference_input_type = _io_dtype(args.io_dtype)
-    converter.inference_output_type = tf.float32
+        converter.inference_output_type = _io_dtype(args.output_dtype)
 
     # Conversion tends to be more stable with this disabled for non-RNN models.
     converter._experimental_lower_tensor_list_ops = False  # pylint: disable=protected-access
@@ -340,15 +485,17 @@ def main():
     interpreter = tf.lite.Interpreter(model_path=str(output_path), num_threads=int(args.threads))
     interpreter.allocate_tensors()
     in0 = interpreter.get_input_details()[0]
-    out0 = interpreter.get_output_details()[0]
+    outs = interpreter.get_output_details()
     print(f"  Input:  {in0['shape']} {in0['dtype']} quant={in0.get('quantization')}")
-    print(f"  Output: {out0['shape']} {out0['dtype']} quant={out0.get('quantization')}")
+    for i, out in enumerate(outs):
+        print(f"  Output {i}: {out['shape']} {out['dtype']} quant={out.get('quantization')} name={out.get('name')}")
 
     dummy = np.zeros(in0["shape"], dtype=in0["dtype"])
     interpreter.set_tensor(in0["index"], dummy)
     interpreter.invoke()
-    y = interpreter.get_tensor(out0["index"])
-    print(f"  Ran 1 inference. Output shape: {y.shape}")
+    for i, out in enumerate(outs):
+        y = interpreter.get_tensor(out["index"])
+        print(f"  Ran 1 inference. Output[{i}] shape: {np.asarray(y).shape}")
 
 
 if __name__ == "__main__":

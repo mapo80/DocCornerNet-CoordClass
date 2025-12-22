@@ -24,6 +24,17 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=50, help="Warmup invokes")
     p.add_argument("--runs", type=int, default=500, help="Timed invokes")
     p.add_argument(
+        "--mode",
+        type=str,
+        default="io",
+        choices=["io", "invoke"],
+        help=(
+            "Benchmark mode: "
+            "'io' measures set_tensor + invoke + get_tensor (end-to-end inside the Interpreter API); "
+            "'invoke' measures invoke() only with input preloaded and without output copies."
+        ),
+    )
+    p.add_argument(
         "--input_fill",
         type=str,
         default="random",
@@ -72,23 +83,38 @@ def main():
 
     x = _quantize_if_needed(x, in_detail)
 
-    # Warmup
-    for _ in range(max(0, args.warmup)):
+    mode = (args.mode or "io").lower().strip()
+    if mode == "invoke":
+        # Preload input tensor once (avoid per-iter set_tensor copies).
         interpreter.set_tensor(in_detail["index"], x)
-        interpreter.invoke()
-        for od in out_details:
-            _ = interpreter.get_tensor(od["index"])
 
-    # Timed runs
-    times = np.empty((max(0, args.runs),), dtype=np.float32)
-    for i in range(times.shape[0]):
-        t0 = time.perf_counter()
-        interpreter.set_tensor(in_detail["index"], x)
-        interpreter.invoke()
-        for od in out_details:
-            _ = interpreter.get_tensor(od["index"])
-        t1 = time.perf_counter()
-        times[i] = (t1 - t0) * 1000.0
+        for _ in range(max(0, args.warmup)):
+            interpreter.invoke()
+
+        times = np.empty((max(0, args.runs),), dtype=np.float32)
+        for i in range(times.shape[0]):
+            t0 = time.perf_counter()
+            interpreter.invoke()
+            t1 = time.perf_counter()
+            times[i] = (t1 - t0) * 1000.0
+    else:
+        # Warmup
+        for _ in range(max(0, args.warmup)):
+            interpreter.set_tensor(in_detail["index"], x)
+            interpreter.invoke()
+            for od in out_details:
+                _ = interpreter.get_tensor(od["index"])
+
+        # Timed runs
+        times = np.empty((max(0, args.runs),), dtype=np.float32)
+        for i in range(times.shape[0]):
+            t0 = time.perf_counter()
+            interpreter.set_tensor(in_detail["index"], x)
+            interpreter.invoke()
+            for od in out_details:
+                _ = interpreter.get_tensor(od["index"])
+            t1 = time.perf_counter()
+            times[i] = (t1 - t0) * 1000.0
 
     p50 = float(np.percentile(times, 50))
     p95 = float(np.percentile(times, 95))
@@ -98,9 +124,9 @@ def main():
     print(f"Model: {model_name}")
     print(f"Input: shape={tuple(shape)}, dtype={np.dtype(dtype)}")
     print(f"Threads: {args.threads}")
+    print(f"Mode: {mode}")
     print(f"Latency: p50={p50:.3f} ms  p95={p95:.3f} ms  mean={mean:.3f} ms  (n={len(times)})")
 
 
 if __name__ == "__main__":
     main()
-
