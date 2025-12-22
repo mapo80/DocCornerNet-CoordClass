@@ -1,0 +1,29 @@
+[
+  {
+    "mean_iou": 0.9893380241605295,
+    "median_iou": 0.9905345041227984,
+    "corner_error_px": 0.6518256628314278,
+    "corner_error_p95_px": 1.6502214074134827,
+    "corner_error_max_px": 27.214523315429688,
+    "recall_50": 1.0,
+    "recall_75": 1.0,
+    "recall_90": 0.9996849401386263,
+    "recall_95": 0.998109640831758,
+    "cls_accuracy": 0.9997379454926625,
+    "cls_precision": 1.0,
+    "cls_recall": 0.9996849401386263,
+    "cls_f1": 0.9998424452497242,
+    "num_samples": 3816,
+    "num_with_doc": 3174,
+    "model": "exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_xy_int8io_xnnpackfull.tflite",
+    "img_size": 256,
+    "input_norm": "imagenet",
+    "tau": 1.0,
+    "tflite_threads": 4,
+    "tflite_input_dtype": "int8",
+    "latency_ms_p50": 4.33033299446106,
+    "latency_ms_p95": 7.8681082010269145,
+    "latency_ms_mean": 5.0425920486450195,
+    "latency_ms_n": 200
+  }
+]

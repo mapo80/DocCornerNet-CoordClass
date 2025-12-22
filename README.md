@@ -133,7 +133,56 @@ python export_tflite_int8.py \
     --output ./exported_tflite/doccornernet_v3_mnv2_256_best_dynamic.tflite
 ```
 
-#### WASM / XNNPACK full delegation (float16)
+#### Keras (.weights.h5 / checkpoint dir) → TFLite (float32 / float16 / int8 full / int8 dynamic)
+
+Notes:
+- Prefer exporting from `best_model.weights.h5` (or a checkpoint dir containing it). Loading `*.keras` may fail on some Keras 3 setups (legacy `Lambda`).
+- Always pass `--config .../config.json` when exporting from a checkpoint directory to avoid picking the wrong config.
+- Dataset path (`DATA_ROOT`) is required for **int8 full** PTQ calibration (and currently required by the script even for `dynamic`).
+
+Set your dataset root:
+
+```bash
+export DATA_ROOT=/Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-labeled
+```
+
+**float32** (coords9 output `[1,9]`):
+
+```bash
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_224_best --config ./checkpoints/mobilenetv2_224_best/config.json --output ./exported_tflite/doccornernet_v3_mnv2_224_best_float32.tflite
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_256_best --config ./checkpoints/mobilenetv2_256_best/config.json --output ./exported_tflite/doccornernet_v3_mnv2_256_best_float32.tflite
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_320      --config ./checkpoints/mobilenetv2_320/config.json      --output ./exported_tflite/doccornernet_v3_mnv2_320_float32.tflite
+python export_tflite.py --model_path ./checkpoints/mobilenetv3_224      --config ./checkpoints/mobilenetv3_224/config.json      --output ./exported_tflite/doccornernet_v3_mnv3_224_float32.tflite
+```
+
+**float16** (coords9 output `[1,9]`, smaller):
+
+```bash
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_224_best --config ./checkpoints/mobilenetv2_224_best/config.json --output ./exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite --float16
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_256_best --config ./checkpoints/mobilenetv2_256_best/config.json --output ./exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite --float16
+python export_tflite.py --model_path ./checkpoints/mobilenetv2_320      --config ./checkpoints/mobilenetv2_320/config.json      --output ./exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite      --float16
+python export_tflite.py --model_path ./checkpoints/mobilenetv3_224      --config ./checkpoints/mobilenetv3_224/config.json      --output ./exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite      --float16
+```
+
+**int8 full quant** (I/O int8, outputs packed SimCC logits + score logit; decode outside the model):
+
+```bash
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_224_best --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv2_224_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_256_best --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_320      --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv2_320_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite      --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv3_224      --data_root "$DATA_ROOT" --split val_cleaned --num_calib 500 --quantization int8 --io_dtype int8 --output_dtype int8 --output_format simcc_logits --simcc_packed_layout bins_first --axis_mean_impl dwconv_full --global_pool_impl dwconv_strided --output ./exported_tflite/doccornernet_v3_mnv3_224_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite      --threads 4
+```
+
+**int8 dynamic range** (weights-only; float32 I/O; coords9 output `[1,9]`):
+
+```bash
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_224_best --data_root "$DATA_ROOT" --split val_cleaned --quantization dynamic --output ./exported_tflite/doccornernet_v3_mnv2_224_best_dynamic.tflite --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_256_best --data_root "$DATA_ROOT" --split val_cleaned --quantization dynamic --output ./exported_tflite/doccornernet_v3_mnv2_256_best_dynamic.tflite --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv2_320      --data_root "$DATA_ROOT" --split val_cleaned --quantization dynamic --output ./exported_tflite/doccornernet_v3_mnv2_320_dynamic.tflite      --threads 4
+python export_tflite_int8.py --checkpoint ./checkpoints/mobilenetv3_224      --data_root "$DATA_ROOT" --split val_cleaned --quantization dynamic --output ./exported_tflite/doccornernet_v3_mnv3_224_dynamic.tflite      --threads 4
+```
+
+#### WASM / XNNPACK full delegation (verification)
 
 For the WebAssembly runtime (`document-scanner-wasm`), we want **100% of the TFLite graph delegated to XNNPACK** (i.e., the post-delegate execution plan contains only `DELEGATE` nodes). This required removing a few ops that XNNPACK does not delegate in practice (e.g. `STRIDED_SLICE`, `TILE`, `PACK`, `SUM`, `RESIZE_NEAREST_NEIGHBOR`).
 
@@ -188,7 +237,43 @@ cmake --build build-native --target xnnpack_delegate_report -j 8
   /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite \
   4
 
-# Expected: "Execution plan nodes: 1" and "Non-delegated builtin ops (plan):" empty.
+# Expected: "Non-delegated builtin ops (plan):" is empty.
+# (Execution plan nodes may be 1 or more; when fully delegated, all plan nodes are DELEGATE.)
+```
+
+You can use the same check for **any** model (float32/float16/int8/dynamic). Example (INT8 full):
+
+```bash
+./build-native/xnnpack_delegate_report \
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_224_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+  4
+```
+
+Batch-check multiple exports (fail-fast if any model is not fully delegated):
+
+```bash
+MODELS=(
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_224_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv2_320_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite
+  /Volumes/ZX20/ML-Models/DocCornerNet-CoordClass/exported_tflite/doccornernet_v3_mnv3_224_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite
+)
+
+for m in "${MODELS[@]}"; do
+  echo "==> $m"
+  out=$(./build-native/xnnpack_delegate_report "$m" 4)
+  if echo "$out" | grep -qE '^  '; then
+    echo "$out"
+    echo "NOT FULLY DELEGATED"
+    exit 1
+  fi
+done
+
+echo "OK: all models fully delegated to XNNPACK."
 ```
 
 Optional: update the WASM model files (used by the package) with the fully-delegated exports:
@@ -276,6 +361,82 @@ Latency/size are mostly architecture-dependent (weights and dataset don’t mate
 Notes:
 - Latency: `benchmark_tflite.py` p50, CPU (XNNPACK), batch size 1.
 - Size: `.tflite` float16 file size on disk.
+
+### TFLite Float16 Leaderboard (measured, full-delegate)
+
+All models below are **float16 exports** (float32 input) and **full-delegate** (post-delegate execution plan contains only `DELEGATE` nodes).
+
+Evaluation command (metrics + latency, `Invoke()` only):
+
+```bash
+python eval_tflite.py \
+  --tflite_models \
+    exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite \
+    exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite \
+    exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite \
+    exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite \
+  --data_root /Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-labeled \
+  --split val_cleaned \
+  --input_norm imagenet \
+  --threads 4 \
+  --benchmark_runs 200 \
+  --output exported_tflite/eval_float16_full_leaderboard_coords9.json
+```
+
+Leaderboard:
+
+| Model | Img | mean_iou | Corner err (mean / p95) | Recall@95 | Latency p50 / p95 (ms) | Size |
+|------|-----|----------|--------------------------|-----------|-------------------------|------|
+| `exported_tflite/doccornernet_v3_mnv2_224_best_float16_xnnpack_full_nearestmul.tflite` | 224 | 0.9894 | 0.57 / 1.44 px | 99.8% | 4.24 / 6.76 | 0.978 MB |
+| `exported_tflite/doccornernet_v3_mnv2_256_best_float16_xnnpack_full_nearestmul.tflite` | 256 | **0.9902** | 0.60 / 1.52 px | 100.0% | 8.18 / 16.53 | 0.978 MB |
+| `exported_tflite/doccornernet_v3_mnv2_320_float16_xnnpack_full_nearestmul.tflite` | 320 | 0.9855 | 1.13 / 2.57 px | 98.4% | 5.36 / 8.14 | 0.883 MB |
+| `exported_tflite/doccornernet_v3_mnv3_224_float16_xnnpack_full_nearestmul.tflite` | 224 | 0.9842 | 0.86 / 2.22 px | 98.0% | 3.96 / 7.06 | 1.471 MB |
+
+### TFLite INT8 Leaderboard (measured, SimCC logits decode outside)
+
+All models below are **INT8 full-delegate** (post-delegate execution plan contains only `DELEGATE` nodes).
+
+Evaluation command (metrics + latency, `Invoke()` only):
+
+```bash
+python eval_tflite_simcc.py \
+  --tflite_models \
+    exported_tflite/doccornernet_v3_mnv2_224_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+    exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+    exported_tflite/doccornernet_v3_mnv2_320_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+    exported_tflite/doccornernet_v3_mnv3_224_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite \
+  --data_root /Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-labeled \
+  --split val_cleaned \
+  --input_norm imagenet \
+  --tau 1.0 \
+  --threads 4 \
+  --benchmark_runs 200 \
+  --output exported_tflite/eval_int8_full_leaderboard_simcc_binsfirst.json
+```
+
+Leaderboard (higher `mean_iou` is better; lower latency is better):
+
+| Model | Img | mean_iou | Corner err (mean / p95) | Recall@95 | Latency p50 / p95 (ms) | Size |
+|------|-----|----------|--------------------------|-----------|-------------------------|------|
+| `exported_tflite/doccornernet_v3_mnv2_224_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite` | 224 | **0.9888** | **0.59 / 1.52 px** | **99.9%** | **2.53 / 4.50** | 0.824 MB |
+| `exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite` | 256 | **0.9893** | 0.65 / 1.64 px | 99.8% | 2.92 / 5.20 | 0.839 MB |
+| `exported_tflite/doccornernet_v3_mnv2_320_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite` | 320 | 0.9844 | 1.21 / 2.67 px | 98.2% | 3.32 / 4.43 | 0.771 MB |
+| `exported_tflite/doccornernet_v3_mnv3_224_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite` | 224 | 0.3519 | 50.43 / 129.92 px | 0.0% | 3.15 / 4.50 | 1.035 MB |
+
+**Winner (overall): `mnv2_224_best` INT8**
+- Best speed/accuracy tradeoff: fastest p50 (2.53ms) with `mean_iou=0.9888` (very close to the 256px model).
+- If you want the top `mean_iou`, pick `mnv2_256_best` (slower due to 256px input).
+
+### Float16 vs INT8 (per-model)
+
+On MobileNetV2 models, **INT8 full-delegate is ~1.6–2.8× faster** with a very small `mean_iou` drop (≈0.0006–0.0011 absolute). On MobileNetV3, this PTQ INT8 export is **not usable** (accuracy collapses).
+
+| Model | Float16 mean_iou | INT8 mean_iou | Δ mean_iou | Float16 p50 (ms) | INT8 p50 (ms) | Speedup |
+|------|------------------:|--------------:|-----------:|-----------------:|--------------:|--------:|
+| `mnv2_224_best` | 0.9894 | 0.9888 | -0.0006 | 4.24 | 2.53 | 1.67× |
+| `mnv2_256_best` | 0.9902 | 0.9893 | -0.0009 | 8.18 | 2.92 | 2.80× |
+| `mnv2_320` | 0.9855 | 0.9844 | -0.0011 | 5.36 | 3.32 | 1.61× |
+| `mnv3_224` | 0.9842 | 0.3519 | -0.6324 | 3.96 | 3.15 | 1.26× |
 
 ### Key Insights
 

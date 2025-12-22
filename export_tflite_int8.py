@@ -370,6 +370,14 @@ def main():
     )
     print(f"  simcc_packed_layout={args.simcc_packed_layout}")
 
+    # MobileNetV3 INT8: TFLite lowers hard-swish to HARD_SWISH, which XNNPACK does not
+    # delegate in quantized graphs. Use a numerically-equivalent implementation that
+    # avoids lowering to the HARD_SWISH builtin op.
+    backbone_key = str(backbone).lower().strip().replace("-", "_")
+    backbone_nonfused_hardswish = backbone_key.startswith("mobilenetv3") and str(args.quantization).lower() == "int8"
+    if backbone_nonfused_hardswish:
+        print("  backbone_nonfused_hardswish=True (XNNPACK int8 full-delegate workaround)")
+
     # Build + load model (avoid downloading backbone weights).
     # NOTE: we load weights into the "standard" model first for compatibility with checkpoints,
     # then copy them into an XNNPACK-friendly variant that avoids EXPAND_DIMS patterns from Conv1D.
@@ -393,6 +401,7 @@ def main():
         alpha=alpha,
         backbone_minimalistic=backbone_minimalistic,
         backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_nonfused_hardswish=backbone_nonfused_hardswish,
         backbone_weights=None,
         fpn_ch=fpn_ch,
         simcc_ch=simcc_ch,

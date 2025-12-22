@@ -686,10 +686,37 @@ def _build_backbone(
     backbone_weights,
     backbone_minimalistic: bool,
     backbone_include_preprocessing: bool,
+    backbone_nonfused_hardswish: bool = False,
 ) -> keras.Model:
     backbone_key = backbone.strip().lower().replace("-", "_")
 
     if backbone_key in {"mobilenetv3_small", "mobilenet_v3_small", "mnetv3_small"}:
+        if bool(backbone_nonfused_hardswish):
+            # Workaround for XNNPACK: quantized TFLite HARD_SWISH is not delegated.
+            # Build MobileNetV3 with an equivalent hard-swish implementation that
+            # avoids lowering to the HARD_SWISH builtin op.
+            import keras.src.applications.mobilenet_v3 as _mv3
+
+            orig_hard_swish = _mv3.hard_swish
+
+            def _hard_swish_no_fuse(x):
+                # hard-swish: x * relu6(x + 3) / 6
+                # Use a slightly inexact scale to prevent fusing to TFLite HARD_SWISH.
+                return x * _mv3.layers.ReLU(6.0)(x + 3.0) * 0.1666667
+
+            _mv3.hard_swish = _hard_swish_no_fuse
+            try:
+                return keras.applications.MobileNetV3Small(
+                    input_tensor=inp,
+                    include_top=False,
+                    weights=backbone_weights,
+                    alpha=alpha,
+                    minimalistic=backbone_minimalistic,
+                    include_preprocessing=backbone_include_preprocessing,
+                )
+            finally:
+                _mv3.hard_swish = orig_hard_swish
+
         return keras.applications.MobileNetV3Small(
             input_tensor=inp,
             include_top=False,
@@ -700,6 +727,27 @@ def _build_backbone(
         )
 
     if backbone_key in {"mobilenetv3_large", "mobilenet_v3_large", "mnetv3_large"}:
+        if bool(backbone_nonfused_hardswish):
+            import keras.src.applications.mobilenet_v3 as _mv3
+
+            orig_hard_swish = _mv3.hard_swish
+
+            def _hard_swish_no_fuse(x):
+                return x * _mv3.layers.ReLU(6.0)(x + 3.0) * 0.1666667
+
+            _mv3.hard_swish = _hard_swish_no_fuse
+            try:
+                return keras.applications.MobileNetV3Large(
+                    input_tensor=inp,
+                    include_top=False,
+                    weights=backbone_weights,
+                    alpha=alpha,
+                    minimalistic=backbone_minimalistic,
+                    include_preprocessing=backbone_include_preprocessing,
+                )
+            finally:
+                _mv3.hard_swish = orig_hard_swish
+
         return keras.applications.MobileNetV3Large(
             input_tensor=inp,
             include_top=False,
@@ -752,6 +800,7 @@ def build_doccorner_simcc_v3(
     backbone: str = "mobilenetv3_small",
     backbone_minimalistic: bool = False,
     backbone_include_preprocessing: bool = False,
+    backbone_nonfused_hardswish: bool = False,
     conv1d_as_conv2d: bool = False,
     axis_mean_impl: str = "mean",
     global_pool_impl: str = "mean",
@@ -801,6 +850,7 @@ def build_doccorner_simcc_v3(
         backbone_weights=backbone_weights,
         backbone_minimalistic=backbone_minimalistic,
         backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_nonfused_hardswish=backbone_nonfused_hardswish,
     )
 
     c2, c3, c4, c5 = _get_feature_layers(backbone_model, img_size=img_size)
@@ -957,6 +1007,7 @@ def create_model(
     backbone: str = "mobilenetv3_small",
     backbone_minimalistic: bool = False,
     backbone_include_preprocessing: bool = False,
+    backbone_nonfused_hardswish: bool = False,
     conv1d_as_conv2d: bool = False,
     axis_mean_impl: str = "mean",
     global_pool_impl: str = "mean",
@@ -996,6 +1047,7 @@ def create_model(
         backbone=backbone,
         backbone_minimalistic=backbone_minimalistic,
         backbone_include_preprocessing=backbone_include_preprocessing,
+        backbone_nonfused_hardswish=backbone_nonfused_hardswish,
         conv1d_as_conv2d=conv1d_as_conv2d,
         axis_mean_impl=axis_mean_impl,
         global_pool_impl=global_pool_impl,

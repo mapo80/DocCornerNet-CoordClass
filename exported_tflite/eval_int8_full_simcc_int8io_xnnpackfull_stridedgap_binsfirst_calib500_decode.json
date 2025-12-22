@@ -1,0 +1,29 @@
+[
+  {
+    "mean_iou": 0.9893666451305745,
+    "median_iou": 0.9904893413965243,
+    "corner_error_px": 0.648167745041806,
+    "corner_error_p95_px": 1.6407144665718079,
+    "corner_error_max_px": 17.604211807250977,
+    "recall_50": 1.0,
+    "recall_75": 1.0,
+    "recall_90": 0.9996849401386263,
+    "recall_95": 0.9984247006931317,
+    "cls_accuracy": 1.0,
+    "cls_precision": 1.0,
+    "cls_recall": 1.0,
+    "cls_f1": 1.0,
+    "num_samples": 3816,
+    "num_with_doc": 3174,
+    "model": "exported_tflite/doccornernet_v3_mnv2_256_best_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst_calib500.tflite",
+    "img_size": 256,
+    "input_norm": "imagenet",
+    "tau": 1.0,
+    "tflite_threads": 4,
+    "tflite_input_dtype": "int8",
+    "latency_ms_p50": 2.702812433242798,
+    "latency_ms_p95": 4.971462368965148,
+    "latency_ms_mean": 3.0716333389282227,
+    "latency_ms_n": 200
+  }
+]
