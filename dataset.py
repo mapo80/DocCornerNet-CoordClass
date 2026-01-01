@@ -53,9 +53,28 @@ DEFAULT_AUG_CONFIG = {
 
 
 def load_split_file(split_path: str) -> List[str]:
-    """Load image names from split file."""
+    """
+    Load image names from split file.
+
+    Supports both formats:
+    - Simple filenames: "document_001.jpg", "negative_001.jpg"
+    - Relative paths: "images/document_001.jpg", "images-negative/negative_001.jpg"
+
+    Returns normalized filenames (without directory prefixes).
+    """
+    result = []
     with open(split_path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
+        for line in f:
+            name = line.strip()
+            if not name:
+                continue
+            # Remove directory prefixes if present
+            if name.startswith("images-negative/"):
+                name = name[len("images-negative/"):]
+            elif name.startswith("images/"):
+                name = name[len("images/"):]
+            result.append(name)
+    return result
 
 
 def load_yolo_label(label_path: str) -> Tuple[np.ndarray, bool]:

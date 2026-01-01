@@ -1,0 +1,31 @@
+[
+  {
+    "mean_iou": 0.9616174085369408,
+    "median_iou": 0.9776548491102801,
+    "corner_error_px": 2.5144420888777486,
+    "corner_error_p95_px": 6.370376920700072,
+    "corner_error_min_px": 0.004139408934861422,
+    "corner_error_max_px": 232.743896484375,
+    "recall_50": 0.9970879694019471,
+    "recall_75": 0.9864829624478443,
+    "recall_90": 0.9384561891515995,
+    "recall_95": 0.8095445062586927,
+    "recall_99": 0.12708623087621695,
+    "cls_accuracy": 0.9986601332210397,
+    "cls_precision": 0.9998259431704452,
+    "cls_recall": 0.9986526425591099,
+    "cls_f1": 0.9992389484441933,
+    "num_samples": 26122,
+    "num_with_doc": 23008,
+    "model": "./exported_tflite/doccornernet_v3_mnv2_256_final_pruned_int8_full_simcc_int8io_xnnpackfull_stridedgap_binsfirst.tflite",
+    "img_size": 256,
+    "input_norm": "imagenet",
+    "tau": 1.0,
+    "tflite_threads": 4,
+    "tflite_input_dtype": "int8",
+    "latency_ms_p50": 2.133604049682617,
+    "latency_ms_p95": 10.360860824584956,
+    "latency_ms_mean": 3.646836757659912,
+    "latency_ms_n": 200
+  }
+]

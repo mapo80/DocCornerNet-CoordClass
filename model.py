@@ -240,8 +240,10 @@ class Broadcast1D(layers.Layer):
         if self._channels is None or self._ones is None:
             raise RuntimeError("Broadcast1D is not built.")
         x = tf.reshape(inputs, [-1, 1, self._channels])
+        # Cast ones to input dtype for mixed precision compatibility
+        ones = tf.cast(self._ones, inputs.dtype)
         # Broadcast along the length dimension without TILE.
-        return x * self._ones
+        return x * ones
 
     def get_config(self):
         config = super().get_config()
@@ -577,14 +579,18 @@ class NearestUpsample2x(layers.Layer):
         if self._h is None or self._w is None or self._c is None or self._ones_w is None or self._ones_h is None:
             raise RuntimeError("NearestUpsample2x is not built.")
 
+        # Cast ones to input dtype for mixed precision compatibility
+        ones_w = tf.cast(self._ones_w, inputs.dtype)
+        ones_h = tf.cast(self._ones_h, inputs.dtype)
+
         # Repeat along width: [B,H,W,C] -> [B,H,W,2,C] -> [B,H,2W,C]
         x = tf.reshape(inputs, [-1, self._h, self._w, 1, self._c])
-        x = x * self._ones_w
+        x = x * ones_w
         x = tf.reshape(x, [-1, self._h, self._w * 2, self._c])
 
         # Repeat along height: [B,H,2W,C] -> [B,H,2,2W,C] -> [B,2H,2W,C]
         x = tf.reshape(x, [-1, self._h, 1, self._w * 2, self._c])
-        x = x * self._ones_h
+        x = x * ones_h
         return tf.reshape(x, [-1, self._h * 2, self._w * 2, self._c])
 
     def get_config(self):

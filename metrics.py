@@ -215,11 +215,13 @@ class ValidationMetrics:
             "median_iou": 0.0,
             "corner_error_px": 0.0,
             "corner_error_p95_px": 0.0,
+            "corner_error_min_px": 0.0,
             "corner_error_max_px": 0.0,
             "recall_50": 0.0,
             "recall_75": 0.0,
             "recall_90": 0.0,
             "recall_95": 0.0,
+            "recall_99": 0.0,
             "cls_accuracy": 0.0,
             "cls_precision": 0.0,
             "cls_recall": 0.0,
@@ -279,12 +281,14 @@ class ValidationMetrics:
         results["median_iou"] = float(np.median(ious))
         results["corner_error_px"] = float(np.mean(mean_corner_errors))
         results["corner_error_p95_px"] = float(np.percentile(all_corner_errors, 95))
+        results["corner_error_min_px"] = float(np.min(all_corner_errors))
         results["corner_error_max_px"] = float(np.max(all_corner_errors))
 
         results["recall_50"] = float((ious >= 0.50).sum() / num_with_doc)
         results["recall_75"] = float((ious >= 0.75).sum() / num_with_doc)
         results["recall_90"] = float((ious >= 0.90).sum() / num_with_doc)
         results["recall_95"] = float((ious >= 0.95).sum() / num_with_doc)
+        results["recall_99"] = float((ious >= 0.99).sum() / num_with_doc)
 
         return results
 
@@ -328,6 +332,7 @@ if __name__ == "__main__":
     print(f"  Corner Error (p95): {results['corner_error_p95_px']:.2f}px")
     print(f"  Recall@90: {results['recall_90']*100:.1f}%")
     print(f"  Recall@95: {results['recall_95']*100:.1f}%")
+    print(f"  Recall@99: {results['recall_99']*100:.1f}%")
     print(f"  Classification Accuracy: {results['cls_accuracy']*100:.1f}%")
 
     print("\nMetrics test passed!")

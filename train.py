@@ -970,7 +970,9 @@ def main():
               f"coord={val_metrics['loss_coord']:.4f} "
               f"score={val_metrics['loss_score']:.4f})")
         print(f"           err_mean={val_metrics['corner_error_px']:.1f}px  "
-              f"err_p95={val_metrics['corner_error_p95_px']:.1f}px")
+              f"err_p95={val_metrics['corner_error_p95_px']:.1f}px  "
+              f"err_min={val_metrics['corner_error_min_px']:.1f}px  "
+              f"err_max={val_metrics['corner_error_max_px']:.1f}px")
         print(f"           IoU={val_metrics['mean_iou']:.4f}  "
               f"R@90={val_metrics['recall_90']*100:.1f}%  "
               f"R@95={val_metrics['recall_95']*100:.1f}%")

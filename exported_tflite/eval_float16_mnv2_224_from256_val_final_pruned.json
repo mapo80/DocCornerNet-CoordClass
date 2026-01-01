@@ -1,0 +1,30 @@
+[
+  {
+    "mean_iou": 0.9642990087963114,
+    "median_iou": 0.97736966582175,
+    "corner_error_px": 2.0289138653257317,
+    "corner_error_p95_px": 5.0359446525573714,
+    "corner_error_min_px": 0.0038139952812343836,
+    "corner_error_max_px": 194.95285034179688,
+    "recall_50": 0.9983049374130737,
+    "recall_75": 0.9914377607788595,
+    "recall_90": 0.9494089012517385,
+    "recall_95": 0.8216272600834492,
+    "recall_99": 0.1263038942976356,
+    "cls_accuracy": 0.9984304417732179,
+    "cls_precision": 0.9994780566308555,
+    "cls_recall": 0.9987395688456189,
+    "cls_f1": 0.9991086762755711,
+    "num_samples": 26122,
+    "num_with_doc": 23008,
+    "model": "./exported_tflite/doccornernet_v3_mnv2_224_from256_float16_xnnpack_full_nearestmul.tflite",
+    "img_size": 224,
+    "input_norm": "imagenet",
+    "tflite_threads": 4,
+    "tflite_input_dtype": "float32",
+    "latency_ms_p50": 2.68554151058197,
+    "latency_ms_p95": 7.34585645198822,
+    "latency_ms_mean": 3.8498342037200928,
+    "latency_ms_n": 200
+  }
+]

@@ -7,6 +7,14 @@
 !checkpoints/final_model_inference.keras
 !checkpoints/config.json
 !checkpoints/history.json
+
+# Large local artifacts (regenerable)
+evaluation_results/
+full_dataset_analysis/
+
+# Proprietary/local integrations (do not commit)
+*scanbot*
+*Scanbot*
 qat_output/
 exported/
 *.onnx

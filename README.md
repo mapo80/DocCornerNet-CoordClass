@@ -14,7 +14,7 @@ A lightweight neural network for document corner detection using **Marginal Coor
 ```bash
 git clone https://github.com/mapo80/DocCornerNet-CoordClass.git
 cd DocCornerNet-CoordClass
-pip install -r requirements.txt
+pip install tensorflow[and-cuda] tqdm pillow numpy opencv-python shapely
 ```
 
 ### 2. Download Dataset
@@ -544,6 +544,26 @@ python train.py \
   --outlier_list ./data/outliers.txt --outlier_weight 3.0 \
   --output_dir ./checkpoints --experiment_name v3_teacher_256_ft
 
+cd /root && nohup python train.py \
+  --data_root /workspace/doc-scanner-dataset \
+  --train_split train \
+  --val_split val \
+  --backbone mobilenetv2 \
+  --alpha 0.35 \
+  --img_size 256 \
+  --num_bins 256 \
+  --fpn_ch 32 \
+  --simcc_ch 96 \
+  --batch_size 512 \
+  --epochs 200 \
+  --lr 0.0015 \
+  --augment \
+  --cache_images \
+  --fast_mode \
+  --output_dir /workspace/checkpoints \
+  --experiment_name mobilenetv2_256 \
+  > /workspace/training_256.log 2>&1 &
+
 # 2) Student @256 (MobileNetV2 small, warm-start from the 224 MNv2 small)
 python train_student.py \
   --teacher_weights ./checkpoints/v3_teacher_256_ft_*/best_model.weights.h5 \
@@ -579,6 +599,417 @@ python train_student.py \
   --outlier_list ./data/outliers_mined_256_iou98.txt --outlier_weight 5.0 \
   --output_dir ./checkpoints_student --experiment_name student_mnv2_256_ft_mined
 ```
+
+---
+
+## Self-Training Pipeline (Dataset Refinement)
+
+Questa sezione descrive il workflow iterativo di **Self-Training** per migliorare la qualità del dataset attraverso predizioni del modello. L'obiettivo è:
+
+1. Addestrare su dati "puliti" (IoU ≥ 0.99)
+2. Usare il modello per ri-valutare il resto del dataset
+3. Espandere il training set con nuove immagini verificate
+4. Iterare fino a convergenza
+
+### Fase 0: Valutazione Completa del Dataset ✅ DONE
+
+> **Completata**: `full_evaluation.csv` generato con 111,431 immagini (88,143 train + 23,288 val)
+> - IoU ≥ 0.99: 16,702 (15%)
+> - IoU ≥ 0.98: 52,996 (48%)
+> - IoU ≥ 0.97: 76,209 (68%)
+> - IoU ≥ 0.95: 95,568 (86%)
+
+Prima di iniziare, genera un CSV con le metriche di tutte le immagini:
+
+```bash
+# Su RunPod (GPU)
+python generate_full_eval_csv.py \
+  --checkpoint /workspace/checkpoints/mobilenetv2_256_YYYYMMDD_HHMMSS \
+  --data_root /workspace/doc-scanner-dataset \
+  --output /workspace/full_evaluation.csv \
+  --splits train,val \
+  --batch_size 256
+
+# Scarica localmente
+scp -i ~/.ssh/id_ed25519 -P <PORT> root@<HOST>:/workspace/full_evaluation.csv ./evaluation_results/
+```
+
+**Output**: `full_evaluation.csv` con colonne `split, filename, iou, err_mean, err_max, score`
+
+Analizza la distribuzione:
+```bash
+# Distribuzione IoU
+awk -F',' 'NR>1 {
+  if($3>=0.99) c99++;
+  else if($3>=0.98) c98++;
+  else if($3>=0.97) c97++;
+  else if($3>=0.95) c95++;
+  else clow++;
+} END {
+  print "IoU >= 0.99:", c99;
+  print "0.98-0.99:", c98;
+  print "0.97-0.98:", c97;
+  print "0.95-0.97:", c95;
+  print "< 0.95:", clow;
+}' full_evaluation.csv
+```
+
+### Fase 1: Creazione Split Puliti (IoU ≥ 0.99) ✅ DONE
+
+> **Completata**: Split puliti creati in `/Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-rev-new/`
+> - `train_clean.txt`: 13,414 positive + 1,794 negative = **15,208 totali**
+> - `val_clean.txt`: 3,288 positive + 439 negative = **3,727 totali**
+
+Estrai le immagini con IoU ≥ 0.99 e aggiungi negative proporzionate:
+
+```bash
+# Script per creare train_clean.txt e val_clean.txt
+python create_clean_splits.py \
+  --csv ./evaluation_results/full_evaluation.csv \
+  --data_root /path/to/dataset \
+  --iou_threshold 0.99 \
+  --output_dir /path/to/dataset
+```
+
+**Oppure manualmente**:
+
+```python
+import csv
+from pathlib import Path
+import random
+
+# Leggi CSV
+with open('full_evaluation.csv') as f:
+    reader = csv.DictReader(f)
+    entries = list(reader)
+
+# Filtra IoU >= 0.99
+train_pos = [e['filename'] for e in entries if e['split'] == 'train' and float(e['iou']) >= 0.99]
+val_pos = [e['filename'] for e in entries if e['split'] == 'val' and float(e['iou']) >= 0.99]
+
+# Leggi negative originali
+data_root = Path('/path/to/dataset')
+with open(data_root / 'train.txt') as f:
+    train_neg = [l.strip() for l in f if l.strip().startswith('negative_')]
+with open(data_root / 'val.txt') as f:
+    val_neg = [l.strip() for l in f if l.strip().startswith('negative_')]
+
+# Calcola proporzione (ratio negatives/positives originale)
+# Esempio: se originale era 13% negative, mantieni lo stesso ratio
+neg_ratio = 0.13  # Adatta al tuo dataset
+
+train_neg_sample = random.sample(train_neg, min(len(train_neg), int(len(train_pos) * neg_ratio)))
+val_neg_sample = random.sample(val_neg, min(len(val_neg), int(len(val_pos) * neg_ratio)))
+
+# Scrivi split puliti
+with open(data_root / 'train_clean.txt', 'w') as f:
+    for name in train_pos + train_neg_sample:
+        f.write(name + '\n')
+
+with open(data_root / 'val_clean.txt', 'w') as f:
+    for name in val_pos + val_neg_sample:
+        f.write(name + '\n')
+
+print(f"train_clean: {len(train_pos)} pos + {len(train_neg_sample)} neg = {len(train_pos) + len(train_neg_sample)}")
+print(f"val_clean: {len(val_pos)} pos + {len(val_neg_sample)} neg = {len(val_pos) + len(val_neg_sample)}")
+```
+
+**Risultato atteso** (esempio con IoU ≥ 0.99):
+- `train_clean.txt`: ~13,400 positive + ~1,800 negative = ~15,200 totali
+- `val_clean.txt`: ~3,300 positive + ~440 negative = ~3,740 totali
+
+### Fase 2: Training su Split Puliti
+
+Addestra il modello sui dati puliti:
+
+```bash
+# Su RunPod
+cd /root && nohup python train_optimized.py \
+  --data_root /workspace/doc-scanner-dataset \
+  --train_split train_clean \
+  --val_split val_clean \
+  --backbone mobilenetv2 \
+  --alpha 0.35 \
+  --img_size 256 \
+  --num_bins 256 \
+  --fpn_ch 32 \
+  --simcc_ch 96 \
+  --batch_size 512 \
+  --epochs 200 \
+  --lr 0.0015 \
+  --augment \
+  --cache_images \
+  --fast_mode \
+  --output_dir /workspace/checkpoints \
+  --experiment_name mobilenetv2_256_clean_iter1 \
+  > /workspace/training_clean_iter1.log 2>&1 &
+
+# Monitor
+tail -f /workspace/training_clean_iter1.log
+```
+
+**Nota**: Essendo il dataset più piccolo (~15k vs ~88k), considera:
+- Aumentare le epochs (150-200)
+- Ridurre learning rate dopo 100 epochs
+- Usare data augmentation aggressiva
+
+### Fase 3: Valutazione del Nuovo Modello
+
+Dopo il training, valuta il nuovo modello su **tutto** il dataset:
+
+```bash
+python generate_full_eval_csv.py \
+  --checkpoint /workspace/checkpoints/mobilenetv2_256_clean_iter1 \
+  --data_root /workspace/doc-scanner-dataset \
+  --output /workspace/full_evaluation_iter1.csv \
+  --splits train,val \
+  --batch_size 256
+```
+
+### Fase 4: Identificazione Candidati per Espansione
+
+Analizza le immagini che erano sotto-soglia ma ora sono predette bene:
+
+```bash
+# Script per trovare candidati
+python find_expansion_candidates.py \
+  --csv_old ./evaluation_results/full_evaluation.csv \
+  --csv_new ./evaluation_results/full_evaluation_iter1.csv \
+  --iou_old_max 0.99 \
+  --iou_new_min 0.98 \
+  --output ./candidates_iter1.txt
+```
+
+**Logica**:
+```python
+# Pseudocodice
+for image in dataset:
+    old_iou = csv_old[image]['iou']  # IoU con modello precedente
+    new_iou = csv_new[image]['iou']  # IoU con nuovo modello
+
+    if old_iou < 0.99 and new_iou >= 0.98:
+        # Candidato: era "cattivo", ora il modello lo predice bene
+        # Probabilmente il GT originale era impreciso
+        candidates.append(image)
+```
+
+**Categorie di risultato**:
+
+| old_iou | new_iou | Interpretazione | Azione |
+|---------|---------|-----------------|--------|
+| ≥ 0.99 | ≥ 0.99 | Già pulita, confermata | Mantieni nel clean set |
+| < 0.99 | ≥ 0.99 | GT era impreciso, modello migliore | **Aggiungi al clean set** |
+| < 0.99 | 0.98-0.99 | Probabile GT impreciso | Verifica manualmente o aggiungi |
+| < 0.99 | < 0.95 | Outlier reale o GT molto sbagliato | **Review manuale** |
+| ≥ 0.99 | < 0.95 | Regressione (raro) | Investiga |
+
+### Fase 5: Espansione del Training Set
+
+Aggiungi i candidati verificati al training set:
+
+```bash
+# Opzione A: Automatica (fidarsi del modello)
+cat train_clean.txt candidates_iter1_train.txt > train_clean_iter2.txt
+
+# Opzione B: Review manuale con web_review_worst.py
+python web_review_worst.py \
+  --worst_cases ./candidates_iter1.txt \
+  --images_tar /path/to/images.tar \
+  --dataset_path /path/to/dataset \
+  --port 7860
+```
+
+### Fase 6: Iterazione
+
+Ripeti le fasi 2-5 fino a quando:
+- Il numero di nuovi candidati è trascurabile
+- Le metriche sul val set convergono
+- Hai raggiunto la qualità desiderata
+
+**Schema iterativo**:
+
+```
+Iterazione 0 (baseline):
+  └── Train su dataset completo → full_evaluation.csv
+
+Iterazione 1:
+  ├── Filtra IoU ≥ 0.99 → train_clean.txt (~15k)
+  ├── Train su train_clean → model_clean_iter1
+  ├── Eval completa → full_evaluation_iter1.csv
+  └── Trova candidati (old < 0.99, new ≥ 0.98)
+
+Iterazione 2:
+  ├── Espandi train_clean con candidati → train_clean_iter2.txt (~25k?)
+  ├── Train su train_clean_iter2 → model_clean_iter2
+  ├── Eval completa → full_evaluation_iter2.csv
+  └── Trova nuovi candidati
+
+Iterazione 3+:
+  └── Continua fino a convergenza
+```
+
+### Fase 7: Training Finale
+
+Una volta stabilizzato il dataset pulito, fai un training finale con tutti i parametri ottimizzati:
+
+```bash
+python train_optimized.py \
+  --data_root /workspace/doc-scanner-dataset \
+  --train_split train_clean_final \
+  --val_split val_clean_final \
+  --backbone mobilenetv2 \
+  --alpha 0.35 \
+  --img_size 256 \
+  --num_bins 256 \
+  --fpn_ch 32 \
+  --simcc_ch 96 \
+  --batch_size 512 \
+  --epochs 200 \
+  --lr 0.001 \
+  --augment \
+  --cache_images \
+  --fast_mode \
+  --output_dir /workspace/checkpoints \
+  --experiment_name mobilenetv2_256_clean_final
+```
+
+### Script di Supporto
+
+#### `generate_full_eval_csv.py`
+Genera CSV completo con metriche per ogni immagine.
+
+#### `create_clean_splits.py` (da creare)
+```python
+"""
+Crea train_clean.txt e val_clean.txt da full_evaluation.csv
+con threshold IoU e sampling proporzionale delle negative.
+"""
+```
+
+#### `find_expansion_candidates.py` (da creare)
+```python
+"""
+Confronta due CSV di valutazione e trova immagini
+che sono migliorate con il nuovo modello.
+"""
+```
+
+#### `web_review_worst.py`
+Review interattiva delle immagini problematiche.
+
+### Metriche di Progresso
+
+Tieni traccia di queste metriche ad ogni iterazione:
+
+| Iterazione | Train size | Val mIoU | % IoU≥0.99 | % IoU≥0.98 | Candidati aggiunti |
+|------------|------------|----------|------------|------------|-------------------|
+| 0 (baseline) | 88,000 | 0.XXX | 15% | 48% | - |
+| 1 | 15,200 | 0.XXX | - | - | - |
+| 2 | ~25,000 | 0.XXX | - | - | +10,000 |
+| 3 | ~35,000 | 0.XXX | - | - | +10,000 |
+| ... | ... | ... | ... | ... | ... |
+| Final | ~80,000 | 0.XXX | 95%+ | 99%+ | - |
+
+### Note Importanti
+
+1. **Validazione**: Usa sempre un val set fisso per confrontare le iterazioni
+2. **Overfitting**: Con dataset piccoli, monitora attentamente il gap train/val
+3. **Negative sampling**: Mantieni sempre una proporzione ragionevole di negative
+4. **Backup**: Salva i checkpoint e CSV di ogni iterazione
+5. **Review manuale**: Per i casi borderline (0.95-0.98), preferisci la review manuale
+
+### Vantaggi del Self-Training
+
+- **Pulizia automatica**: Il modello "scopre" i GT imprecisi
+- **Scalabilità**: Funziona anche con dataset molto grandi
+- **Iterativo**: Ogni iterazione migliora la qualità complessiva
+- **Curriculum learning**: Il modello impara prima i casi facili, poi quelli difficili
+
+### Rischi e Mitigazioni
+
+| Rischio | Mitigazione |
+|---------|-------------|
+| Confirmation bias | Usa sempre val set separato e fisso |
+| Drift del modello | Confronta con baseline ad ogni iterazione |
+| Perdita di diversità | Non rimuovere mai immagini, solo ri-etichettale |
+| Propagazione errori | Review manuale per candidati con IoU < 0.95 |
+
+---
+
+## Evaluate Worst Cases
+
+Analyze the worst predictions (lowest IoU) on train and val sets, creating visual collages with GT (green) and prediction (red) bounding boxes.
+
+### Quick Start
+
+```bash
+python evaluate_worst_cases.py \
+  --checkpoint ./checkpoints/mobilenetv2_256_best \
+  --data_root ./data \
+  --output_dir ./analysis \
+  --n_worst 50 \
+  --splits train,val \
+  --batch_size 512
+```
+
+### Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--checkpoint` | Checkpoint directory (must contain `config.json` and `best_model.weights.h5`) | required |
+| `--data_root` | Dataset root directory | `/workspace/doc-scanner-dataset` |
+| `--output_dir` | Output directory for results | `/workspace` |
+| `--n_worst` | Number of worst cases in collage | 20 |
+| `--splits` | Comma-separated splits to evaluate | `train,val` |
+| `--batch_size` | Batch size for inference | 64 |
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `worst_cases_collage.png` | Visual collage of N worst cases with GT (green) and prediction (red) |
+| `evaluation_results.txt` | Full results sorted by IoU (worst first) with split, filename, IoU, error, score |
+| `worst_cases.txt` | Top N×5 worst cases only |
+
+### Example Output (collage)
+
+Each tile shows:
+- Original image
+- Ground truth bbox (green)
+- Predicted bbox (red)
+- IoU value, pixel error, split indicator
+- Filename
+
+### RunPod Usage
+
+```bash
+# Transfer script
+scp -i ~/.ssh/id_ed25519 -P <PORT> evaluate_worst_cases.py model.py root@<HOST>:/root/
+
+# Run with nohup (background)
+cd /root && nohup python evaluate_worst_cases.py \
+  --checkpoint /workspace/checkpoints/mobilenetv2_256_20251229_125645 \
+  --data_root /workspace/doc-scanner-dataset \
+  --output_dir /workspace \
+  --n_worst 50 \
+  --splits train,val \
+  --batch_size 512 \
+  > /workspace/evaluate.log 2>&1 &
+
+# Monitor progress
+tail -f /workspace/evaluate.log
+
+# Download results
+scp -i ~/.ssh/id_ed25519 -P <PORT> root@<HOST>:/workspace/worst_cases_collage.png ./
+scp -i ~/.ssh/id_ed25519 -P <PORT> root@<HOST>:/workspace/evaluation_results.txt ./
+```
+
+### Performance
+
+With multithreading (16 workers) and batching:
+- **~88k train images**: ~3-4 min
+- **~23k val images**: ~1 min
+- **Total**: ~5-7 min (vs ~3.5 hours without optimization)
 
 ---
 
