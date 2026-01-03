@@ -18,6 +18,9 @@ For the latest cross‑dataset comparison (rev‑last vs rev‑new vs `val_clean
 - Best on rev‑last val: `mobilenetv2_256_revlast`
 - Best on `val_clean_iter4_mix`: `mobilenetv2_256_clean_iter3`
 
+**Training data (best generalist)**
+- Dataset: `doc-scanner-dataset-rev-new` (`train_clean_iter3_plus_hard_full` / `val_clean_iter3`)
+
 **TFLite artifacts**
 - Benchmarks + delegate report: `checkpoints/tflite_top4/` (note: `*.tflite` binaries are git‑ignored; regenerate via export scripts)
 - XNNPACK full‑delegate report: `checkpoints/tflite_top4/xnnpack_delegate_report.txt`
