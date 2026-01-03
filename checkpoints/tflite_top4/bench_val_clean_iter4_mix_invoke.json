@@ -1,0 +1,100 @@
+{
+  "data_root": "/Volumes/ZX20/ML-Models/DocScannerDetection/datasets/official/doc-scanner-dataset-rev-new",
+  "split": "val_clean_iter4_mix",
+  "input_norm": "imagenet",
+  "mode": "invoke",
+  "threads": 4,
+  "batch_size": 32,
+  "num_samples": 2000,
+  "warmup_runs": 25,
+  "results": [
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_float16.tflite",
+      "img_size": 224,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 3.572239637374878,
+      "latency_ms_p50": 2.5494790077209473,
+      "latency_ms_p95": 7.438127803802488,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_int8_full_simcc_int8io.tflite",
+      "img_size": 224,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 2.559644937515259,
+      "latency_ms_p50": 1.8771875500679016,
+      "latency_ms_p95": 5.074394154548645,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_float16.tflite",
+      "img_size": 224,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 3.6415584087371826,
+      "latency_ms_p50": 2.6590830087661743,
+      "latency_ms_p95": 7.146170878410339,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_int8_full_simcc_int8io.tflite",
+      "img_size": 224,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 2.7974095344543457,
+      "latency_ms_p50": 1.9830420017242432,
+      "latency_ms_p95": 5.828827047348022,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_float16.tflite",
+      "img_size": 256,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 4.3782572746276855,
+      "latency_ms_p50": 2.929437518119812,
+      "latency_ms_p95": 10.299966955184933,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_int8_full_simcc_int8io.tflite",
+      "img_size": 256,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 4.1995849609375,
+      "latency_ms_p50": 2.3656874895095825,
+      "latency_ms_p95": 9.791154861450195,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_256_revlast_float16.tflite",
+      "img_size": 256,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 3.9379994869232178,
+      "latency_ms_p50": 3.0195415019989014,
+      "latency_ms_p95": 7.898002409934997,
+      "latency_ms_n": 2000
+    },
+    {
+      "model": "checkpoints/tflite_top4/mobilenetv2_256_revlast_int8_full_simcc_int8io.tflite",
+      "img_size": 256,
+      "tflite_threads": 4,
+      "mode": "invoke",
+      "input_norm": "imagenet",
+      "latency_ms_mean": 3.2456371784210205,
+      "latency_ms_p50": 2.1936044692993164,
+      "latency_ms_p95": 6.926423025131223,
+      "latency_ms_n": 2000
+    }
+  ]
+}

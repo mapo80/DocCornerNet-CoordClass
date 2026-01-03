@@ -342,6 +342,7 @@ def main():
     print(f"  Recall@75:            {results['recall_75']*100:.1f}%")
     print(f"  Recall@90:            {results['recall_90']*100:.1f}%")
     print(f"  Recall@95:            {results['recall_95']*100:.1f}%")
+    print(f"  Recall@99:            {results['recall_99']*100:.1f}%")
 
     print(f"\nClassification Metrics (on {results['num_samples']} total images):")
     print(f"  Accuracy:             {results['cls_accuracy']*100:.1f}%")

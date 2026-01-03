@@ -7,6 +7,21 @@ A lightweight neural network for document corner detection using **Marginal Coor
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-DocCornerDataset-yellow)](https://huggingface.co/datasets/mapo80/DocCornerDataset)
 
+## Leaderboard (Recommended Models)
+
+For the latest cross‑dataset comparison (rev‑last vs rev‑new vs `val_clean_iter4_mix`) and the TFLite top‑4 exports (float16 + int8 full‑quant), see:
+
+- [checkpoints/model_comparison_revlast_vs_iters.md](checkpoints/model_comparison_revlast_vs_iters.md)
+
+**Current winners**
+- Best cross‑dataset generalization (rev‑last + rev‑new): `mobilenetv2_224_from256_clean_iter3`
+- Best on rev‑last val: `mobilenetv2_256_revlast`
+- Best on `val_clean_iter4_mix`: `mobilenetv2_256_clean_iter3`
+
+**TFLite artifacts**
+- Benchmarks + delegate report: `checkpoints/tflite_top4/` (note: `*.tflite` binaries are git‑ignored; regenerate via export scripts)
+- XNNPACK full‑delegate report: `checkpoints/tflite_top4/xnnpack_delegate_report.txt`
+
 ## Quick Start
 
 ### 1. Install Dependencies

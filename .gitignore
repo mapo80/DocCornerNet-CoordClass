@@ -13,8 +13,9 @@ evaluation_results/
 full_dataset_analysis/
 
 # Proprietary/local integrations (do not commit)
-*scanbot*
-*Scanbot*
+# (Keep this repo vendor-agnostic: no third-party SDK code or artifacts.)
+vendor/
+private/
 qat_output/
 exported/
 *.onnx

@@ -155,6 +155,7 @@ class ValidationMetrics:
     - Corner error: mean, p95, max (in pixels)
     - Recall at IoU thresholds: 50%, 75%, 90%, 95%
     - Classification: accuracy, precision, recall, F1
+    - Outlier counts (positive samples only): by IoU and pixel error thresholds
     """
 
     def __init__(self, img_size: int = 224):
@@ -222,6 +223,13 @@ class ValidationMetrics:
             "recall_90": 0.0,
             "recall_95": 0.0,
             "recall_99": 0.0,
+            # Outliers (positive samples only)
+            "num_iou_lt_90": 0,
+            "num_iou_lt_95": 0,
+            "num_iou_lt_99": 0,
+            "num_err_gt_10": 0,
+            "num_err_gt_20": 0,
+            "num_err_gt_50": 0,
             "cls_accuracy": 0.0,
             "cls_precision": 0.0,
             "cls_recall": 0.0,
@@ -256,25 +264,69 @@ class ValidationMetrics:
         pred_coords_pos = pred_coords[mask]
         gt_coords_pos = gt_coords[mask]
 
+        # ------------------------------------------------------------
         # IoU per sample
-        ious = []
-        for i in range(num_with_doc):
-            iou = compute_polygon_iou(pred_coords_pos[i], gt_coords_pos[i])
-            ious.append(iou)
-        ious = np.array(ious)
+        # ------------------------------------------------------------
+        # Shapely 2.x supports vectorized ops; use it for valid polygons and
+        # fall back to the existing per-sample implementation for invalid ones
+        # to preserve legacy behavior.
+        ious = np.zeros((num_with_doc,), dtype=np.float64)
+        if SHAPELY_AVAILABLE:
+            try:
+                from shapely import area, intersection, is_empty, is_valid, polygons, union  # type: ignore
 
-        # Corner error per sample
-        all_corner_errors = []
-        mean_corner_errors = []
-        for i in range(num_with_doc):
-            mean_err, per_corner = compute_corner_error(
-                pred_coords_pos[i], gt_coords_pos[i], self.img_size
-            )
-            mean_corner_errors.append(mean_err)
-            all_corner_errors.extend(per_corner)
+                pred_pts = pred_coords_pos.reshape(-1, 4, 2).astype(np.float64, copy=False)
+                gt_pts = gt_coords_pos.reshape(-1, 4, 2).astype(np.float64, copy=False)
 
-        all_corner_errors = np.array(all_corner_errors)
-        mean_corner_errors = np.array(mean_corner_errors)
+                pred_polys = polygons(pred_pts)
+                gt_polys = polygons(gt_pts)
+
+                valid = is_valid(pred_polys) & is_valid(gt_polys) & (~is_empty(pred_polys)) & (~is_empty(gt_polys))
+                if bool(valid.any()):
+                    inter = area(intersection(pred_polys[valid], gt_polys[valid]))
+                    uni = area(union(pred_polys[valid], gt_polys[valid]))
+                    ious_valid = np.where(uni > 0, inter / uni, 0.0)
+                    ious[valid] = ious_valid
+
+                invalid_idx = np.where(~valid)[0]
+                if invalid_idx.size:
+                    for i in invalid_idx.tolist():
+                        ious[i] = float(compute_polygon_iou(pred_coords_pos[i], gt_coords_pos[i]))
+            except Exception:
+                # Safety fallback (should be rare): revert to the legacy slow path.
+                for i in range(num_with_doc):
+                    ious[i] = float(compute_polygon_iou(pred_coords_pos[i], gt_coords_pos[i]))
+        else:
+            # Vectorized bbox IoU fallback (fast).
+            pred_xy = pred_coords_pos.reshape(-1, 4, 2)
+            gt_xy = gt_coords_pos.reshape(-1, 4, 2)
+            pxmin = pred_xy[:, :, 0].min(axis=1)
+            pymin = pred_xy[:, :, 1].min(axis=1)
+            pxmax = pred_xy[:, :, 0].max(axis=1)
+            pymax = pred_xy[:, :, 1].max(axis=1)
+            gxmin = gt_xy[:, :, 0].min(axis=1)
+            gymin = gt_xy[:, :, 1].min(axis=1)
+            gxmax = gt_xy[:, :, 0].max(axis=1)
+            gymax = gt_xy[:, :, 1].max(axis=1)
+
+            ix1 = np.maximum(pxmin, gxmin)
+            iy1 = np.maximum(pymin, gymin)
+            ix2 = np.minimum(pxmax, gxmax)
+            iy2 = np.minimum(pymax, gymax)
+            inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+            area_p = np.maximum(0.0, pxmax - pxmin) * np.maximum(0.0, pymax - pymin)
+            area_g = np.maximum(0.0, gxmax - gxmin) * np.maximum(0.0, gymax - gymin)
+            uni = area_p + area_g - inter
+            ious = np.where(uni > 0, inter / uni, 0.0)
+
+        # ------------------------------------------------------------
+        # Corner error per sample (vectorized)
+        # ------------------------------------------------------------
+        pred_px = pred_coords_pos.reshape(-1, 4, 2) * float(self.img_size)
+        gt_px = gt_coords_pos.reshape(-1, 4, 2) * float(self.img_size)
+        per_corner = np.sqrt(((pred_px - gt_px) ** 2).sum(axis=2))  # [N,4]
+        mean_corner_errors = per_corner.mean(axis=1)
+        all_corner_errors = per_corner.reshape(-1)
 
         # Update results
         results["mean_iou"] = float(np.mean(ious))
@@ -289,6 +341,14 @@ class ValidationMetrics:
         results["recall_90"] = float((ious >= 0.90).sum() / num_with_doc)
         results["recall_95"] = float((ious >= 0.95).sum() / num_with_doc)
         results["recall_99"] = float((ious >= 0.99).sum() / num_with_doc)
+
+        # Outlier counts (positive samples only)
+        results["num_iou_lt_90"] = int((ious < 0.90).sum())
+        results["num_iou_lt_95"] = int((ious < 0.95).sum())
+        results["num_iou_lt_99"] = int((ious < 0.99).sum())
+        results["num_err_gt_10"] = int((mean_corner_errors > 10.0).sum())
+        results["num_err_gt_20"] = int((mean_corner_errors > 20.0).sum())
+        results["num_err_gt_50"] = int((mean_corner_errors > 50.0).sum())
 
         return results
 

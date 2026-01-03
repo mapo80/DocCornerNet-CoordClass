@@ -913,6 +913,17 @@ def main():
             f"R@99={val_metrics['recall_99']*100:.1f}%",
             flush=True,
         )
+        n_doc = int(val_metrics.get("num_with_doc", 0))
+        if n_doc > 0:
+            out_iou90 = int(val_metrics.get("num_iou_lt_90", 0))
+            out_err20 = int(val_metrics.get("num_err_gt_20", 0))
+            out_err50 = int(val_metrics.get("num_err_gt_50", 0))
+            print(
+                f"           outliers: IoU<0.90={out_iou90}/{n_doc} ({out_iou90/n_doc*100:.1f}%)  "
+                f"err>20px={out_err20}/{n_doc} ({out_err20/n_doc*100:.1f}%)  "
+                f"err>50px={out_err50}/{n_doc} ({out_err50/n_doc*100:.1f}%)",
+                flush=True,
+            )
         print(
             f"           cls_acc={val_metrics['cls_accuracy']*100:.1f}%  "
             f"cls_f1={val_metrics['cls_f1']:.3f}",

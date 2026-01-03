@@ -1,0 +1,80 @@
+==== checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_float16.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_float16.tflite
+Threads: 4
+Input dtype: Float32
+Nodes: 280 (before delegate: 279)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_int8_full_simcc_int8io.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_224_from256_clean_iter3_int8_full_simcc_int8io.tflite
+Threads: 4
+Input dtype: Int8
+Nodes: 131 (before delegate: 130)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_float16.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_float16.tflite
+Threads: 4
+Input dtype: Float32
+Nodes: 280 (before delegate: 279)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_int8_full_simcc_int8io.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_224_from256_revlast_int8_full_simcc_int8io.tflite
+Threads: 4
+Input dtype: Int8
+Nodes: 131 (before delegate: 130)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_float16.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_float16.tflite
+Threads: 4
+Input dtype: Float32
+Nodes: 280 (before delegate: 279)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_int8_full_simcc_int8io.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_256_clean_iter3_int8_full_simcc_int8io.tflite
+Threads: 4
+Input dtype: Int8
+Nodes: 131 (before delegate: 130)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_256_revlast_float16.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_256_revlast_float16.tflite
+Threads: 4
+Input dtype: Float32
+Nodes: 280 (before delegate: 279)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
+==== checkpoints/tflite_top4/mobilenetv2_256_revlast_int8_full_simcc_int8io.tflite ====
+Model: checkpoints/tflite_top4/mobilenetv2_256_revlast_int8_full_simcc_int8io.tflite
+Threads: 4
+Input dtype: Int8
+Nodes: 131 (before delegate: 130)
+Execution plan nodes: 1
+
+DELEGATE (XNNPACK): 1 plan node(s)
+Non-delegated builtin ops (plan):
+
