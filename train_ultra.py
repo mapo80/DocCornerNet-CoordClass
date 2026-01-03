@@ -713,27 +713,32 @@ def main():
     if args.init_weights:
         init_path = _find_init_weights_path(args.init_weights)
         print(f"\nLoading init weights from: {init_path}", flush=True)
-        try:
+
+        # Keras by_name loading only supports legacy HDF5 files ending in .h5/.hdf5.
+        # Our checkpoints typically use the newer '*.weights.h5' naming; the file is
+        # still HDF5, but Keras refuses by_name based on the filename.
+        init_for_by_name = init_path
+        if init_path.name.endswith(".weights.h5"):
+            legacy_name = init_path.name[: -len(".weights.h5")] + ".h5"
+            legacy_path = output_dir / legacy_name
+            if not legacy_path.exists():
+                shutil.copy2(init_path, legacy_path)
+            init_for_by_name = legacy_path
+
+        if args.init_partial:
+            # Prefer partial load first to avoid noisy shape-mismatch errors when the
+            # architecture changes slightly (e.g. simcc_ch, img_size/num_bins).
+            try:
+                model.load_weights(str(init_for_by_name), by_name=True, skip_mismatch=True)
+                print("✓ Loaded init weights (partial)", flush=True)
+            except Exception as e:
+                print(f"Warning: partial init load failed: {e}", flush=True)
+                print("Retrying strict init load...", flush=True)
+                model.load_weights(str(init_path))
+                print("✓ Loaded init weights (strict)", flush=True)
+        else:
             model.load_weights(str(init_path))
             print("✓ Loaded init weights (strict)", flush=True)
-        except Exception as e:
-            if not args.init_partial:
-                raise
-            print(f"Warning: strict init load failed: {e}", flush=True)
-            print("Retrying with by_name=True, skip_mismatch=True...", flush=True)
-            # Keras by_name loading only supports legacy HDF5 files ending in .h5/.hdf5.
-            # Our checkpoints typically use the newer '*.weights.h5' naming; the file is
-            # still HDF5, but Keras refuses by_name based on the filename. Create a
-            # legacy-named copy for partial loading.
-            init_for_by_name = init_path
-            if init_path.name.endswith(".weights.h5"):
-                legacy_name = init_path.name[: -len(".weights.h5")] + ".h5"
-                legacy_path = output_dir / legacy_name
-                if not legacy_path.exists():
-                    shutil.copy2(init_path, legacy_path)
-                init_for_by_name = legacy_path
-            model.load_weights(str(init_for_by_name), by_name=True, skip_mismatch=True)
-            print("✓ Loaded init weights (partial)", flush=True)
 
     # Optimizer
     optimizer = keras.optimizers.AdamW(
