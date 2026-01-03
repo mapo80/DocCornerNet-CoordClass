@@ -113,8 +113,10 @@ Ranked by **worst‑case Mean IoU** across `rev-last` val and `rev-new` val (so 
 |---:|---|---:|---:|---:|
 | 1 | `mobilenetv2_224_from256_clean_iter3` | 0.9682 | 0.9047 | **0.9047** |
 | 2 | `mobilenetv2_256_clean_iter3` | 0.9672 | 0.8997 | **0.8997** |
-| 3 | `mobilenetv2_224_from256_revlast` | 0.9784 | 0.8321 | **0.8321** |
-| 4 | `mobilenetv2_256_revlast` | 0.9798 | 0.8301 | **0.8301** |
+| 3 | `mobilenetv2_256_best` | 0.9577 | 0.8513 | **0.8513** |
+| 4 | `mobilenetv2_224_best` | 0.9587 | 0.8505 | **0.8505** |
+| 5 | `mobilenetv2_224_from256_revlast` | 0.9784 | 0.8321 | **0.8321** |
+| 6 | `mobilenetv2_256_revlast` | 0.9798 | 0.8301 | **0.8301** |
 
 ## Leaderboard — `val_clean_iter4_mix` (positives=5364, negatives=718)
 
@@ -128,7 +130,8 @@ Ranked by **worst‑case Mean IoU** across `rev-last` val and `rev-new` val (so 
 | 6 | `mobilenetv2_224_from256_revlast` | 0.9730 | 93.7% | 10.0% | 1.62 | 3.51 | 190.20 |
 | 7 | `mobilenetv2_256_revlast` | 0.9726 | 93.8% | 10.0% | 1.91 | 3.99 | 232.66 |
 | 8 | `teacher (det-only)` | 0.9657 | 90.7% | 5.9% | 9.48 | 20.47 | 840.67 |
-| 9 | `mobilenetv2_256_best` | 0.9644 | 85.2% | 33.7% | 2.94 | 12.14 | 215.54 |
+| 9 | `mobilenetv2_224_best` | 0.9645 | 86.1% | 32.2% | 2.56 | 6.37 | 194.53 |
+| 10 | `mobilenetv2_256_best` | 0.9645 | 85.2% | 33.9% | 2.94 | 7.80 | 215.54 |
 
 ## Leaderboard — `rev-last` val (positives=8077, negatives=3114)
 
@@ -138,6 +141,8 @@ Ranked by **worst‑case Mean IoU** across `rev-last` val and `rev-new` val (so 
 | 2 | `mobilenetv2_224_from256_revlast` | 0.9784 | 95.7% | 37.1% | 1.38 | 2.31 | 209.52 |
 | 3 | `mobilenetv2_224_from256_clean_iter3` | 0.9682 | 91.2% | 9.4% | 2.09 | 3.60 | 210.97 |
 | 4 | `mobilenetv2_256_clean_iter3` | 0.9672 | 91.2% | 8.6% | 2.46 | 4.10 | 240.68 |
+| 5 | `mobilenetv2_224_best` | 0.9587 | 85.9% | 7.4% | 2.99 | 6.10 | 210.12 |
+| 6 | `mobilenetv2_256_best` | 0.9577 | 84.8% | 7.5% | 3.47 | 7.79 | 239.67 |
 
 ## Leaderboard — `rev-new` val (positives=23444, negatives=3114)
 
@@ -145,8 +150,10 @@ Ranked by **worst‑case Mean IoU** across `rev-last` val and `rev-new` val (so 
 |---:|---|---:|---:|---:|---:|---:|---:|
 | 1 | `mobilenetv2_224_from256_clean_iter3` | **0.9047** | 63.7% | 18.2% | 5.77 | 30.57 | 195.35 |
 | 2 | `mobilenetv2_256_clean_iter3` | 0.8997 | 63.8% | 21.0% | 6.97 | 39.91 | 266.76 |
-| 3 | `mobilenetv2_224_from256_revlast` | 0.8321 | 52.9% | 3.2% | 12.21 | 74.95 | 281.87 |
-| 4 | `mobilenetv2_256_revlast` | 0.8301 | 53.2% | 3.2% | 13.89 | 86.81 | 283.48 |
+| 3 | `mobilenetv2_256_best` | 0.8513 | 49.1% | 10.4% | 12.19 | 73.12 | 276.08 |
+| 4 | `mobilenetv2_224_best` | 0.8505 | 49.6% | 9.8% | 10.72 | 64.33 | 247.75 |
+| 5 | `mobilenetv2_224_from256_revlast` | 0.8321 | 52.9% | 3.2% | 12.21 | 74.95 | 281.87 |
+| 6 | `mobilenetv2_256_revlast` | 0.8301 | 53.2% | 3.2% | 13.89 | 86.81 | 283.48 |
 
 ## Sources
 - `evaluation_results/full_evaluation_iter1_on_val_iter4.csv`
