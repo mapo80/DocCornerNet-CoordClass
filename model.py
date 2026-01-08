@@ -644,6 +644,94 @@ class SimCCDecode(layers.Layer):
         return config
 
 
+@register_keras_serializable(package="doccorner")
+class CornerGAU(layers.Layer):
+    """
+    Gated Attention Unit for corner relationship modeling (RTMPose-inspired).
+
+    Applies self-attention between the 4 corner keypoint representations to model
+    their geometric correlations (e.g., if TL moves, TR/BL/BR are influenced).
+
+    Input: [B, 4, C] - 4 corner token representations
+    Output: [B, 4, C] - refined corner representations
+
+    Architecture:
+        Input [B, 4, C]
+            ↓
+        FC projection → [B, 4, hidden_dim]
+            ↓
+        Single-head self-attention (4x4 attention matrix)
+            ↓
+        FC output projection → [B, 4, C]
+            ↓
+        Gated residual: output = input + gate * attention_output
+    """
+
+    def __init__(self, hidden_dim: int = 64, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_dim = int(hidden_dim)
+        self._in_channels = None
+        self._scale = None
+
+    def build(self, input_shape):
+        if len(input_shape) != 3:
+            raise ValueError(f"CornerGAU expects rank-3 input [B, 4, C], got shape={input_shape}")
+        num_tokens = input_shape[1]
+        channels = input_shape[2]
+        if num_tokens is None or channels is None:
+            raise ValueError("CornerGAU requires static dimensions for TFLite compatibility.")
+        if num_tokens != 4:
+            raise ValueError(f"CornerGAU expects 4 corner tokens, got {num_tokens}")
+
+        self._in_channels = int(channels)
+        self._scale = 1.0 / np.sqrt(float(self.hidden_dim))
+
+        # Query, Key, Value projections
+        self.q_proj = layers.Dense(self.hidden_dim, use_bias=True, name="q_proj")
+        self.k_proj = layers.Dense(self.hidden_dim, use_bias=True, name="k_proj")
+        self.v_proj = layers.Dense(self.hidden_dim, use_bias=True, name="v_proj")
+
+        # Output projection back to input channels
+        self.out_proj = layers.Dense(self._in_channels, use_bias=True, name="out_proj")
+
+        # Gate for gated residual connection
+        self.gate_proj = layers.Dense(self._in_channels, activation="sigmoid", name="gate")
+
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs: [B, 4, C]
+        if self._in_channels is None or self._scale is None:
+            raise RuntimeError("CornerGAU is not built.")
+
+        # Project to Q, K, V
+        Q = self.q_proj(inputs)  # [B, 4, hidden_dim]
+        K = self.k_proj(inputs)  # [B, 4, hidden_dim]
+        V = self.v_proj(inputs)  # [B, 4, hidden_dim]
+
+        # Self-attention: Q @ K^T / sqrt(d) -> softmax -> @ V
+        # [B, 4, hidden_dim] @ [B, hidden_dim, 4] -> [B, 4, 4]
+        attn_scores = tf.matmul(Q, K, transpose_b=True) * self._scale
+        attn_weights = tf.nn.softmax(attn_scores, axis=-1)  # [B, 4, 4]
+
+        # [B, 4, 4] @ [B, 4, hidden_dim] -> [B, 4, hidden_dim]
+        attn_out = tf.matmul(attn_weights, V)
+
+        # Project back to input dimension
+        attn_out = self.out_proj(attn_out)  # [B, 4, C]
+
+        # Gated residual: output = input + gate * attention_output
+        gate = self.gate_proj(inputs)  # [B, 4, C] with sigmoid activation
+        output = inputs + gate * attn_out
+
+        return output
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"hidden_dim": self.hidden_dim})
+        return config
+
+
 def _get_feature_layers(backbone, img_size: int):
     """
     Extract multi-scale feature layers from a conv backbone.
@@ -812,6 +900,9 @@ def build_doccorner_simcc_v3(
     global_pool_impl: str = "mean",
     score_pool_impl: str | None = None,
     simcc_output_layout: str = "corners_first",
+    use_gau: bool = False,
+    gau_hidden_dim: int = 64,
+    fc_expansion_dim: int = 0,
 ):
     """
     Build DocCornerNetV3 model with correct SimCC (MMPose style).
@@ -837,6 +928,9 @@ def build_doccorner_simcc_v3(
         global_pool_impl: Global pooling impl ('mean', 'avgpool', 'dwconv_full', 'dwconv_strided', 'dwconv_pyramid')
         score_pool_impl: Pooling impl override for score_gap (defaults to global_pool_impl)
         simcc_output_layout: SimCC tensor layout ('corners_first' => [B,4,num_bins], 'bins_first' => [B,num_bins,4])
+        use_gau: Enable Gated Attention Unit for corner relationship modeling (RTMPose-inspired)
+        gau_hidden_dim: Hidden dimension for GAU self-attention (default 64)
+        fc_expansion_dim: FC expansion dimension before classification (0=disabled, 256=RTMPose default)
 
     Returns:
         Keras Model with outputs dict
@@ -942,6 +1036,69 @@ def build_doccorner_simcc_v3(
     x_feat = layers.Concatenate(name="simcc_x_cat")([x_feat, global_x])  # [B, 224, simcc_ch]
     y_feat = layers.Concatenate(name="simcc_y_cat")([y_feat, global_y])  # [B, 224, simcc_ch]
 
+    # =========================================================================
+    # FC Expansion (RTMPose-inspired): expand feature dimension before classification
+    # =========================================================================
+    if fc_expansion_dim > 0:
+        x_feat = layers.Dense(fc_expansion_dim, name="simcc_x_expand")(x_feat)
+        x_feat = layers.ReLU(name="simcc_x_expand_relu")(x_feat)
+        y_feat = layers.Dense(fc_expansion_dim, name="simcc_y_expand")(y_feat)
+        y_feat = layers.ReLU(name="simcc_y_expand_relu")(y_feat)
+
+    # =========================================================================
+    # GAU (RTMPose-inspired): model corner relationships via self-attention
+    # =========================================================================
+    if use_gau:
+        # Save originals for residual connection
+        x_feat_orig = x_feat
+        y_feat_orig = y_feat
+
+        # Get the current feature dimension (static)
+        feat_dim = int(x_feat.shape[-1])
+
+        # Global average pooling over bins: [B, num_bins, ch] -> [B, ch]
+        x_gap = layers.GlobalAveragePooling1D(name="gau_x_gap")(x_feat)
+        y_gap = layers.GlobalAveragePooling1D(name="gau_y_gap")(y_feat)
+
+        # Project to 4 corner representations each: [B, ch] -> [B, 4*ch] -> reshape [B, 4, ch]
+        x_corners = layers.Dense(4 * feat_dim, name="gau_x_corner_proj")(x_gap)
+        x_corners = layers.Reshape((4, feat_dim), name="gau_x_reshape")(x_corners)
+        y_corners = layers.Dense(4 * feat_dim, name="gau_y_corner_proj")(y_gap)
+        y_corners = layers.Reshape((4, feat_dim), name="gau_y_reshape")(y_corners)
+
+        # Combine X and Y corner representations for joint attention: [B, 4, 2*ch]
+        corners_combined = layers.Concatenate(axis=-1, name="gau_corners_cat")([x_corners, y_corners])
+
+        # Apply GAU for corner relationship modeling
+        corners_refined = CornerGAU(hidden_dim=gau_hidden_dim, name="corner_gau")(corners_combined)
+
+        # Split back to X and Y using Lambda with slicing
+        x_corners_refined = layers.Lambda(
+            lambda t: t[:, :, :feat_dim], name="gau_x_split"
+        )(corners_refined)
+        y_corners_refined = layers.Lambda(
+            lambda t: t[:, :, feat_dim:], name="gau_y_split"
+        )(corners_refined)
+
+        # Average over corners: [B, 4, ch] -> [B, ch]
+        x_corner_avg = layers.GlobalAveragePooling1D(name="gau_x_corner_avg")(x_corners_refined)
+        y_corner_avg = layers.GlobalAveragePooling1D(name="gau_y_corner_avg")(y_corners_refined)
+
+        # Project to modulation weights (sigmoid for gating)
+        x_mod = layers.Dense(feat_dim, activation="sigmoid", name="gau_x_mod")(x_corner_avg)
+        y_mod = layers.Dense(feat_dim, activation="sigmoid", name="gau_y_mod")(y_corner_avg)
+
+        # Expand dims for broadcasting: [B, ch] -> [B, 1, ch]
+        x_mod = layers.Reshape((1, feat_dim), name="gau_x_mod_reshape")(x_mod)
+        y_mod = layers.Reshape((1, feat_dim), name="gau_y_mod_reshape")(y_mod)
+
+        # Apply gated modulation: x_feat = x_feat_orig + x_feat_orig * x_mod
+        # First compute x_feat_orig * x_mod, then add to original
+        x_modulated = layers.Multiply(name="gau_x_apply")([x_feat_orig, x_mod])
+        x_feat = layers.Add(name="gau_x_residual")([x_feat_orig, x_modulated])
+        y_modulated = layers.Multiply(name="gau_y_apply")([y_feat_orig, y_mod])
+        y_feat = layers.Add(name="gau_y_residual")([y_feat_orig, y_modulated])
+
     # Output heads: 4 corners for each axis
     # [B, num_bins, simcc_ch] -> [B, num_bins, 4]
     simcc_x = conv1d_layer(
@@ -1019,6 +1176,9 @@ def create_model(
     global_pool_impl: str = "mean",
     score_pool_impl: str | None = None,
     simcc_output_layout: str = "corners_first",
+    use_gau: bool = False,
+    gau_hidden_dim: int = 64,
+    fc_expansion_dim: int = 0,
 ):
     """
     Factory function to create DocCornerNetV3 training model with SimCC.
@@ -1037,6 +1197,9 @@ def create_model(
         num_bins: Coordinate bins (default 224)
         tau: Softmax temperature (default 1.0)
         score_init_bias: Score bias init (default 1.75)
+        use_gau: Enable Gated Attention Unit for corner relationships (default False)
+        gau_hidden_dim: GAU hidden dimension (default 64)
+        fc_expansion_dim: FC expansion dimension (0=disabled, 256=RTMPose default)
 
     Returns:
         DocCornerNetV3 Keras Model (training version)
@@ -1059,6 +1222,9 @@ def create_model(
         global_pool_impl=global_pool_impl,
         score_pool_impl=score_pool_impl,
         simcc_output_layout=simcc_output_layout,
+        use_gau=use_gau,
+        gau_hidden_dim=gau_hidden_dim,
+        fc_expansion_dim=fc_expansion_dim,
     )
 
 

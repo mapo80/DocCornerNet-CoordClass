@@ -217,7 +217,8 @@ class ValidationMetrics:
             "corner_error_px": 0.0,
             "corner_error_p95_px": 0.0,
             "corner_error_min_px": 0.0,
-            "corner_error_max_px": 0.0,
+            "corner_error_max_px": 0.0,  # max of per-image mean errors
+            "corner_error_worst_px": 0.0,  # worst single corner error
             "recall_50": 0.0,
             "recall_75": 0.0,
             "recall_90": 0.0,
@@ -230,6 +231,10 @@ class ValidationMetrics:
             "num_err_gt_10": 0,
             "num_err_gt_20": 0,
             "num_err_gt_50": 0,
+            # Images with at least 1 corner exceeding threshold
+            "num_any_corner_gt_10": 0,
+            "num_any_corner_gt_20": 0,
+            "num_any_corner_gt_50": 0,
             "cls_accuracy": 0.0,
             "cls_precision": 0.0,
             "cls_recall": 0.0,
@@ -334,7 +339,8 @@ class ValidationMetrics:
         results["corner_error_px"] = float(np.mean(mean_corner_errors))
         results["corner_error_p95_px"] = float(np.percentile(all_corner_errors, 95))
         results["corner_error_min_px"] = float(np.min(all_corner_errors))
-        results["corner_error_max_px"] = float(np.max(all_corner_errors))
+        results["corner_error_max_px"] = float(np.max(mean_corner_errors))  # max per-image mean
+        results["corner_error_worst_px"] = float(np.max(all_corner_errors))  # worst single corner
 
         results["recall_50"] = float((ious >= 0.50).sum() / num_with_doc)
         results["recall_75"] = float((ious >= 0.75).sum() / num_with_doc)
@@ -349,6 +355,12 @@ class ValidationMetrics:
         results["num_err_gt_10"] = int((mean_corner_errors > 10.0).sum())
         results["num_err_gt_20"] = int((mean_corner_errors > 20.0).sum())
         results["num_err_gt_50"] = int((mean_corner_errors > 50.0).sum())
+
+        # Images with at least 1 corner exceeding threshold
+        max_corner_per_img = per_corner.max(axis=1)  # [N] max corner error per image
+        results["num_any_corner_gt_10"] = int((max_corner_per_img > 10.0).sum())
+        results["num_any_corner_gt_20"] = int((max_corner_per_img > 20.0).sum())
+        results["num_any_corner_gt_50"] = int((max_corner_per_img > 50.0).sum())
 
         return results
 

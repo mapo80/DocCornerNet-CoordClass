@@ -736,16 +736,18 @@ from dataset import tf_augment_batch
 
 
 class Trainer:
-    """Efficient trainer with compiled functions."""
+    """Efficient trainer with compiled functions and gradient accumulation."""
 
     def __init__(self, model, optimizer, img_size, sigma_px, tau,
-                 w_simcc, w_coord, w_score, platform='cuda', augment=False):
+                 w_simcc, w_coord, w_score, platform='cuda', augment=False,
+                 accumulation_steps=1):
         self.model = model
         self.optimizer = optimizer
         self.platform = platform
         self.use_mixed_precision = platform == 'cuda'
         self.augment = augment
         self.img_size = img_size
+        self.accumulation_steps = accumulation_steps
 
         # Pre-compute constants as tensors
         self.img_size_tf = tf.constant(img_size, dtype=tf.int32)
@@ -755,6 +757,25 @@ class Trainer:
         self.w_simcc = tf.constant(w_simcc, dtype=tf.float32)
         self.w_coord = tf.constant(w_coord, dtype=tf.float32)
         self.w_score = tf.constant(w_score, dtype=tf.float32)
+
+        # Gradient accumulation buffers (initialized lazily)
+        self._gradient_accumulator = None
+        self._accumulation_count = tf.Variable(0, dtype=tf.int32, trainable=False)
+
+    def _init_gradient_accumulator(self):
+        """Initialize gradient accumulator with zeros matching model variables."""
+        if self._gradient_accumulator is None:
+            self._gradient_accumulator = [
+                tf.Variable(tf.zeros_like(var), trainable=False)
+                for var in self.model.trainable_variables
+            ]
+
+    def reset_gradient_accumulator(self):
+        """Reset accumulated gradients to zero."""
+        if self._gradient_accumulator is not None:
+            for acc in self._gradient_accumulator:
+                acc.assign(tf.zeros_like(acc))
+        self._accumulation_count.assign(0)
 
     @tf.function
     def augment_batch(self, images, coords, has_doc):
@@ -850,7 +871,7 @@ class Trainer:
 
     @tf.function
     def train_step(self, images, coords_gt, has_doc):
-        """Training step."""
+        """Training step (no accumulation - applies gradients immediately)."""
         with tf.GradientTape() as tape:
             (
                 total_loss,
@@ -872,6 +893,54 @@ class Trainer:
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
         return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+
+    @tf.function
+    def train_step_accumulate(self, images, coords_gt, has_doc):
+        """Training step with gradient accumulation - accumulates gradients without applying."""
+        with tf.GradientTape() as tape:
+            (
+                total_loss,
+                coords_pred,
+                loss_simcc,
+                loss_coord,
+                loss_score,
+                _,
+            ) = self._compute_loss(images, coords_gt, has_doc, training=True)
+            if self.use_mixed_precision:
+                if hasattr(self.optimizer, "scale_loss"):
+                    scaled_loss = self.optimizer.scale_loss(total_loss)
+                else:
+                    scaled_loss = total_loss
+            else:
+                scaled_loss = total_loss
+
+        gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
+
+        # Accumulate gradients (add to existing)
+        for acc, grad in zip(self._gradient_accumulator, gradients):
+            if grad is not None:
+                acc.assign_add(grad)
+
+        self._accumulation_count.assign_add(1)
+        iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+
+    @tf.function
+    def apply_accumulated_gradients(self):
+        """Apply accumulated gradients (averaged over accumulation steps)."""
+        # Average the gradients
+        accum_steps_float = tf.cast(self._accumulation_count, tf.float32)
+        averaged_gradients = [
+            acc / accum_steps_float for acc in self._gradient_accumulator
+        ]
+        # Apply to optimizer
+        self.optimizer.apply_gradients(
+            zip(averaged_gradients, self.model.trainable_variables)
+        )
+        # Reset accumulators
+        for acc in self._gradient_accumulator:
+            acc.assign(tf.zeros_like(acc))
+        self._accumulation_count.assign(0)
 
     @tf.function
     def val_step(self, images, coords_gt, has_doc):
@@ -1014,6 +1083,12 @@ def main():
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--num_bins", type=int, default=256)
     parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--use_gau", action="store_true",
+                        help="Enable Gated Attention Unit for corner relationship modeling (RTMPose-inspired)")
+    parser.add_argument("--gau_hidden_dim", type=int, default=64,
+                        help="Hidden dimension for GAU self-attention")
+    parser.add_argument("--fc_expansion_dim", type=int, default=0,
+                        help="FC expansion dimension before classification (0=disabled, 256=RTMPose default)")
 
     # Loss
     parser.add_argument("--sigma_px", type=float, default=3.0)
@@ -1023,6 +1098,8 @@ def main():
 
     # Training
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--accumulation_steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * accumulation_steps)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -1143,8 +1220,15 @@ def main():
         img_size=args.img_size,
         num_bins=args.num_bins,
         tau=args.tau,
+        use_gau=args.use_gau,
+        gau_hidden_dim=args.gau_hidden_dim,
+        fc_expansion_dim=args.fc_expansion_dim,
     )
     print(f"Parameters: {model.count_params():,}", flush=True)
+    if args.use_gau:
+        print(f"GAU enabled: hidden_dim={args.gau_hidden_dim}", flush=True)
+    if args.fc_expansion_dim > 0:
+        print(f"FC expansion: dim={args.fc_expansion_dim}", flush=True)
 
     # Optional warm-start (e.g. fine-tune at different img_size/num_bins).
     if args.init_weights:
@@ -1191,7 +1275,8 @@ def main():
     trainer = Trainer(
         model, optimizer, args.img_size, args.sigma_px, args.tau,
         args.w_simcc, args.w_coord, args.w_score,
-        platform=platform, augment=args.augment
+        platform=platform, augment=args.augment,
+        accumulation_steps=args.accumulation_steps
     )
 
     # ========================================================================
@@ -1211,8 +1296,13 @@ def main():
     # ========================================================================
     # Training loop
     # ========================================================================
+    effective_batch_size = args.batch_size * args.accumulation_steps
     print("\n" + "=" * 80, flush=True)
-    print(f"Starting training: {args.epochs} epochs, batch_size={args.batch_size}", flush=True)
+    print(f"Starting training: {args.epochs} epochs", flush=True)
+    if args.accumulation_steps > 1:
+        print(f"Batch size: {args.batch_size} x {args.accumulation_steps} accumulation = {effective_batch_size} effective", flush=True)
+    else:
+        print(f"Batch size: {args.batch_size}", flush=True)
     if args.augment:
         print("Augmentation: ENABLED", flush=True)
     print("=" * 80, flush=True)
@@ -1245,6 +1335,14 @@ def main():
         train_score = []
         train_iou = []
         train_err = []
+        accumulation_steps = args.accumulation_steps
+        use_accumulation = accumulation_steps > 1
+
+        # Initialize gradient accumulator on first use
+        if use_accumulation and trainer._gradient_accumulator is None:
+            trainer._init_gradient_accumulator()
+            trainer.reset_gradient_accumulator()
+
         train_pbar = tqdm(
             train_ds.dataset,
             total=len(train_ds),
@@ -1255,12 +1353,24 @@ def main():
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
             ascii=True,
         )
-        for images, coords, has_doc in train_pbar:
+        for batch_idx, (images, coords, has_doc) in enumerate(train_pbar):
             if args.augment:
                 images, coords = trainer.augment_batch(images, coords, has_doc)
-            loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
-                images, coords, has_doc
-            )
+
+            if use_accumulation:
+                # Accumulate gradients
+                loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate(
+                    images, coords, has_doc
+                )
+                # Apply accumulated gradients every accumulation_steps
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    trainer.apply_accumulated_gradients()
+            else:
+                # Standard training step
+                loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
+                    images, coords, has_doc
+                )
+
             loss_val = float(loss)
             train_losses.append(loss_val)
             train_simcc.append(float(loss_simcc))
@@ -1273,6 +1383,10 @@ def main():
                 "err": f"{np.mean(train_err):.1f}px",
                 "iou": f"{np.mean(train_iou):.3f}",
             })
+
+        # Apply any remaining accumulated gradients at end of epoch
+        if use_accumulation and trainer._accumulation_count > 0:
+            trainer.apply_accumulated_gradients()
 
         avg_train_loss = float(np.mean(train_losses))
         avg_train_simcc = float(np.mean(train_simcc))
@@ -1344,8 +1458,8 @@ def main():
         print(
             f"           err_mean={val_metrics['corner_error_px']:.1f}px  "
             f"err_p95={val_metrics['corner_error_p95_px']:.1f}px  "
-            f"err_min={val_metrics['corner_error_min_px']:.1f}px  "
-            f"err_max={val_metrics['corner_error_max_px']:.1f}px",
+            f"err_max={val_metrics['corner_error_max_px']:.1f}px  "
+            f"err_worst={val_metrics['corner_error_worst_px']:.1f}px",
             flush=True,
         )
         print(
@@ -1360,12 +1474,19 @@ def main():
             out_iou90 = int(val_metrics.get("num_iou_lt_90", 0))
             out_err20 = int(val_metrics.get("num_err_gt_20", 0))
             out_err50 = int(val_metrics.get("num_err_gt_50", 0))
+            any_c20 = int(val_metrics.get("num_any_corner_gt_20", 0))
+            any_c50 = int(val_metrics.get("num_any_corner_gt_50", 0))
             print(
                 f"           outliers: IoU<0.90={out_iou90}/{n_doc} ({out_iou90/n_doc*100:.1f}%)  "
                 f"err>20px={out_err20}/{n_doc} ({out_err20/n_doc*100:.1f}%)  "
-                f"err>50px={out_err50}/{n_doc} ({out_err50/n_doc*100:.1f}%)",
+                f"any_corner>20px={any_c20}/{n_doc} ({any_c20/n_doc*100:.1f}%)",
                 flush=True,
             )
+            if any_c50 > 0:
+                print(
+                    f"           any_corner>50px={any_c50}/{n_doc} ({any_c50/n_doc*100:.1f}%)",
+                    flush=True,
+                )
         print(
             f"           cls_acc={val_metrics['cls_accuracy']*100:.1f}%  "
             f"cls_f1={val_metrics['cls_f1']:.3f}",
