@@ -25,6 +25,120 @@ For the latest cross‑dataset comparison (rev‑last vs rev‑new vs `val_clean
 - Benchmarks + delegate report: `checkpoints/tflite_top4/` (note: `*.tflite` binaries are git‑ignored; regenerate via export scripts)
 - XNNPACK full‑delegate report: `checkpoints/tflite_top4/xnnpack_delegate_report.txt`
 
+## Remote Training (RunPod, Lambda Labs, etc.)
+
+For training on remote GPU machines, use the automated setup script.
+
+### One-Line Setup
+
+```bash
+# SSH into your remote machine, then:
+curl -sSL https://raw.githubusercontent.com/mapo80/DocCornerNet-CoordClass/main/setup_remote.sh | bash
+```
+
+Or with dataset download:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/mapo80/DocCornerNet-CoordClass/main/setup_remote.sh | bash -s -- --download-dataset
+```
+
+### Manual Setup + Training
+
+```bash
+# 1. Clone repository
+git clone https://github.com/mapo80/DocCornerNet-CoordClass.git
+cd DocCornerNet-CoordClass
+
+# 2. Run setup script
+bash setup_remote.sh
+
+# 3. Download dataset from HuggingFace
+python train_ultra.py \
+    --hf_dataset mapo80/DocCornerDataset \
+    --download_hf ./hf_dataset
+
+# 4. Start training (mobile model - alpha=0.35, 256px)
+nohup python train_ultra.py \
+    --hf_dataset ./hf_dataset \
+    --output_dir ./checkpoints \
+    --backbone mobilenetv2 \
+    --alpha 0.35 \
+    --img_size 256 \
+    --num_bins 256 \
+    --batch_size 512 \
+    --epochs 200 \
+    --augment \
+    > training.log 2>&1 &
+
+# Monitor training
+tail -f training.log
+```
+
+### Server Model Training (Higher Quality)
+
+For server-side inference where model size is less important:
+
+```bash
+python train_ultra.py \
+    --hf_dataset ./hf_dataset \
+    --output_dir ./checkpoints \
+    --backbone mobilenetv2 \
+    --alpha 1.0 \
+    --img_size 320 \
+    --num_bins 320 \
+    --simcc_ch 128 \
+    --fpn_ch 48 \
+    --batch_size 128 \
+    --epochs 200 \
+    --augment
+```
+
+### Setup Script Options
+
+```bash
+bash setup_remote.sh [OPTIONS]
+
+Options:
+  --download-dataset    Download the HuggingFace dataset after setup
+  --hf-token TOKEN      HuggingFace token for private datasets
+  --output-dir DIR      Directory for dataset download (default: ./hf_dataset)
+  --branch BRANCH       Git branch to checkout (default: main)
+  --repo-dir DIR        Directory for repository (default: /root/DocCornerNet-CoordClass)
+```
+
+### Example: Full RunPod Workflow
+
+```bash
+# 1. SSH into RunPod instance
+ssh root@<HOST> -p <PORT> -i ~/.ssh/id_ed25519
+
+# 2. Setup (one command)
+curl -sSL https://raw.githubusercontent.com/mapo80/DocCornerNet-CoordClass/main/setup_remote.sh | bash -s -- --download-dataset --output-dir /workspace/hf_dataset
+
+# 3. Start training
+cd /root/DocCornerNet-CoordClass
+nohup python train_ultra.py \
+    --hf_dataset /workspace/hf_dataset \
+    --output_dir /workspace/checkpoints \
+    --backbone mobilenetv2 \
+    --alpha 0.35 \
+    --img_size 256 \
+    --num_bins 256 \
+    --batch_size 512 \
+    --epochs 200 \
+    --augment \
+    > /workspace/training.log 2>&1 &
+
+# 4. Monitor
+tail -f /workspace/training.log
+
+# 5. Download results (from local machine)
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/checkpoints/*/best_model.weights.h5 ./
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<HOST>:/workspace/checkpoints/*/config.json ./
+```
+
+---
+
 ## Quick Start
 
 ### 1. Install Dependencies
