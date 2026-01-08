@@ -11,6 +11,7 @@
 # Large local artifacts (regenerable)
 evaluation_results/
 full_dataset_analysis/
+hf_dataset/
 
 # Proprietary/local integrations (do not commit)
 # (Keep this repo vendor-agnostic: no third-party SDK code or artifacts.)
