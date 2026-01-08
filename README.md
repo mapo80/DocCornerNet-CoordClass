@@ -7,16 +7,213 @@ A lightweight neural network for document corner detection using **Marginal Coor
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-DocCornerDataset-yellow)](https://huggingface.co/datasets/mapo80/DocCornerDataset)
 
+## Overview
+
+DocCornerNet detects the four corners of documents in images using a novel approach based on **Simple Coordinate Classification (SimCC)**. Instead of predicting corner coordinates directly via regression or generating 2D heatmaps, SimCC treats coordinate prediction as a 1D classification problem along each axis, achieving sub-pixel precision with significantly lower computational cost.
+
+**Key Features:**
+- **Sub-pixel accuracy**: Mean corner error < 1 pixel at 224px input
+- **Lightweight**: ~500K parameters, <1MB model size
+- **Fast inference**: ~4ms on CPU (TFLite + XNNPACK)
+- **Production-ready**: Full XNNPACK delegation for mobile/WASM deployment
+- **High accuracy**: Mean IoU > 0.98 on document detection benchmarks
+
+---
+
+## Model Architecture
+
+### High-Level Overview
+
+```
+Input Image [H×W×3]
+        ↓
+┌───────────────────────────────────────┐
+│     MobileNetV2/V3 Backbone           │
+│   (ImageNet pretrained, α=0.35-1.0)   │
+└───────────────────────────────────────┘
+        ↓
+    Multi-scale features (C2, C3, C4, C5)
+        ↓
+┌───────────────────────────────────────┐
+│           Mini-FPN Neck               │
+│   Top-down pathway with lateral       │
+│   connections, 2x nearest upsampling  │
+└───────────────────────────────────────┘
+        ↓
+    Fused features P2 [H/4 × W/4 × fpn_ch]
+        ↓
+┌───────────────────────────────────────┐
+│         SimCC Head                    │
+│   Marginal pooling + 1D convolutions  │
+│   → X logits [B, 4, num_bins]         │
+│   → Y logits [B, 4, num_bins]         │
+└───────────────────────────────────────┘
+        ↓
+    Soft-argmax decode → coords [B, 8]
+        ↓
+┌───────────────────────────────────────┐
+│         Score Head                    │
+│   Global pooling → Dense → logit      │
+└───────────────────────────────────────┘
+        ↓
+    Output: 4 corners (x,y) + document score
+```
+
+### Component Details
+
+#### 1. Backbone
+
+The model supports multiple backbone architectures:
+
+| Backbone | Parameters | Notes |
+|----------|------------|-------|
+| MobileNetV2 | ~495K (α=0.35) | **Recommended** - Best accuracy/speed tradeoff |
+| MobileNetV3-Small | ~742K (α=0.75) | Slightly larger, similar accuracy |
+| MobileNetV3-Large | Larger | For server deployment |
+
+The backbone extracts multi-scale features at 4 resolutions:
+- **C2**: H/4 × W/4 (56×56 at 224px input) - Fine details
+- **C3**: H/8 × W/8 (28×28) - Medium features
+- **C4**: H/16 × W/16 (14×14) - Coarse features
+- **C5**: H/32 × W/32 (7×7) - Global context (used for score head)
+
+#### 2. Mini-FPN (Feature Pyramid Network)
+
+A lightweight top-down feature pyramid that merges multi-scale features:
+
+```
+C4 ──→ 1×1 Conv ──→ P4
+                    ↓ 2× Upsample
+C3 ──→ 1×1 Conv ──→ Add ──→ SepConv ──→ P3
+                                        ↓ 2× Upsample
+C2 ──→ 1×1 Conv ──→ Add ──→ SepConv ──→ P2 [56×56×fpn_ch]
+```
+
+Key design choices:
+- **Separable convolutions** for efficiency (3×3 depthwise + 1×1 pointwise)
+- **XNNPACK-friendly 2× upsampling** via reshape+multiply (no RESIZE_NEAREST_NEIGHBOR)
+- **Batch normalization + Swish** activation after each refinement
+
+#### 3. SimCC Head (Marginal Coordinate Classification)
+
+The core innovation: predicting coordinates as 1D classification problems.
+
+**Step 1: Marginal Pooling**
+```
+P_fused [B, 56, 56, ch]
+    ↓
+    ├── Mean along Y axis → X_marginal [B, 56, ch]  (vertical features)
+    └── Mean along X axis → Y_marginal [B, 56, ch]  (horizontal features)
+```
+
+**Step 2: Resolution Matching**
+```
+X_marginal [B, 56, ch] → Bilinear resize → [B, num_bins, ch]
+Y_marginal [B, 56, ch] → Bilinear resize → [B, num_bins, ch]
+```
+
+**Step 3: 1D Convolutions**
+```
+X_feat = Conv1D(k=5) → BN → ReLU → Conv1D(k=3) → BN → ReLU
+Y_feat = Conv1D(k=5) → BN → ReLU → Conv1D(k=3) → BN → ReLU
+```
+
+**Step 4: Global Context Fusion**
+```
+Global = GAP(P_fused) → Dense → Broadcast to [B, num_bins, ch/2]
+X_feat = Concat([X_feat, Global])
+Y_feat = Concat([Y_feat, Global])
+```
+
+**Step 5: Output Logits**
+```
+simcc_x = Conv1D(4, k=1)(X_feat) → [B, 4, num_bins]  (4 corners × num_bins)
+simcc_y = Conv1D(4, k=1)(Y_feat) → [B, 4, num_bins]
+```
+
+#### 4. Coordinate Decoding (Soft-Argmax)
+
+The logits are converted to continuous coordinates via soft-argmax:
+
+```python
+# For each corner i ∈ {0,1,2,3}:
+prob_x = softmax(simcc_x[:, i, :] / τ)  # [B, num_bins]
+prob_y = softmax(simcc_y[:, i, :] / τ)  # [B, num_bins]
+
+# Bin centers in [0, 1]
+centers = linspace(0, 1, num_bins)
+
+# Expected value (soft-argmax)
+x_i = sum(prob_x * centers)  # [B]
+y_i = sum(prob_y * centers)  # [B]
+```
+
+Where τ (tau) is a temperature parameter (default 1.0). Lower τ makes the distribution sharper.
+
+#### 5. Score Head
+
+Binary classification for document presence:
+
+```
+C5 [B, 7, 7, ch] → Global Average Pool → Dense(1) → score_logit
+```
+
+The logit is converted to probability via sigmoid during inference.
+
+### Why SimCC Works Better Than Alternatives
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Direct Regression** | Simple | Poor gradient flow, limited supervision |
+| **2D Heatmaps** | Rich supervision | Expensive (H×W per keypoint), quantization error |
+| **SimCC (ours)** | Rich supervision (num_bins per axis), efficient, sub-pixel precision | Requires axis independence assumption |
+
+SimCC advantages:
+1. **Richer supervision**: 224 bins per axis vs 1 scalar (regression) or 224×224 (heatmap)
+2. **Better gradients**: Cross-entropy loss provides stronger signal than L1/L2
+3. **Spatial awareness**: Marginal pooling preserves position information
+4. **Efficiency**: O(num_bins) instead of O(H×W) for heatmaps
+
+---
+
+## Model Configurations
+
+### Presets
+
+| Config | Alpha | FPN | SimCC | Input | Params | Use Case |
+|--------|-------|-----|-------|-------|--------|----------|
+| **Mobile** | 0.35 | 32 | 96 | 224/256 | ~495K | Mobile, WASM, edge |
+| **Server** | 1.0 | 48 | 128 | 320 | ~1.2M | Server, high accuracy |
+| **Tiny** | 0.35 | 24 | 64 | 224 | ~105K | Ultra-constrained |
+
+### Training Hyperparameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--alpha` | 0.35 | Backbone width multiplier |
+| `--fpn_ch` | 32 | FPN channel dimension |
+| `--simcc_ch` | 96 | SimCC head hidden channels |
+| `--img_size` | 256 | Input image size |
+| `--num_bins` | 256 | Number of classification bins (usually = img_size) |
+| `--tau` | 1.0 | Softmax temperature |
+| `--batch_size` | 512 | Training batch size |
+| `--lr` | 0.001 | Initial learning rate |
+| `--epochs` | 200 | Training epochs |
+
+---
+
 ## Leaderboard
 
-| Model | Img | mean_iou | Corner err (px) | Latency (ms) | Size |
-|-------|-----|----------|-----------------|--------------|------|
+Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset) validation split:
+
+| Model | Input | mean_iou | Corner err (px) | Latency (ms) | Size |
+|-------|-------|----------|-----------------|--------------|------|
 | `mobilenetv2_224_best` | 224 | 0.9894 | 0.57 | 4.24 | 0.98 MB |
 | `mobilenetv2_256_best` | 256 | **0.9902** | 0.60 | 8.18 | 0.98 MB |
 | `mobilenetv2_320` | 320 | 0.9855 | 1.13 | 5.36 | 0.88 MB |
 | `mobilenetv3_224` | 224 | 0.9842 | 0.86 | 3.96 | 1.47 MB |
 
-**Winner**: `mobilenetv2_224_best` - Best tradeoff for deployment (smallest model, fastest, most robust).
+**Recommended**: `mobilenetv2_224_best` - Best speed/accuracy/robustness tradeoff for deployment.
 
 ---
 
