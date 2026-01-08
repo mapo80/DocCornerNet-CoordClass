@@ -337,11 +337,19 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
         "test": "test",
     }
 
+    # Debug: print all parquet files found
+    print(f"Parquet files found:", flush=True)
+    for f in parquet_files[:10]:
+        print(f"  {f}", flush=True)
+    if len(parquet_files) > 10:
+        print(f"  ... and {len(parquet_files) - 10} more", flush=True)
+
     for split in splits:
         # Find parquet files for this split (check various patterns)
+        # HuggingFace uses patterns like: default/train/0000.parquet, train/data-00000.parquet, etc.
         split_files = [
             f for f in parquet_files
-            if f"/{split}/" in f or f.startswith(f"{split}/") or f"/{split}-" in f or f.startswith(f"{split}-")
+            if f"/{split}/" in f or f.startswith(f"{split}/") or f"/{split}-" in f or f.startswith(f"{split}-") or f"/{split}/" in f.lower()
         ]
 
         if not split_files:
