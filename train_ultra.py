@@ -309,7 +309,7 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 
     if splits is None:
-        splits = ["train", "validation", "test"]
+        splits = ["train", "val", "test"]
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -336,13 +336,6 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
         "train": "train",
         "test": "test",
     }
-
-    # Debug: print all parquet files found
-    print(f"Parquet files found:", flush=True)
-    for f in parquet_files[:10]:
-        print(f"  {f}", flush=True)
-    if len(parquet_files) > 10:
-        print(f"  ... and {len(parquet_files) - 10} more", flush=True)
 
     for split in splits:
         # Find parquet files for this split (check various patterns)
