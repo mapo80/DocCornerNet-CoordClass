@@ -9,7 +9,13 @@ Key optimizations:
 5. XLA JIT compilation on CUDA
 6. Efficient training loop with minimal overhead
 
+Supports multiple data sources:
+- Local directory with images/, labels/, split files (--data_root)
+- HuggingFace Hub dataset (--hf_dataset mapo80/DocCornerDataset)
+- Local Parquet files (--hf_dataset ./hf_dataset)
+
 Usage:
+    # From local directory
     python train_ultra.py \
         --data_root /path/to/dataset \
         --output_dir /path/to/checkpoints \
@@ -17,6 +23,29 @@ Usage:
         --img_size 256 \
         --batch_size 512 \
         --epochs 100
+
+    # From HuggingFace Hub
+    python train_ultra.py \
+        --hf_dataset mapo80/DocCornerDataset \
+        --output_dir /path/to/checkpoints \
+        --backbone mobilenetv2 \
+        --img_size 256 \
+        --batch_size 512 \
+        --epochs 100
+
+    # From local Parquet files
+    python train_ultra.py \
+        --hf_dataset ./hf_dataset \
+        --output_dir /path/to/checkpoints \
+        --backbone mobilenetv2 \
+        --img_size 256 \
+        --batch_size 512 \
+        --epochs 100
+
+    # Download HuggingFace dataset to local Parquet (no training)
+    python train_ultra.py \
+        --hf_dataset mapo80/DocCornerDataset \
+        --download_hf ./downloaded_dataset
 """
 
 import argparse
@@ -246,6 +275,370 @@ def load_dataset_fast(data_root, split, img_size, num_workers=64):
     print(f"  Loaded {n_valid}/{n_images} valid images ({mem_gb:.2f} GB)", flush=True)
     print(f"  Time: {load_time:.1f}s load + {stack_time:.1f}s stack = {total_time:.1f}s total", flush=True)
     print(f"  Speed: {n_valid / load_time:.0f} img/s", flush=True)
+
+    return images, coords, has_doc
+
+
+# ============================================================================
+# HuggingFace dataset loading
+# ============================================================================
+
+def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, hf_token: str = None):
+    """
+    Download a HuggingFace dataset and save as local Parquet files.
+
+    Args:
+        hf_dataset: HuggingFace dataset name (e.g., 'mapo80/DocCornerDataset')
+        output_dir: Directory to save the Parquet files
+        splits: List of splits to download (default: ['train', 'validation', 'test'])
+        hf_token: HuggingFace API token (optional, for private datasets)
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError(
+            "HuggingFace datasets library not installed. "
+            "Install with: pip install datasets"
+        )
+
+    # Get token from argument, environment, or HF CLI login
+    if hf_token is None:
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if splits is None:
+        splits = ["train", "validation", "test"]
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading dataset from HuggingFace: {hf_dataset}", flush=True)
+    print(f"Output directory: {output_path}", flush=True)
+
+    # Map split names to directory names
+    split_dir_map = {
+        "validation": "val",
+        "val": "val",
+        "train": "train",
+        "test": "test",
+    }
+
+    for split in splits:
+        print(f"\nDownloading {split} split...", flush=True)
+        try:
+            dataset = load_dataset(hf_dataset, split=split, token=hf_token)
+        except Exception as e:
+            print(f"  Warning: Could not load split '{split}': {e}", flush=True)
+            continue
+
+        n_samples = len(dataset)
+        print(f"  Found {n_samples} samples", flush=True)
+
+        # Create split directory
+        split_dir = split_dir_map.get(split, split)
+        split_path = output_path / split_dir
+        split_path.mkdir(parents=True, exist_ok=True)
+
+        # Define schema
+        schema = pa.schema([
+            ("image", pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
+            ("filename", pa.string()),
+            ("is_negative", pa.bool_()),
+            ("corner_tl_x", pa.float32()),
+            ("corner_tl_y", pa.float32()),
+            ("corner_tr_x", pa.float32()),
+            ("corner_tr_y", pa.float32()),
+            ("corner_br_x", pa.float32()),
+            ("corner_br_y", pa.float32()),
+            ("corner_bl_x", pa.float32()),
+            ("corner_bl_y", pa.float32()),
+        ])
+
+        # Process in batches
+        rows_per_file = 1000
+        rows = []
+        file_idx = 0
+
+        for i in tqdm(range(n_samples), desc=f"Processing {split}", unit="img"):
+            sample = dataset[i]
+            img = sample["image"]
+
+            # Convert image to bytes
+            import io
+            buffer = io.BytesIO()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(buffer, format="JPEG", quality=95)
+            img_bytes = buffer.getvalue()
+
+            # Get filename
+            filename = sample.get("filename", f"{split}_{i:06d}.jpg")
+
+            # Get coordinates
+            is_negative = sample.get("is_negative", False)
+
+            row = {
+                "image": {"bytes": img_bytes, "path": filename},
+                "filename": filename,
+                "is_negative": is_negative,
+                "corner_tl_x": sample.get("corner_tl_x"),
+                "corner_tl_y": sample.get("corner_tl_y"),
+                "corner_tr_x": sample.get("corner_tr_x"),
+                "corner_tr_y": sample.get("corner_tr_y"),
+                "corner_br_x": sample.get("corner_br_x"),
+                "corner_br_y": sample.get("corner_br_y"),
+                "corner_bl_x": sample.get("corner_bl_x"),
+                "corner_bl_y": sample.get("corner_bl_y"),
+            }
+            rows.append(row)
+
+            # Write batch
+            if len(rows) >= rows_per_file:
+                table = pa.Table.from_pylist(rows, schema=schema)
+                output_file = split_path / f"data-{file_idx:05d}.parquet"
+                pq.write_table(table, output_file, compression="snappy")
+                file_idx += 1
+                rows = []
+
+        # Write remaining rows
+        if rows:
+            table = pa.Table.from_pylist(rows, schema=schema)
+            output_file = split_path / f"data-{file_idx:05d}.parquet"
+            pq.write_table(table, output_file, compression="snappy")
+            file_idx += 1
+
+        print(f"  Saved {n_samples} samples to {split_path} ({file_idx} files)", flush=True)
+
+    print(f"\nDataset downloaded successfully to {output_path}", flush=True)
+    print(f"You can now use: --hf_dataset {output_path}", flush=True)
+
+
+def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_workers: int = 64):
+    """
+    Load dataset directly from local Parquet files (no HF caching).
+
+    Args:
+        parquet_dir: Path to local Parquet directory (e.g., './hf_dataset')
+        split: Split name ('train', 'validation', 'test')
+        img_size: Target image size
+        num_workers: Number of workers for parallel processing
+
+    Returns:
+        images: np.ndarray [N, H, W, 3] uint8
+        coords: np.ndarray [N, 8] float32
+        has_doc: np.ndarray [N] float32
+    """
+    import pyarrow.parquet as pq
+    import io
+
+    parquet_path = Path(parquet_dir)
+
+    # Map split names (HF uses 'validation', local may use 'val')
+    split_dir_map = {
+        "validation": "val",
+        "val": "val",
+        "train": "train",
+        "test": "test",
+    }
+    split_dir = split_dir_map.get(split, split)
+    split_path = parquet_path / split_dir
+
+    if not split_path.exists():
+        # Try the original split name
+        split_path = parquet_path / split
+        if not split_path.exists():
+            raise FileNotFoundError(f"Split directory not found: {parquet_path / split_dir} or {parquet_path / split}")
+
+    print(f"Loading {split} from local Parquet: {split_path}", flush=True)
+    start_time = time.time()
+
+    # Find all parquet files
+    parquet_files = sorted(split_path.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No .parquet files found in {split_path}")
+
+    print(f"  Found {len(parquet_files)} parquet files", flush=True)
+
+    # Read all parquet files and collect rows
+    all_rows = []
+    for pf in tqdm(parquet_files, desc="Reading parquet", unit="file"):
+        table = pq.read_table(pf)
+        for i in range(len(table)):
+            row = {
+                "image_bytes": table["image"][i].as_py()["bytes"],
+                "is_negative": table["is_negative"][i].as_py(),
+                "corner_tl_x": table["corner_tl_x"][i].as_py(),
+                "corner_tl_y": table["corner_tl_y"][i].as_py(),
+                "corner_tr_x": table["corner_tr_x"][i].as_py(),
+                "corner_tr_y": table["corner_tr_y"][i].as_py(),
+                "corner_br_x": table["corner_br_x"][i].as_py(),
+                "corner_br_y": table["corner_br_y"][i].as_py(),
+                "corner_bl_x": table["corner_bl_x"][i].as_py(),
+                "corner_bl_y": table["corner_bl_y"][i].as_py(),
+            }
+            all_rows.append(row)
+
+    n_samples = len(all_rows)
+    print(f"  Found {n_samples} samples in {split} split", flush=True)
+
+    # Pre-allocate arrays
+    images = np.empty((n_samples, img_size, img_size, 3), dtype=np.uint8)
+    coords = np.zeros((n_samples, 8), dtype=np.float32)
+    has_doc = np.zeros(n_samples, dtype=np.float32)
+
+    def process_row(args):
+        """Process a single row from parquet."""
+        idx, row = args
+
+        # Decode image
+        img = Image.open(io.BytesIO(row["image_bytes"]))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # Resize
+        img = img.resize((img_size, img_size), Image.BILINEAR)
+        img_array = np.asarray(img, dtype=np.uint8).copy()
+
+        # Get coordinates
+        is_negative = row.get("is_negative", False)
+        if is_negative or row.get("corner_tl_x") is None:
+            sample_coords = np.zeros(8, dtype=np.float32)
+            sample_has_doc = 0.0
+        else:
+            sample_coords = np.array([
+                row["corner_tl_x"], row["corner_tl_y"],
+                row["corner_tr_x"], row["corner_tr_y"],
+                row["corner_br_x"], row["corner_br_y"],
+                row["corner_bl_x"], row["corner_bl_y"],
+            ], dtype=np.float32)
+            sample_has_doc = 1.0
+
+        return idx, img_array, sample_coords, sample_has_doc
+
+    # Process samples in parallel
+    print(f"  Processing {n_samples} samples with {num_workers} workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for idx, img_array, sample_coords, sample_has_doc in tqdm(
+            executor.map(process_row, enumerate(all_rows)),
+            total=n_samples,
+            desc=f"Loading {split}",
+            unit="img",
+        ):
+            images[idx] = img_array
+            coords[idx] = sample_coords
+            has_doc[idx] = sample_has_doc
+
+    # Free memory
+    del all_rows
+    gc.collect()
+
+    load_time = time.time() - start_time
+    n_positive = int(has_doc.sum())
+    n_negative = n_samples - n_positive
+    mem_gb = images.nbytes / 1e9
+
+    print(f"  Loaded {n_samples} images ({mem_gb:.2f} GB) in {load_time:.1f}s", flush=True)
+    print(f"  Positive: {n_positive}, Negative: {n_negative}", flush=True)
+    print(f"  Speed: {n_samples / load_time:.0f} img/s", flush=True)
+
+    return images, coords, has_doc
+
+
+def load_hf_dataset_to_numpy(hf_dataset: str, split: str, img_size: int, num_workers: int = 64):
+    """
+    Load dataset from HuggingFace (Hub or local Parquet files).
+
+    Args:
+        hf_dataset: HuggingFace dataset name (e.g., 'mapo80/DocCornerDataset')
+                    or path to local Parquet directory (e.g., './hf_dataset')
+        split: Split name ('train', 'validation', 'test')
+        img_size: Target image size
+        num_workers: Number of workers for parallel processing
+
+    Returns:
+        images: np.ndarray [N, H, W, 3] uint8
+        coords: np.ndarray [N, 8] float32
+        has_doc: np.ndarray [N] float32
+    """
+    # Check if this is a local directory - use direct parquet loading (no caching)
+    hf_path = Path(hf_dataset)
+    if hf_path.exists() and hf_path.is_dir():
+        return load_dataset_from_parquet(str(hf_path), split, img_size, num_workers)
+
+    # HuggingFace Hub - use datasets library
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError(
+            "HuggingFace datasets library not installed. "
+            "Install with: pip install datasets"
+        )
+
+    print(f"Loading {split} from HuggingFace Hub: {hf_dataset}", flush=True)
+    start_time = time.time()
+
+    hf_ds = load_dataset(hf_dataset, split=split)
+
+    n_samples = len(hf_ds)
+    print(f"  Found {n_samples} samples in {split} split", flush=True)
+
+    # Pre-allocate arrays
+    images = np.empty((n_samples, img_size, img_size, 3), dtype=np.uint8)
+    coords = np.zeros((n_samples, 8), dtype=np.float32)
+    has_doc = np.zeros(n_samples, dtype=np.float32)
+
+    def process_sample(idx):
+        """Process a single sample from HF dataset."""
+        sample = hf_ds[idx]
+        img = sample["image"]
+
+        # Convert to RGB if necessary
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # Resize
+        img = img.resize((img_size, img_size), Image.BILINEAR)
+        img_array = np.asarray(img, dtype=np.uint8).copy()
+
+        # Get coordinates
+        is_negative = sample.get("is_negative", False)
+        if is_negative or sample.get("corner_tl_x") is None:
+            sample_coords = np.zeros(8, dtype=np.float32)
+            sample_has_doc = 0.0
+        else:
+            sample_coords = np.array([
+                sample["corner_tl_x"], sample["corner_tl_y"],
+                sample["corner_tr_x"], sample["corner_tr_y"],
+                sample["corner_br_x"], sample["corner_br_y"],
+                sample["corner_bl_x"], sample["corner_bl_y"],
+            ], dtype=np.float32)
+            sample_has_doc = 1.0
+
+        return idx, img_array, sample_coords, sample_has_doc
+
+    # Process samples in parallel
+    print(f"  Processing {n_samples} samples with {num_workers} workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for idx, img_array, sample_coords, sample_has_doc in tqdm(
+            executor.map(process_sample, range(n_samples)),
+            total=n_samples,
+            desc=f"Loading {split}",
+            unit="img",
+        ):
+            images[idx] = img_array
+            coords[idx] = sample_coords
+            has_doc[idx] = sample_has_doc
+
+    load_time = time.time() - start_time
+    n_positive = int(has_doc.sum())
+    n_negative = n_samples - n_positive
+    mem_gb = images.nbytes / 1e9
+
+    print(f"  Loaded {n_samples} images ({mem_gb:.2f} GB) in {load_time:.1f}s", flush=True)
+    print(f"  Positive: {n_positive}, Negative: {n_negative}", flush=True)
+    print(f"  Speed: {n_samples / load_time:.0f} img/s", flush=True)
 
     return images, coords, has_doc
 
@@ -575,10 +968,22 @@ def main():
     parser = argparse.ArgumentParser(description="Ultra-optimized cross-platform training")
 
     # Data
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Root directory with images/, labels/, split files")
+    parser.add_argument("--hf_dataset", type=str, default=None,
+                        help="HuggingFace dataset name (e.g., 'mapo80/DocCornerDataset') "
+                             "or path to local Parquet directory")
+    parser.add_argument("--download_hf", type=str, default=None,
+                        help="Download HuggingFace dataset to this directory and exit. "
+                             "Use with --hf_dataset to specify the dataset name.")
+    parser.add_argument("--hf_token", type=str, default=None,
+                        help="HuggingFace API token for private datasets. "
+                             "Can also be set via HF_TOKEN environment variable.")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory for checkpoints (required unless --download_hf)")
     parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--val_split", type=str, default="val")
+    parser.add_argument("--val_split", type=str, default="validation",
+                        help="Validation split name (default: 'validation' for HF, 'val' for local)")
     parser.add_argument("--experiment_name", type=str, default=None)
 
     # Model
@@ -637,6 +1042,26 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle download mode
+    if args.download_hf:
+        if not args.hf_dataset:
+            parser.error("--download_hf requires --hf_dataset to specify the dataset name")
+        download_hf_dataset(args.hf_dataset, args.download_hf, hf_token=args.hf_token)
+        return
+
+    # Validate data source arguments
+    if args.data_root is None and args.hf_dataset is None:
+        parser.error("Either --data_root or --hf_dataset must be specified")
+    if args.data_root is not None and args.hf_dataset is not None:
+        parser.error("Cannot specify both --data_root and --hf_dataset")
+    if args.output_dir is None:
+        parser.error("--output_dir is required for training")
+
+    # Auto-detect val_split name for local datasets
+    if args.data_root is not None and args.val_split == "validation":
+        # Local datasets typically use 'val' instead of 'validation'
+        args.val_split = "val"
+
     # Setup platform
     platform = setup_platform()
     use_mixed_precision = platform == 'cuda'
@@ -664,12 +1089,24 @@ def main():
     print("Loading datasets...", flush=True)
     print("=" * 80, flush=True)
 
-    train_images, train_coords, train_has_doc = load_dataset_fast(
-        args.data_root, args.train_split, args.img_size, args.num_workers
-    )
-    val_images, val_coords, val_has_doc = load_dataset_fast(
-        args.data_root, args.val_split, args.img_size, args.num_workers
-    )
+    if args.hf_dataset:
+        # Load from HuggingFace (Hub or local Parquet)
+        print(f"Data source: HuggingFace ({args.hf_dataset})", flush=True)
+        train_images, train_coords, train_has_doc = load_hf_dataset_to_numpy(
+            args.hf_dataset, args.train_split, args.img_size, args.num_workers
+        )
+        val_images, val_coords, val_has_doc = load_hf_dataset_to_numpy(
+            args.hf_dataset, args.val_split, args.img_size, args.num_workers
+        )
+    else:
+        # Load from local directory
+        print(f"Data source: Local ({args.data_root})", flush=True)
+        train_images, train_coords, train_has_doc = load_dataset_fast(
+            args.data_root, args.train_split, args.img_size, args.num_workers
+        )
+        val_images, val_coords, val_has_doc = load_dataset_fast(
+            args.data_root, args.val_split, args.img_size, args.num_workers
+        )
 
     # ========================================================================
     # Create tf.data datasets
