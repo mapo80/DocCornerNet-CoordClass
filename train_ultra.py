@@ -285,7 +285,10 @@ def load_dataset_fast(data_root, split, img_size, num_workers=64):
 
 def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, hf_token: str = None):
     """
-    Download a HuggingFace dataset and save as local Parquet files.
+    Download a HuggingFace dataset directly as Parquet files (no processing/caching).
+
+    Uses huggingface_hub to download raw parquet files directly, avoiding the
+    datasets library which creates a large cache.
 
     Args:
         hf_dataset: HuggingFace dataset name (e.g., 'mapo80/DocCornerDataset')
@@ -294,19 +297,16 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
         hf_token: HuggingFace API token (optional, for private datasets)
     """
     try:
-        from datasets import load_dataset
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError:
         raise ImportError(
-            "HuggingFace datasets library not installed. "
-            "Install with: pip install datasets"
+            "huggingface_hub library not installed. "
+            "Install with: pip install huggingface_hub"
         )
 
     # Get token from argument, environment, or HF CLI login
     if hf_token is None:
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
 
     if splits is None:
         splits = ["train", "validation", "test"]
@@ -317,7 +317,19 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
     print(f"Downloading dataset from HuggingFace: {hf_dataset}", flush=True)
     print(f"Output directory: {output_path}", flush=True)
 
-    # Map split names to directory names
+    api = HfApi()
+
+    # List all files in the dataset repo
+    try:
+        files = api.list_repo_files(repo_id=hf_dataset, repo_type="dataset", token=hf_token)
+    except Exception as e:
+        raise RuntimeError(f"Could not list files in {hf_dataset}: {e}")
+
+    # Filter parquet files and group by split
+    parquet_files = [f for f in files if f.endswith(".parquet")]
+    print(f"Found {len(parquet_files)} parquet files in repository", flush=True)
+
+    # Map split names for output directories
     split_dir_map = {
         "validation": "val",
         "val": "val",
@@ -326,90 +338,50 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
     }
 
     for split in splits:
-        print(f"\nDownloading {split} split...", flush=True)
-        try:
-            dataset = load_dataset(hf_dataset, split=split, token=hf_token)
-        except Exception as e:
-            print(f"  Warning: Could not load split '{split}': {e}", flush=True)
+        # Find parquet files for this split (check various patterns)
+        split_files = [
+            f for f in parquet_files
+            if f"/{split}/" in f or f.startswith(f"{split}/") or f"/{split}-" in f or f.startswith(f"{split}-")
+        ]
+
+        if not split_files:
+            print(f"\nNo parquet files found for split '{split}', skipping...", flush=True)
             continue
 
-        n_samples = len(dataset)
-        print(f"  Found {n_samples} samples", flush=True)
+        print(f"\nDownloading {split} split ({len(split_files)} files)...", flush=True)
 
         # Create split directory
         split_dir = split_dir_map.get(split, split)
         split_path = output_path / split_dir
         split_path.mkdir(parents=True, exist_ok=True)
 
-        # Define schema
-        schema = pa.schema([
-            ("image", pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
-            ("filename", pa.string()),
-            ("is_negative", pa.bool_()),
-            ("corner_tl_x", pa.float32()),
-            ("corner_tl_y", pa.float32()),
-            ("corner_tr_x", pa.float32()),
-            ("corner_tr_y", pa.float32()),
-            ("corner_br_x", pa.float32()),
-            ("corner_br_y", pa.float32()),
-            ("corner_bl_x", pa.float32()),
-            ("corner_bl_y", pa.float32()),
-        ])
+        # Download each file
+        for file_path in tqdm(split_files, desc=f"Downloading {split}", unit="file"):
+            # Download to local cache and get path
+            local_file = hf_hub_download(
+                repo_id=hf_dataset,
+                filename=file_path,
+                repo_type="dataset",
+                token=hf_token,
+                local_dir=str(output_path),
+                local_dir_use_symlinks=False,
+            )
 
-        # Process in batches
-        rows_per_file = 1000
-        rows = []
-        file_idx = 0
+        # Move files from nested structure to split directory if needed
+        # huggingface_hub downloads to output_path/split/filename.parquet
+        downloaded_split_path = output_path / split
+        if downloaded_split_path.exists() and downloaded_split_path != split_path:
+            # Move files from downloaded location to our standard location
+            for pf in downloaded_split_path.glob("*.parquet"):
+                dest = split_path / pf.name
+                if not dest.exists():
+                    shutil.move(str(pf), str(dest))
+            # Remove empty directory
+            if downloaded_split_path.exists() and not list(downloaded_split_path.iterdir()):
+                downloaded_split_path.rmdir()
 
-        for i in tqdm(range(n_samples), desc=f"Processing {split}", unit="img"):
-            sample = dataset[i]
-            img = sample["image"]
-
-            # Convert image to bytes
-            import io
-            buffer = io.BytesIO()
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(buffer, format="JPEG", quality=95)
-            img_bytes = buffer.getvalue()
-
-            # Get filename
-            filename = sample.get("filename", f"{split}_{i:06d}.jpg")
-
-            # Get coordinates
-            is_negative = sample.get("is_negative", False)
-
-            row = {
-                "image": {"bytes": img_bytes, "path": filename},
-                "filename": filename,
-                "is_negative": is_negative,
-                "corner_tl_x": sample.get("corner_tl_x"),
-                "corner_tl_y": sample.get("corner_tl_y"),
-                "corner_tr_x": sample.get("corner_tr_x"),
-                "corner_tr_y": sample.get("corner_tr_y"),
-                "corner_br_x": sample.get("corner_br_x"),
-                "corner_br_y": sample.get("corner_br_y"),
-                "corner_bl_x": sample.get("corner_bl_x"),
-                "corner_bl_y": sample.get("corner_bl_y"),
-            }
-            rows.append(row)
-
-            # Write batch
-            if len(rows) >= rows_per_file:
-                table = pa.Table.from_pylist(rows, schema=schema)
-                output_file = split_path / f"data-{file_idx:05d}.parquet"
-                pq.write_table(table, output_file, compression="snappy")
-                file_idx += 1
-                rows = []
-
-        # Write remaining rows
-        if rows:
-            table = pa.Table.from_pylist(rows, schema=schema)
-            output_file = split_path / f"data-{file_idx:05d}.parquet"
-            pq.write_table(table, output_file, compression="snappy")
-            file_idx += 1
-
-        print(f"  Saved {n_samples} samples to {split_path} ({file_idx} files)", flush=True)
+        n_files = len(list(split_path.glob("*.parquet")))
+        print(f"  Saved {n_files} parquet files to {split_path}", flush=True)
 
     print(f"\nDataset downloaded successfully to {output_path}", flush=True)
     print(f"You can now use: --hf_dataset {output_path}", flush=True)
