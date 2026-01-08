@@ -1,3 +1,6 @@
+# Archive (obsolete scripts and checkpoints)
+_archive/
+
 # Checkpoints & Models (allow pretrained models)
 !checkpoints/best_model.keras
 !checkpoints/best_model.weights.h5

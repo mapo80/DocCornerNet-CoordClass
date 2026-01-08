@@ -1,5 +1,8 @@
 tensorflow>=2.10
 numpy
-shapely
-tqdm
 pillow
+tqdm
+opencv-python-headless
+shapely
+huggingface_hub
+pyarrow
