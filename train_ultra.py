@@ -562,10 +562,19 @@ def load_hf_dataset_to_numpy(hf_dataset: str, split: str, img_size: int, num_wor
         coords: np.ndarray [N, 8] float32
         has_doc: np.ndarray [N] float32
     """
-    # Check if this is a local directory - use direct parquet loading (no caching)
-    hf_path = Path(hf_dataset)
-    if hf_path.exists() and hf_path.is_dir():
-        return load_dataset_from_parquet(str(hf_path), split, img_size, num_workers)
+    # Check if this looks like a local path (contains / or \, or starts with .)
+    is_local_path = "/" in hf_dataset or "\\" in hf_dataset or hf_dataset.startswith(".")
+
+    if is_local_path:
+        hf_path = Path(hf_dataset)
+        if hf_path.exists() and hf_path.is_dir():
+            return load_dataset_from_parquet(str(hf_path), split, img_size, num_workers)
+        else:
+            raise FileNotFoundError(
+                f"Local dataset directory not found: {hf_path.absolute()}\n"
+                f"Please download the dataset first with:\n"
+                f"  python train_ultra.py --hf_dataset mapo80/DocCornerDataset --download_hf {hf_dataset}"
+            )
 
     # HuggingFace Hub - use datasets library
     try:
