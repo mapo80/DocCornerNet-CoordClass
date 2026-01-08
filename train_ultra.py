@@ -443,13 +443,31 @@ def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_w
         "test": "test",
     }
     split_dir = split_dir_map.get(split, split)
-    split_path = parquet_path / split_dir
 
-    if not split_path.exists():
-        # Try the original split name
-        split_path = parquet_path / split
-        if not split_path.exists():
-            raise FileNotFoundError(f"Split directory not found: {parquet_path / split_dir} or {parquet_path / split}")
+    # Try multiple possible locations for split data
+    possible_paths = [
+        parquet_path / split_dir,           # e.g., ./hf_dataset/train/
+        parquet_path / split,               # e.g., ./hf_dataset/validation/
+        parquet_path / "data" / split_dir,  # e.g., ./hf_dataset/data/train/
+        parquet_path / "data" / split,      # e.g., ./hf_dataset/data/validation/
+        parquet_path,                       # e.g., ./hf_dataset/ (parquet files in root)
+    ]
+
+    split_path = None
+    for p in possible_paths:
+        if p.exists():
+            # Check if it has parquet files (either directly or we'll check later)
+            if p.is_dir():
+                split_path = p
+                break
+
+    if split_path is None:
+        raise FileNotFoundError(
+            f"Split directory not found. Tried:\n" +
+            "\n".join(f"  - {p}" for p in possible_paths) +
+            f"\n\nContents of {parquet_path}:\n" +
+            "\n".join(f"  - {x.name}" for x in parquet_path.iterdir()) if parquet_path.exists() else "  (directory doesn't exist)"
+        )
 
     print(f"Loading {split} from local Parquet: {split_path}", flush=True)
     start_time = time.time()
