@@ -647,88 +647,102 @@ class SimCCDecode(layers.Layer):
 @register_keras_serializable(package="doccorner")
 class CornerGAU(layers.Layer):
     """
-    Gated Attention Unit for corner relationship modeling (RTMPose-inspired).
+    Lightweight Gated Attention Unit for corner relationship modeling.
 
-    Applies self-attention between the 4 corner keypoint representations to model
-    their geometric correlations (e.g., if TL moves, TR/BL/BR are influenced).
+    Operates on SimCC logits [B, 4, num_bins] AFTER they are computed.
+    Models geometric correlations between the 4 corners using a tiny 4×4
+    self-attention matrix (only 16 attention weights).
 
-    Input: [B, 4, C] - 4 corner token representations
-    Output: [B, 4, C] - refined corner representations
+    Architecture (FAST):
+        simcc_x [B, 4, num_bins] + simcc_y [B, 4, num_bins]
+            ↓
+        Mean over bins → corner_x [B, 4, 1], corner_y [B, 4, 1]
+            ↓
+        Concat → corner_repr [B, 4, 2]
+            ↓
+        Self-attention 4×4 (tiny!)
+            ↓
+        Project to refinement deltas [B, 4, num_bins] per axis
+            ↓
+        Gated residual on original logits
 
-    Architecture:
-        Input [B, 4, C]
-            ↓
-        FC projection → [B, 4, hidden_dim]
-            ↓
-        Single-head self-attention (4x4 attention matrix)
-            ↓
-        FC output projection → [B, 4, C]
-            ↓
-        Gated residual: output = input + gate * attention_output
+    XNNPACK-friendly: uses only Dense, matmul, softmax (all delegable).
     """
 
-    def __init__(self, hidden_dim: int = 64, **kwargs):
+    def __init__(self, hidden_dim: int = 32, num_bins: int = 256, **kwargs):
         super().__init__(**kwargs)
         self.hidden_dim = int(hidden_dim)
-        self._in_channels = None
+        self.num_bins = int(num_bins)
         self._scale = None
 
     def build(self, input_shape):
-        if len(input_shape) != 3:
-            raise ValueError(f"CornerGAU expects rank-3 input [B, 4, C], got shape={input_shape}")
-        num_tokens = input_shape[1]
-        channels = input_shape[2]
-        if num_tokens is None or channels is None:
-            raise ValueError("CornerGAU requires static dimensions for TFLite compatibility.")
-        if num_tokens != 4:
-            raise ValueError(f"CornerGAU expects 4 corner tokens, got {num_tokens}")
+        # Input is a list: [simcc_x, simcc_y], each [B, 4, num_bins]
+        if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 2:
+            raise ValueError(f"CornerGAU expects [simcc_x, simcc_y] inputs, got {input_shape}")
 
-        self._in_channels = int(channels)
         self._scale = 1.0 / np.sqrt(float(self.hidden_dim))
 
-        # Query, Key, Value projections
+        # Q, K, V projections from corner representation [B, 4, 2] -> [B, 4, hidden_dim]
         self.q_proj = layers.Dense(self.hidden_dim, use_bias=True, name="q_proj")
         self.k_proj = layers.Dense(self.hidden_dim, use_bias=True, name="k_proj")
         self.v_proj = layers.Dense(self.hidden_dim, use_bias=True, name="v_proj")
 
-        # Output projection back to input channels
-        self.out_proj = layers.Dense(self._in_channels, use_bias=True, name="out_proj")
+        # Output projections: attention output -> logit refinement per axis
+        # [B, 4, hidden_dim] -> [B, 4, num_bins]
+        self.out_x = layers.Dense(self.num_bins, use_bias=True, name="out_x")
+        self.out_y = layers.Dense(self.num_bins, use_bias=True, name="out_y")
 
-        # Gate for gated residual connection
-        self.gate_proj = layers.Dense(self._in_channels, activation="sigmoid", name="gate")
+        # Gates for residual connection (per corner, scalar gate)
+        self.gate_x = layers.Dense(1, activation="sigmoid", name="gate_x")
+        self.gate_y = layers.Dense(1, activation="sigmoid", name="gate_y")
 
         super().build(input_shape)
 
     def call(self, inputs):
-        # inputs: [B, 4, C]
-        if self._in_channels is None or self._scale is None:
-            raise RuntimeError("CornerGAU is not built.")
+        # inputs: [simcc_x, simcc_y], each [B, 4, num_bins]
+        simcc_x, simcc_y = inputs
 
-        # Project to Q, K, V
-        Q = self.q_proj(inputs)  # [B, 4, hidden_dim]
-        K = self.k_proj(inputs)  # [B, 4, hidden_dim]
-        V = self.v_proj(inputs)  # [B, 4, hidden_dim]
+        # Step 1: Compress logits to corner representations via soft-argmax style
+        # Mean over bins gives expected position (simpler than full soft-argmax)
+        # [B, 4, num_bins] -> [B, 4, 1]
+        corner_x = tf.reduce_mean(simcc_x, axis=-1, keepdims=True)  # [B, 4, 1]
+        corner_y = tf.reduce_mean(simcc_y, axis=-1, keepdims=True)  # [B, 4, 1]
 
-        # Self-attention: Q @ K^T / sqrt(d) -> softmax -> @ V
-        # [B, 4, hidden_dim] @ [B, hidden_dim, 4] -> [B, 4, 4]
+        # Step 2: Concat X+Y to get corner representation [B, 4, 2]
+        corner_repr = tf.concat([corner_x, corner_y], axis=-1)  # [B, 4, 2]
+
+        # Step 3: Self-attention over 4 corners (4×4 attention matrix = 16 elements!)
+        Q = self.q_proj(corner_repr)  # [B, 4, hidden_dim]
+        K = self.k_proj(corner_repr)  # [B, 4, hidden_dim]
+        V = self.v_proj(corner_repr)  # [B, 4, hidden_dim]
+
+        # Attention: [B, 4, hidden_dim] @ [B, hidden_dim, 4] -> [B, 4, 4]
         attn_scores = tf.matmul(Q, K, transpose_b=True) * self._scale
         attn_weights = tf.nn.softmax(attn_scores, axis=-1)  # [B, 4, 4]
 
         # [B, 4, 4] @ [B, 4, hidden_dim] -> [B, 4, hidden_dim]
         attn_out = tf.matmul(attn_weights, V)
 
-        # Project back to input dimension
-        attn_out = self.out_proj(attn_out)  # [B, 4, C]
+        # Step 4: Project attention output to logit refinement
+        delta_x = self.out_x(attn_out)  # [B, 4, num_bins]
+        delta_y = self.out_y(attn_out)  # [B, 4, num_bins]
 
-        # Gated residual: output = input + gate * attention_output
-        gate = self.gate_proj(inputs)  # [B, 4, C] with sigmoid activation
-        output = inputs + gate * attn_out
+        # Step 5: Gated residual (gate per corner, broadcast over bins)
+        gate_x = self.gate_x(attn_out)  # [B, 4, 1]
+        gate_y = self.gate_y(attn_out)  # [B, 4, 1]
 
-        return output
+        # output = original + gate * delta
+        refined_x = simcc_x + gate_x * delta_x
+        refined_y = simcc_y + gate_y * delta_y
+
+        return refined_x, refined_y
 
     def get_config(self):
         config = super().get_config()
-        config.update({"hidden_dim": self.hidden_dim})
+        config.update({
+            "hidden_dim": self.hidden_dim,
+            "num_bins": self.num_bins,
+        })
         return config
 
 
@@ -1045,60 +1059,6 @@ def build_doccorner_simcc_v3(
         y_feat = layers.Dense(fc_expansion_dim, name="simcc_y_expand")(y_feat)
         y_feat = layers.ReLU(name="simcc_y_expand_relu")(y_feat)
 
-    # =========================================================================
-    # GAU (RTMPose-inspired): model corner relationships via self-attention
-    # =========================================================================
-    if use_gau:
-        # Save originals for residual connection
-        x_feat_orig = x_feat
-        y_feat_orig = y_feat
-
-        # Get the current feature dimension (static)
-        feat_dim = int(x_feat.shape[-1])
-
-        # Global average pooling over bins: [B, num_bins, ch] -> [B, ch]
-        x_gap = layers.GlobalAveragePooling1D(name="gau_x_gap")(x_feat)
-        y_gap = layers.GlobalAveragePooling1D(name="gau_y_gap")(y_feat)
-
-        # Project to 4 corner representations each: [B, ch] -> [B, 4*ch] -> reshape [B, 4, ch]
-        x_corners = layers.Dense(4 * feat_dim, name="gau_x_corner_proj")(x_gap)
-        x_corners = layers.Reshape((4, feat_dim), name="gau_x_reshape")(x_corners)
-        y_corners = layers.Dense(4 * feat_dim, name="gau_y_corner_proj")(y_gap)
-        y_corners = layers.Reshape((4, feat_dim), name="gau_y_reshape")(y_corners)
-
-        # Combine X and Y corner representations for joint attention: [B, 4, 2*ch]
-        corners_combined = layers.Concatenate(axis=-1, name="gau_corners_cat")([x_corners, y_corners])
-
-        # Apply GAU for corner relationship modeling
-        corners_refined = CornerGAU(hidden_dim=gau_hidden_dim, name="corner_gau")(corners_combined)
-
-        # Split back to X and Y using Lambda with slicing
-        x_corners_refined = layers.Lambda(
-            lambda t: t[:, :, :feat_dim], name="gau_x_split"
-        )(corners_refined)
-        y_corners_refined = layers.Lambda(
-            lambda t: t[:, :, feat_dim:], name="gau_y_split"
-        )(corners_refined)
-
-        # Average over corners: [B, 4, ch] -> [B, ch]
-        x_corner_avg = layers.GlobalAveragePooling1D(name="gau_x_corner_avg")(x_corners_refined)
-        y_corner_avg = layers.GlobalAveragePooling1D(name="gau_y_corner_avg")(y_corners_refined)
-
-        # Project to modulation weights (sigmoid for gating)
-        x_mod = layers.Dense(feat_dim, activation="sigmoid", name="gau_x_mod")(x_corner_avg)
-        y_mod = layers.Dense(feat_dim, activation="sigmoid", name="gau_y_mod")(y_corner_avg)
-
-        # Expand dims for broadcasting: [B, ch] -> [B, 1, ch]
-        x_mod = layers.Reshape((1, feat_dim), name="gau_x_mod_reshape")(x_mod)
-        y_mod = layers.Reshape((1, feat_dim), name="gau_y_mod_reshape")(y_mod)
-
-        # Apply gated modulation: x_feat = x_feat_orig + x_feat_orig * x_mod
-        # First compute x_feat_orig * x_mod, then add to original
-        x_modulated = layers.Multiply(name="gau_x_apply")([x_feat_orig, x_mod])
-        x_feat = layers.Add(name="gau_x_residual")([x_feat_orig, x_modulated])
-        y_modulated = layers.Multiply(name="gau_y_apply")([y_feat_orig, y_mod])
-        y_feat = layers.Add(name="gau_y_residual")([y_feat_orig, y_modulated])
-
     # Output heads: 4 corners for each axis
     # [B, num_bins, simcc_ch] -> [B, num_bins, 4]
     simcc_x = conv1d_layer(
@@ -1128,6 +1088,31 @@ def build_doccorner_simcc_v3(
         pass
     else:
         raise ValueError(f"Unsupported simcc_output_layout='{simcc_output_layout}'")
+
+    # =========================================================================
+    # GAU (Lightweight): model corner relationships via self-attention on logits
+    # Operates AFTER logits are computed, with tiny 4×4 attention matrix
+    # =========================================================================
+    if use_gau:
+        # GAU expects [B, 4, num_bins] layout (corners_first)
+        if simcc_layout in {"corners_first", "corner_first", "channels_first", "first"}:
+            # Already in correct layout
+            simcc_x, simcc_y = CornerGAU(
+                hidden_dim=gau_hidden_dim,
+                num_bins=num_bins,
+                name="corner_gau"
+            )([simcc_x, simcc_y])
+        else:
+            # Need to transpose for GAU, then transpose back
+            simcc_x_t = layers.Permute((2, 1), name="gau_x_transpose_in")(simcc_x)  # [B, 4, num_bins]
+            simcc_y_t = layers.Permute((2, 1), name="gau_y_transpose_in")(simcc_y)
+            simcc_x_t, simcc_y_t = CornerGAU(
+                hidden_dim=gau_hidden_dim,
+                num_bins=num_bins,
+                name="corner_gau"
+            )([simcc_x_t, simcc_y_t])
+            simcc_x = layers.Permute((2, 1), name="gau_x_transpose_out")(simcc_x_t)  # [B, num_bins, 4]
+            simcc_y = layers.Permute((2, 1), name="gau_y_transpose_out")(simcc_y_t)
 
     coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])
 
