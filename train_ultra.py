@@ -1348,11 +1348,13 @@ def main():
             total=len(train_ds),
             desc="  Train",
             unit="batch",
-            ncols=100,
+            ncols=120,
             leave=True,
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
             ascii=True,
         )
+        batch_start_time = time.time()
+        imgs_processed = 0
         for batch_idx, (images, coords, has_doc) in enumerate(train_pbar):
             if args.augment:
                 images, coords = trainer.augment_batch(images, coords, has_doc)
@@ -1378,10 +1380,17 @@ def main():
             train_score.append(float(loss_score))
             train_iou.append(float(batch_iou))
             train_err.append(float(batch_err))
+
+            # Calculate img/s
+            imgs_processed += images.shape[0]
+            elapsed = time.time() - batch_start_time
+            imgs_per_sec = imgs_processed / elapsed if elapsed > 0 else 0
+
             train_pbar.set_postfix({
                 "loss": f"{np.mean(train_losses):.4f}",
                 "err": f"{np.mean(train_err):.1f}px",
                 "iou": f"{np.mean(train_iou):.3f}",
+                "img/s": f"{imgs_per_sec:.0f}",
             })
 
         # Apply any remaining accumulated gradients at end of epoch
@@ -1406,11 +1415,13 @@ def main():
             total=len(val_ds),
             desc="  Val  ",
             unit="batch",
-            ncols=100,
+            ncols=120,
             leave=True,
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
             ascii=True,
         )
+        val_start_time = time.time()
+        val_imgs_processed = 0
         for images, coords, has_doc in val_pbar:
             preds, score_logit, v_loss, v_simcc, v_coord, v_score = trainer.val_step(
                 images, coords, has_doc
@@ -1421,8 +1432,15 @@ def main():
             val_score.append(float(v_score))
             score_pred = tf.sigmoid(score_logit).numpy()
             metrics.update(preds.numpy(), coords.numpy(), score_pred, has_doc.numpy())
+
+            # Calculate img/s
+            val_imgs_processed += images.shape[0]
+            val_elapsed = time.time() - val_start_time
+            val_imgs_per_sec = val_imgs_processed / val_elapsed if val_elapsed > 0 else 0
+
             val_pbar.set_postfix({
                 "loss": f"{np.mean(val_losses):.4f}",
+                "img/s": f"{val_imgs_per_sec:.0f}",
             })
 
         val_metrics = metrics.compute()

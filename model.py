@@ -647,13 +647,17 @@ class SimCCDecode(layers.Layer):
 @register_keras_serializable(package="doccorner")
 class CornerGAU(layers.Layer):
     """
-    Lightweight Gated Attention Unit for corner relationship modeling.
+    Ultra-lightweight Gated Attention Unit for corner relationship modeling.
 
     Operates on SimCC logits [B, 4, num_bins] AFTER they are computed.
     Models geometric correlations between the 4 corners using a tiny 4×4
     self-attention matrix (only 16 attention weights).
 
-    Architecture (FAST):
+    Key optimization: Instead of projecting to num_bins (expensive), we only
+    output a per-corner SCALE and BIAS that modulates the original logits.
+    This reduces params from ~20K to ~500 while maintaining expressiveness.
+
+    Architecture (ULTRA-FAST):
         simcc_x [B, 4, num_bins] + simcc_y [B, 4, num_bins]
             ↓
         Mean over bins → corner_x [B, 4, 1], corner_y [B, 4, 1]
@@ -662,17 +666,16 @@ class CornerGAU(layers.Layer):
             ↓
         Self-attention 4×4 (tiny!)
             ↓
-        Project to refinement deltas [B, 4, num_bins] per axis
+        Output: scale [B, 4, 1] + bias [B, 4, 1] per axis
             ↓
-        Gated residual on original logits
+        refined = original * scale + bias  (broadcast over bins)
 
-    XNNPACK-friendly: uses only Dense, matmul, softmax (all delegable).
+    Only ~500 params total. XNNPACK-friendly.
     """
 
-    def __init__(self, hidden_dim: int = 32, num_bins: int = 256, **kwargs):
+    def __init__(self, hidden_dim: int = 32, **kwargs):
         super().__init__(**kwargs)
         self.hidden_dim = int(hidden_dim)
-        self.num_bins = int(num_bins)
         self._scale = None
 
     def build(self, input_shape):
@@ -687,14 +690,10 @@ class CornerGAU(layers.Layer):
         self.k_proj = layers.Dense(self.hidden_dim, use_bias=True, name="k_proj")
         self.v_proj = layers.Dense(self.hidden_dim, use_bias=True, name="v_proj")
 
-        # Output projections: attention output -> logit refinement per axis
-        # [B, 4, hidden_dim] -> [B, 4, num_bins]
-        self.out_x = layers.Dense(self.num_bins, use_bias=True, name="out_x")
-        self.out_y = layers.Dense(self.num_bins, use_bias=True, name="out_y")
-
-        # Gates for residual connection (per corner, scalar gate)
-        self.gate_x = layers.Dense(1, activation="sigmoid", name="gate_x")
-        self.gate_y = layers.Dense(1, activation="sigmoid", name="gate_y")
+        # Output: per-corner scale and bias (NOT per-bin!)
+        # [B, 4, hidden_dim] -> [B, 4, 2] (scale, bias) per axis
+        self.out_x = layers.Dense(2, use_bias=True, name="out_x")  # scale + bias
+        self.out_y = layers.Dense(2, use_bias=True, name="out_y")  # scale + bias
 
         super().build(input_shape)
 
@@ -702,8 +701,7 @@ class CornerGAU(layers.Layer):
         # inputs: [simcc_x, simcc_y], each [B, 4, num_bins]
         simcc_x, simcc_y = inputs
 
-        # Step 1: Compress logits to corner representations via soft-argmax style
-        # Mean over bins gives expected position (simpler than full soft-argmax)
+        # Step 1: Compress logits to corner representations
         # [B, 4, num_bins] -> [B, 4, 1]
         corner_x = tf.reduce_mean(simcc_x, axis=-1, keepdims=True)  # [B, 4, 1]
         corner_y = tf.reduce_mean(simcc_y, axis=-1, keepdims=True)  # [B, 4, 1]
@@ -723,17 +721,19 @@ class CornerGAU(layers.Layer):
         # [B, 4, 4] @ [B, 4, hidden_dim] -> [B, 4, hidden_dim]
         attn_out = tf.matmul(attn_weights, V)
 
-        # Step 4: Project attention output to logit refinement
-        delta_x = self.out_x(attn_out)  # [B, 4, num_bins]
-        delta_y = self.out_y(attn_out)  # [B, 4, num_bins]
+        # Step 4: Output per-corner scale and bias
+        out_x = self.out_x(attn_out)  # [B, 4, 2]
+        out_y = self.out_y(attn_out)  # [B, 4, 2]
 
-        # Step 5: Gated residual (gate per corner, broadcast over bins)
-        gate_x = self.gate_x(attn_out)  # [B, 4, 1]
-        gate_y = self.gate_y(attn_out)  # [B, 4, 1]
+        # Split into scale (sigmoid for [0,2] range centered at 1) and bias
+        scale_x = 1.0 + tf.nn.tanh(out_x[:, :, 0:1])  # [B, 4, 1], range [0, 2]
+        bias_x = out_x[:, :, 1:2]  # [B, 4, 1]
+        scale_y = 1.0 + tf.nn.tanh(out_y[:, :, 0:1])  # [B, 4, 1], range [0, 2]
+        bias_y = out_y[:, :, 1:2]  # [B, 4, 1]
 
-        # output = original + gate * delta
-        refined_x = simcc_x + gate_x * delta_x
-        refined_y = simcc_y + gate_y * delta_y
+        # Step 5: Apply scale and bias (broadcast over bins)
+        refined_x = simcc_x * scale_x + bias_x
+        refined_y = simcc_y * scale_y + bias_y
 
         return refined_x, refined_y
 
@@ -741,7 +741,6 @@ class CornerGAU(layers.Layer):
         config = super().get_config()
         config.update({
             "hidden_dim": self.hidden_dim,
-            "num_bins": self.num_bins,
         })
         return config
 
@@ -1099,7 +1098,6 @@ def build_doccorner_simcc_v3(
             # Already in correct layout
             simcc_x, simcc_y = CornerGAU(
                 hidden_dim=gau_hidden_dim,
-                num_bins=num_bins,
                 name="corner_gau"
             )([simcc_x, simcc_y])
         else:
@@ -1108,7 +1106,6 @@ def build_doccorner_simcc_v3(
             simcc_y_t = layers.Permute((2, 1), name="gau_y_transpose_in")(simcc_y)
             simcc_x_t, simcc_y_t = CornerGAU(
                 hidden_dim=gau_hidden_dim,
-                num_bins=num_bins,
                 name="corner_gau"
             )([simcc_x_t, simcc_y_t])
             simcc_x = layers.Permute((2, 1), name="gau_x_transpose_out")(simcc_x_t)  # [B, num_bins, 4]
