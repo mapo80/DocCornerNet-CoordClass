@@ -647,30 +647,22 @@ class SimCCDecode(layers.Layer):
 @register_keras_serializable(package="doccorner")
 class CornerGAU(layers.Layer):
     """
-    Ultra-lightweight Gated Attention Unit for corner relationship modeling.
+    Geometric Attention Unit for corner coordinate refinement.
 
-    Operates on SimCC logits [B, 4, num_bins] AFTER they are computed.
-    Models geometric correlations between the 4 corners using a tiny 4×4
-    self-attention matrix (only 16 attention weights).
+    Operates AFTER soft-argmax decoding on coordinates [B, 4, 2].
+    Models geometric correlations between the 4 corners using self-attention,
+    then predicts delta corrections to refine the coordinates.
 
-    Key optimization: Instead of projecting to num_bins (expensive), we only
-    output a per-corner SCALE and BIAS that modulates the original logits.
-    This reduces params from ~20K to ~500 while maintaining expressiveness.
+    Architecture:
+        coords [B, 4, 2] (from soft-argmax)
+            ↓
+        Self-attention 4×4 (tiny! only 16 weights)
+            ↓
+        Output: delta [B, 4, 2] (dx, dy corrections)
+            ↓
+        coords_refined = coords + delta
 
-    Architecture (ULTRA-FAST):
-        simcc_x [B, 4, num_bins] + simcc_y [B, 4, num_bins]
-            ↓
-        Mean over bins → corner_x [B, 4, 1], corner_y [B, 4, 1]
-            ↓
-        Concat → corner_repr [B, 4, 2]
-            ↓
-        Self-attention 4×4 (tiny!)
-            ↓
-        Output: scale [B, 4, 1] + bias [B, 4, 1] per axis
-            ↓
-        refined = original * scale + bias  (broadcast over bins)
-
-    Only ~500 params total. XNNPACK-friendly.
+    ~300 params total. XNNPACK-friendly (uses only Dense, matmul, softmax).
     """
 
     def __init__(self, hidden_dim: int = 32, **kwargs):
@@ -679,40 +671,33 @@ class CornerGAU(layers.Layer):
         self._scale = None
 
     def build(self, input_shape):
-        # Input is a list: [simcc_x, simcc_y], each [B, 4, num_bins]
-        if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 2:
-            raise ValueError(f"CornerGAU expects [simcc_x, simcc_y] inputs, got {input_shape}")
-
+        # Input: coords [B, 4, 2]
         self._scale = 1.0 / np.sqrt(float(self.hidden_dim))
 
-        # Q, K, V projections from corner representation [B, 4, 2] -> [B, 4, hidden_dim]
+        # Q, K, V projections: [B, 4, 2] -> [B, 4, hidden_dim]
         self.q_proj = layers.Dense(self.hidden_dim, use_bias=True, name="q_proj")
         self.k_proj = layers.Dense(self.hidden_dim, use_bias=True, name="k_proj")
         self.v_proj = layers.Dense(self.hidden_dim, use_bias=True, name="v_proj")
 
-        # Output: per-corner scale and bias (NOT per-bin!)
-        # [B, 4, hidden_dim] -> [B, 4, 2] (scale, bias) per axis
-        self.out_x = layers.Dense(2, use_bias=True, name="out_x")  # scale + bias
-        self.out_y = layers.Dense(2, use_bias=True, name="out_y")  # scale + bias
+        # Output projection: [B, 4, hidden_dim] -> [B, 4, 2] (delta x, delta y)
+        # Initialize near zero for stable training start
+        self.out_proj = layers.Dense(
+            2,
+            use_bias=True,
+            kernel_initializer=keras.initializers.RandomNormal(stddev=0.01),
+            bias_initializer=keras.initializers.Zeros(),
+            name="out_proj"
+        )
 
         super().build(input_shape)
 
-    def call(self, inputs):
-        # inputs: [simcc_x, simcc_y], each [B, 4, num_bins]
-        simcc_x, simcc_y = inputs
+    def call(self, coords):
+        # coords: [B, 4, 2] - corner coordinates (x, y) normalized [0, 1]
 
-        # Step 1: Compress logits to corner representations
-        # [B, 4, num_bins] -> [B, 4, 1]
-        corner_x = tf.reduce_mean(simcc_x, axis=-1, keepdims=True)  # [B, 4, 1]
-        corner_y = tf.reduce_mean(simcc_y, axis=-1, keepdims=True)  # [B, 4, 1]
-
-        # Step 2: Concat X+Y to get corner representation [B, 4, 2]
-        corner_repr = tf.concat([corner_x, corner_y], axis=-1)  # [B, 4, 2]
-
-        # Step 3: Self-attention over 4 corners (4×4 attention matrix = 16 elements!)
-        Q = self.q_proj(corner_repr)  # [B, 4, hidden_dim]
-        K = self.k_proj(corner_repr)  # [B, 4, hidden_dim]
-        V = self.v_proj(corner_repr)  # [B, 4, hidden_dim]
+        # Self-attention over 4 corners
+        Q = self.q_proj(coords)  # [B, 4, hidden_dim]
+        K = self.k_proj(coords)  # [B, 4, hidden_dim]
+        V = self.v_proj(coords)  # [B, 4, hidden_dim]
 
         # Attention: [B, 4, hidden_dim] @ [B, hidden_dim, 4] -> [B, 4, 4]
         attn_scores = tf.matmul(Q, K, transpose_b=True) * self._scale
@@ -721,27 +706,20 @@ class CornerGAU(layers.Layer):
         # [B, 4, 4] @ [B, 4, hidden_dim] -> [B, 4, hidden_dim]
         attn_out = tf.matmul(attn_weights, V)
 
-        # Step 4: Output per-corner scale and bias
-        out_x = self.out_x(attn_out)  # [B, 4, 2]
-        out_y = self.out_y(attn_out)  # [B, 4, 2]
+        # Project to delta corrections
+        delta = self.out_proj(attn_out)  # [B, 4, 2]
 
-        # Split into scale (sigmoid for [0,2] range centered at 1) and bias
-        scale_x = 1.0 + tf.nn.tanh(out_x[:, :, 0:1])  # [B, 4, 1], range [0, 2]
-        bias_x = out_x[:, :, 1:2]  # [B, 4, 1]
-        scale_y = 1.0 + tf.nn.tanh(out_y[:, :, 0:1])  # [B, 4, 1], range [0, 2]
-        bias_y = out_y[:, :, 1:2]  # [B, 4, 1]
+        # Apply correction with residual
+        coords_refined = coords + delta
 
-        # Step 5: Apply scale and bias (broadcast over bins)
-        refined_x = simcc_x * scale_x + bias_x
-        refined_y = simcc_y * scale_y + bias_y
+        # Clip to valid range [0, 1]
+        coords_refined = tf.clip_by_value(coords_refined, 0.0, 1.0)
 
-        return refined_x, refined_y
+        return coords_refined
 
     def get_config(self):
         config = super().get_config()
-        config.update({
-            "hidden_dim": self.hidden_dim,
-        })
+        config.update({"hidden_dim": self.hidden_dim})
         return config
 
 
@@ -1088,30 +1066,25 @@ def build_doccorner_simcc_v3(
     else:
         raise ValueError(f"Unsupported simcc_output_layout='{simcc_output_layout}'")
 
+    # Decode coordinates from logits via soft-argmax
+    coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])  # [B, 8]
+
     # =========================================================================
-    # GAU (Lightweight): model corner relationships via self-attention on logits
-    # Operates AFTER logits are computed, with tiny 4×4 attention matrix
+    # GAU (Geometric Attention Unit): refine coordinates via self-attention
+    # Operates on decoded coordinates [B, 4, 2], not on logits
     # =========================================================================
     if use_gau:
-        # GAU expects [B, 4, num_bins] layout (corners_first)
-        if simcc_layout in {"corners_first", "corner_first", "channels_first", "first"}:
-            # Already in correct layout
-            simcc_x, simcc_y = CornerGAU(
-                hidden_dim=gau_hidden_dim,
-                name="corner_gau"
-            )([simcc_x, simcc_y])
-        else:
-            # Need to transpose for GAU, then transpose back
-            simcc_x_t = layers.Permute((2, 1), name="gau_x_transpose_in")(simcc_x)  # [B, 4, num_bins]
-            simcc_y_t = layers.Permute((2, 1), name="gau_y_transpose_in")(simcc_y)
-            simcc_x_t, simcc_y_t = CornerGAU(
-                hidden_dim=gau_hidden_dim,
-                name="corner_gau"
-            )([simcc_x_t, simcc_y_t])
-            simcc_x = layers.Permute((2, 1), name="gau_x_transpose_out")(simcc_x_t)  # [B, num_bins, 4]
-            simcc_y = layers.Permute((2, 1), name="gau_y_transpose_out")(simcc_y_t)
+        # Reshape coords [B, 8] -> [B, 4, 2] for attention over corners
+        coords_4x2 = layers.Reshape((4, 2), name="coords_reshape")(coords)
 
-    coords = SimCCDecode(num_bins=num_bins, tau=tau, name="coords")([simcc_x, simcc_y])
+        # Apply geometric attention to refine coordinates
+        coords_refined_4x2 = CornerGAU(
+            hidden_dim=gau_hidden_dim,
+            name="corner_gau"
+        )(coords_4x2)  # [B, 4, 2]
+
+        # Reshape back to [B, 8]
+        coords = layers.Reshape((8,), name="coords_refined")(coords_refined_4x2)
 
     # =========================================================================
     # Score Head: Document presence classification
