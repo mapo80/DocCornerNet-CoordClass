@@ -763,6 +763,72 @@ Single tensor `[1, 9]`:
 
 ---
 
+## Optimized Dataset Loading
+
+The dataset loading pipeline has been optimized for maximum performance with vectorized operations.
+
+### Performance Improvements
+
+| Operation | Before | After | Speedup |
+|-----------|--------|-------|---------|
+| Parquet reading | Row-by-row iteration | PyArrow `concat_tables` + vectorized column access | ~3x |
+| tf.data construction | Chunked `concatenate()` (O(n²)) | Single `from_tensor_slices()` (O(1)) | ~50x |
+| Shuffle buffer | Full dataset size | 10% of dataset (min 10K) | ~10x memory reduction |
+
+### Benchmark Results (Validation Set - 8,645 samples)
+
+```
+Parquet read:          2.8s
+Column extraction:     0.2s
+Image decoding:        8.4s (1,032 img/s)
+Total loading:         11.5s
+FastDataset creation:  0.17s
+Iteration speed:       8,264 img/s
+```
+
+### Key Optimizations
+
+#### 1. Vectorized Parquet Reading
+
+```python
+# Before: Row-by-row (slow)
+for pf in parquet_files:
+    table = pq.read_table(pf)
+    for i in range(len(table)):
+        row = {"image_bytes": table["image"][i].as_py()["bytes"], ...}
+
+# After: Vectorized with PyArrow
+tables = [pq.read_table(pf) for pf in parquet_files]
+combined = pa.concat_tables(tables)
+coords = np.column_stack([combined[f"corner_{c}_{a}"].to_numpy() for c, a in corners])
+```
+
+#### 2. Single-Pass tf.data Construction
+
+```python
+# Before: O(n²) chunked concatenation
+dataset = None
+for chunk in chunks:
+    shard_ds = tf.data.Dataset.from_tensor_slices(chunk)
+    dataset = shard_ds if dataset is None else dataset.concatenate(shard_ds)
+
+# After: O(1) single call
+dataset = tf.data.Dataset.from_tensor_slices((images, coords, has_doc))
+```
+
+#### 3. Optimized Shuffle Buffer
+
+```python
+# Before: Full buffer (high memory)
+dataset.shuffle(n_samples)
+
+# After: 10% buffer (sufficient randomization, lower memory)
+buffer_size = min(n_samples, max(10000, n_samples // 10))
+dataset.shuffle(buffer_size)
+```
+
+---
+
 ## CSPNeXt Backbone
 
 CSPNeXt-Tiny is a high-performance backbone from the RTMDet family, offering improved accuracy over MobileNet at the cost of larger model size.

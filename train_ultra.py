@@ -518,77 +518,87 @@ def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_w
 
     print(f"  Found {len(parquet_files)} parquet files", flush=True)
 
-    # Read all parquet files and collect rows
-    all_rows = []
-    for pf in tqdm(parquet_files, desc="Reading parquet", unit="file"):
-        table = pq.read_table(pf)
-        for i in range(len(table)):
-            row = {
-                "image_bytes": table["image"][i].as_py()["bytes"],
-                "is_negative": table["is_negative"][i].as_py(),
-                "corner_tl_x": table["corner_tl_x"][i].as_py(),
-                "corner_tl_y": table["corner_tl_y"][i].as_py(),
-                "corner_tr_x": table["corner_tr_x"][i].as_py(),
-                "corner_tr_y": table["corner_tr_y"][i].as_py(),
-                "corner_br_x": table["corner_br_x"][i].as_py(),
-                "corner_br_y": table["corner_br_y"][i].as_py(),
-                "corner_bl_x": table["corner_bl_x"][i].as_py(),
-                "corner_bl_y": table["corner_bl_y"][i].as_py(),
-            }
-            all_rows.append(row)
+    # =========================================================================
+    # OPTIMIZED: Vectorized parquet reading with PyArrow
+    # =========================================================================
+    import pyarrow as pa
 
-    n_samples = len(all_rows)
+    # Read all parquet files and concatenate into single table
+    print("  Reading parquet files (vectorized)...", flush=True)
+    read_start = time.time()
+    tables = []
+    for pf in tqdm(parquet_files, desc="Reading parquet", unit="file"):
+        tables.append(pq.read_table(pf))
+    combined = pa.concat_tables(tables)
+    del tables
+    read_time = time.time() - read_start
+    print(f"  Parquet read: {read_time:.1f}s", flush=True)
+
+    n_samples = len(combined)
     print(f"  Found {n_samples} samples in {split} split", flush=True)
 
-    # Pre-allocate arrays
+    # Extract columns vectorized (much faster than row-by-row)
+    extract_start = time.time()
+    image_col = combined["image"].to_pylist()
+    image_bytes_list = [img["bytes"] for img in image_col]
+    del image_col
+
+    is_negative = combined["is_negative"].to_numpy()
+
+    # Extract coordinates vectorized
+    corner_cols = {}
+    for corner in ["tl", "tr", "br", "bl"]:
+        for axis in ["x", "y"]:
+            col_name = f"corner_{corner}_{axis}"
+            corner_cols[col_name] = combined[col_name].to_numpy()
+
+    # Build coords array directly (vectorized)
+    coords = np.column_stack([
+        corner_cols["corner_tl_x"], corner_cols["corner_tl_y"],
+        corner_cols["corner_tr_x"], corner_cols["corner_tr_y"],
+        corner_cols["corner_br_x"], corner_cols["corner_br_y"],
+        corner_cols["corner_bl_x"], corner_cols["corner_bl_y"],
+    ]).astype(np.float32)
+
+    # has_doc: 0 if negative, 1 otherwise
+    has_doc = (~is_negative).astype(np.float32)
+
+    # Zero out coords for negative samples
+    coords[is_negative] = 0.0
+
+    del combined, corner_cols, is_negative
+    extract_time = time.time() - extract_start
+    print(f"  Column extraction: {extract_time:.1f}s", flush=True)
+
+    # Pre-allocate image array
     images = np.empty((n_samples, img_size, img_size, 3), dtype=np.uint8)
-    coords = np.zeros((n_samples, 8), dtype=np.float32)
-    has_doc = np.zeros(n_samples, dtype=np.float32)
 
-    def process_row(args):
-        """Process a single row from parquet."""
-        idx, row = args
-
-        # Decode image
-        img = Image.open(io.BytesIO(row["image_bytes"]))
+    def process_image(args):
+        """Process a single image from bytes."""
+        idx, img_bytes = args
+        img = Image.open(io.BytesIO(img_bytes))
         if img.mode != "RGB":
             img = img.convert("RGB")
-
-        # Resize
         img = img.resize((img_size, img_size), Image.BILINEAR)
-        img_array = np.asarray(img, dtype=np.uint8).copy()
+        return idx, np.asarray(img, dtype=np.uint8).copy()
 
-        # Get coordinates
-        is_negative = row.get("is_negative", False)
-        if is_negative or row.get("corner_tl_x") is None:
-            sample_coords = np.zeros(8, dtype=np.float32)
-            sample_has_doc = 0.0
-        else:
-            sample_coords = np.array([
-                row["corner_tl_x"], row["corner_tl_y"],
-                row["corner_tr_x"], row["corner_tr_y"],
-                row["corner_br_x"], row["corner_br_y"],
-                row["corner_bl_x"], row["corner_bl_y"],
-            ], dtype=np.float32)
-            sample_has_doc = 1.0
-
-        return idx, img_array, sample_coords, sample_has_doc
-
-    # Process samples in parallel
-    print(f"  Processing {n_samples} samples with {num_workers} workers...", flush=True)
+    # Process images in parallel (this is the main bottleneck - I/O bound)
+    print(f"  Decoding {n_samples} images with {num_workers} workers...", flush=True)
+    decode_start = time.time()
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for idx, img_array, sample_coords, sample_has_doc in tqdm(
-            executor.map(process_row, enumerate(all_rows)),
+        for idx, img_array in tqdm(
+            executor.map(process_image, enumerate(image_bytes_list)),
             total=n_samples,
-            desc=f"Loading {split}",
+            desc=f"Decoding {split}",
             unit="img",
         ):
             images[idx] = img_array
-            coords[idx] = sample_coords
-            has_doc[idx] = sample_has_doc
+
+    decode_time = time.time() - decode_start
+    print(f"  Image decoding: {decode_time:.1f}s ({n_samples / decode_time:.0f} img/s)", flush=True)
 
     # Free memory
-    del all_rows
+    del image_bytes_list
     gc.collect()
 
     load_time = time.time() - start_time
@@ -728,7 +738,6 @@ class FastDataset:
         self.shuffle = shuffle
         self.drop_remainder = drop_remainder
         self.name = name
-        self.chunk_size = max(self.batch_size * 4, 1024)
         self.return_indices = return_indices
 
         # Store raw uint8 images (3GB instead of 12GB float32)
@@ -743,47 +752,41 @@ class FastDataset:
             self.n_batches = (self.n_samples + batch_size - 1) // batch_size
 
         print("  Creating tf.data pipeline...", flush=True)
+        build_start = time.time()
         dataset = self._build_base_dataset()
+
         if self.shuffle:
-            dataset = dataset.shuffle(self.n_samples, reshuffle_each_iteration=True)
+            # OPTIMIZED: Use smaller shuffle buffer (10% of dataset or 10k, whichever is larger)
+            # Full buffer shuffle is expensive and often unnecessary for good randomization
+            buffer_size = min(self.n_samples, max(10000, self.n_samples // 10))
+            dataset = dataset.shuffle(buffer_size, reshuffle_each_iteration=True)
 
         dataset = dataset.batch(self.batch_size, drop_remainder=self.drop_remainder)
         dataset = dataset.map(self._normalize_batch, num_parallel_calls=tf.data.AUTOTUNE)
         self.dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
+        build_time = time.time() - build_start
         print(
             f"  Dataset ready: {self.n_batches} batches of {batch_size} "
-            f"(drop_remainder={self.drop_remainder}, return_indices={self.return_indices})",
+            f"(drop_remainder={self.drop_remainder}, return_indices={self.return_indices}) "
+            f"in {build_time:.1f}s",
             flush=True,
         )
 
     def _build_base_dataset(self):
-        if self.n_samples == 0:
-            with tf.device("/CPU:0"):
-                if self.return_indices:
-                    return tf.data.Dataset.from_tensor_slices(
-                        (self.indices, self.images, self.coords, self.has_doc)
-                    )
-                return tf.data.Dataset.from_tensor_slices(
-                    (self.images, self.coords, self.has_doc)
-                )
+        """Build tf.data.Dataset from numpy arrays.
 
-        dataset = None
-        for start in tqdm(
-            range(0, self.n_samples, self.chunk_size),
-            desc=f"Building {self.name} dataset",
-            unit="chunk",
-        ):
-            end = min(start + self.chunk_size, self.n_samples)
+        OPTIMIZED: Single from_tensor_slices call instead of chunked concatenation.
+        This avoids O(n²) complexity from repeated concatenate() calls.
+        """
+        with tf.device("/CPU:0"):
             if self.return_indices:
-                shard = (self.indices[start:end], self.images[start:end], self.coords[start:end], self.has_doc[start:end])
-            else:
-                shard = (self.images[start:end], self.coords[start:end], self.has_doc[start:end])
-            with tf.device("/CPU:0"):
-                shard_ds = tf.data.Dataset.from_tensor_slices(shard)
-            dataset = shard_ds if dataset is None else dataset.concatenate(shard_ds)
-
-        return dataset
+                return tf.data.Dataset.from_tensor_slices(
+                    (self.indices, self.images, self.coords, self.has_doc)
+                )
+            return tf.data.Dataset.from_tensor_slices(
+                (self.images, self.coords, self.has_doc)
+            )
 
     def _normalize_batch(self, *args):
         """Normalize a batch with TF ops."""
