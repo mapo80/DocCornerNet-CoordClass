@@ -454,7 +454,7 @@ def download_hf_dataset(hf_dataset: str, output_dir: str, splits: list = None, h
     print(f"You can now use: --hf_dataset {output_path}", flush=True)
 
 
-def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_workers: int = 64):
+def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_workers: int = 8):
     """
     Load dataset directly from local Parquet files (no HF caching).
 
@@ -1295,8 +1295,8 @@ def main():
     parser.add_argument("--min_lr", type=float, default=1e-6)
 
     # Loading
-    parser.add_argument("--num_workers", type=int, default=64,
-                        help="Threads for image loading")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="Threads for image loading (8-16 recommended with OpenCV)")
 
     # Augmentation
     parser.add_argument("--augment", action="store_true",
