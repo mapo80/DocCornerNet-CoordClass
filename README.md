@@ -527,13 +527,18 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 |-------|-------|--------|------|----------|-----------------|-----------|-----------|
 | `mobilenetv2_320_a1.0_baseline` | 1.0 | 2.4M | 9.84 MB | **0.9197** | **6.90** | **67.2%** | **26.5%** |
 | `mobilenetv2_320_a0.35_baseline` | 0.35 | 495K | 2.41 MB | 0.9044 | 8.41 | 64.1% | 23.2% |
+| `mobilenetv2_320_a0.35_gau_fc256_ohem` | 0.35 | ~550K | 3.85 MB | 0.9014 | 8.78 | 63.2% | 20.6% |
+| `cspnext_320_gau_fc256_ohem` | - | ~2.5M | 10.43 MB | 0.8970 | 9.29 | 63.8% | 24.4% |
 | `mobilenetv2_320_a1.0_gau_fc256` | 1.0 | 2.4M | 9.75 MB | 0.8959 | 9.20 | 60.5% | 25.6% |
 | `mobilenetv2_320_a0.35_fc256` | 0.35 | 546K | 2.62 MB | 0.8939 | 9.50 | 63.1% | 22.9% |
 | `mobilenetv2_320_a0.35_gau_v2_fc256` | 0.35 | 546K | 2.63 MB | 0.8771 | 11.00 | 56.3% | 18.8% |
 
 **Winner**: `mobilenetv2_320_a1.0_baseline` - Best accuracy on test set with IoU=0.9197 and corner error 6.90px.
 
-**Note**: GAU (Gated Attention Unit) models were trained with a version that didn't include trainable GAU weights. The FC expansion (256-dim) didn't improve accuracy over the baseline.
+**Notes**:
+- GAU (Gated Attention Unit) and FC expansion (256-dim) did not improve accuracy over the baseline
+- OHEM (Online Hard Example Mining) models show similar performance to non-OHEM variants
+- CSPNeXt backbone (10.43 MB) underperforms MobileNetV2 α=1.0 baseline (9.84 MB) despite larger size
 
 ### Validation Set Results
 

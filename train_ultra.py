@@ -71,39 +71,93 @@ from PIL import Image
 # ============================================================================
 class HardSampleTracker:
     """
-    Tracks hard samples identified during validation for Online Hard Example Mining.
+    Tracks hard samples during TRAINING for Online Hard Example Mining.
 
-    Hard samples are those with any corner error >= threshold (default 20px).
-    The tracker maintains a set of sample indices and their error scores,
-    updated after each validation epoch.
+    Hard samples are identified by:
+    1. Corner error >= threshold (default 10px)
+    2. Top-K fraction of hardest samples (if top_k > 0)
+
+    Uses exponential moving average (EMA) to smooth error estimates across epochs.
     """
 
-    def __init__(self, threshold_px: float = 20.0):
+    def __init__(self, threshold_px: float = 10.0, top_k_fraction: float = 0.0, ema_alpha: float = 0.3):
+        """
+        Args:
+            threshold_px: Corner error threshold in pixels (default: 10.0)
+            top_k_fraction: Fraction of hardest samples to select (0.0 = disabled, 0.1 = top 10%)
+            ema_alpha: EMA smoothing factor for error updates (higher = more weight to recent)
+        """
         self.threshold_px = threshold_px
-        self.hard_indices = set()  # Set of training sample indices
-        self.hard_scores = {}  # {idx: max_corner_error}
+        self.top_k_fraction = top_k_fraction
+        self.ema_alpha = ema_alpha
+
+        self.sample_errors = {}  # {idx: ema_error} - running average of errors
+        self.hard_indices = set()  # Current set of hard sample indices
+        self._needs_recompute = True  # Flag to recompute hard indices
+
+    def update_from_training_batch(self, sample_indices: np.ndarray, corner_errors: np.ndarray):
+        """
+        Update error estimates from a training batch.
+
+        Args:
+            sample_indices: Array of sample indices from the batch
+            corner_errors: Array of max corner error per sample (in pixels)
+        """
+        for idx, err in zip(sample_indices, corner_errors):
+            idx_int = int(idx)
+            err_float = float(err)
+            if idx_int in self.sample_errors:
+                # EMA update: new = alpha * current + (1-alpha) * old
+                self.sample_errors[idx_int] = (
+                    self.ema_alpha * err_float +
+                    (1 - self.ema_alpha) * self.sample_errors[idx_int]
+                )
+            else:
+                self.sample_errors[idx_int] = err_float
+        self._needs_recompute = True
+
+    def recompute_hard_indices(self):
+        """Recompute the set of hard sample indices based on current error estimates."""
+        if not self.sample_errors:
+            self.hard_indices = set()
+            self._needs_recompute = False
+            return
+
+        # Sort samples by error (descending)
+        sorted_samples = sorted(self.sample_errors.items(), key=lambda x: x[1], reverse=True)
+
+        # Select by threshold
+        hard_by_threshold = {idx for idx, err in sorted_samples if err >= self.threshold_px}
+
+        # Select top-K if enabled
+        if self.top_k_fraction > 0:
+            k = max(1, int(len(sorted_samples) * self.top_k_fraction))
+            hard_by_topk = {idx for idx, _ in sorted_samples[:k]}
+        else:
+            hard_by_topk = set()
+
+        # Union of both criteria
+        self.hard_indices = hard_by_threshold | hard_by_topk
+        self._needs_recompute = False
 
     def update_from_validation(self, sample_indices: np.ndarray, max_corner_errors: np.ndarray):
         """
-        Update hard sample list after validation epoch.
-
-        Args:
-            sample_indices: Array of sample indices (global training indices)
-            max_corner_errors: Array of max corner error per sample (in pixels)
+        Legacy method for validation-based updates (backward compatibility).
+        Prefer update_from_training_batch() for proper OHEM.
         """
-        self.hard_indices.clear()
-        self.hard_scores.clear()
         for idx, err in zip(sample_indices, max_corner_errors):
             idx_int = int(idx)
-            if err >= self.threshold_px:
-                self.hard_indices.add(idx_int)
-                self.hard_scores[idx_int] = float(err)
+            self.sample_errors[idx_int] = float(err)
+        self._needs_recompute = True
+        self.recompute_hard_indices()
 
     def is_hard(self, idx: int) -> bool:
         """Check if a sample index is in the hard sample set."""
+        if self._needs_recompute:
+            self.recompute_hard_indices()
         return int(idx) in self.hard_indices
 
-    def get_weight(self, idx: int, base_weight: float = 1.0, hard_weight: float = 2.0) -> float:
+    def get_weight(self, idx: int, base_weight: float = 1.0, hard_weight: float = 4.0) -> float:
         """Get sample weight: base_weight + hard_weight if hard, else base_weight."""
         if self.is_hard(idx):
             return base_weight + hard_weight
@@ -111,25 +165,35 @@ class HardSampleTracker:
 
     def get_stats(self) -> tuple:
         """Return (num_hard_samples, avg_error_of_hard_samples)."""
-        if not self.hard_scores:
+        if self._needs_recompute:
+            self.recompute_hard_indices()
+        if not self.hard_indices:
             return 0, 0.0
-        return len(self.hard_indices), float(np.mean(list(self.hard_scores.values())))
+        hard_errors = [self.sample_errors[idx] for idx in self.hard_indices if idx in self.sample_errors]
+        return len(self.hard_indices), float(np.mean(hard_errors)) if hard_errors else 0.0
 
     def save(self, path: Path):
-        """Save hard sample list to file."""
+        """Save hard sample data to file."""
         path = Path(path)
-        if self.hard_indices:
-            indices = np.array(list(self.hard_indices), dtype=np.int64)
-            scores = np.array([self.hard_scores[i] for i in indices], dtype=np.float32)
-            np.savez(path, indices=indices, scores=scores)
+        if self.sample_errors:
+            indices = np.array(list(self.sample_errors.keys()), dtype=np.int64)
+            errors = np.array(list(self.sample_errors.values()), dtype=np.float32)
+            hard_mask = np.array([idx in self.hard_indices for idx in indices], dtype=bool)
+            np.savez(path, indices=indices, errors=errors, hard_mask=hard_mask,
+                     threshold_px=self.threshold_px, top_k_fraction=self.top_k_fraction)
 
     def load(self, path: Path):
-        """Load hard sample list from file."""
+        """Load hard sample data from file."""
         path = Path(path)
         if path.exists():
             data = np.load(path)
-            self.hard_indices = set(data['indices'].tolist())
-            self.hard_scores = dict(zip(data['indices'].tolist(), data['scores'].tolist()))
+            self.sample_errors = dict(zip(data['indices'].tolist(), data['errors'].tolist()))
+            if 'threshold_px' in data:
+                self.threshold_px = float(data['threshold_px'])
+            if 'top_k_fraction' in data:
+                self.top_k_fraction = float(data['top_k_fraction'])
+            self._needs_recompute = True
+            self.recompute_hard_indices()
 
 
 # ============================================================================
@@ -979,14 +1043,19 @@ class Trainer:
         loss_per_sample = tf.reduce_mean(loss_per_coord, axis=-1)  # [B]
 
         # Apply sample weights if provided (OHEM)
+        # CRITICAL: Normalize by number of positive samples, NOT by sum of weights
+        # Otherwise weights > 1.0 would reduce loss magnitude instead of increasing it
+        n_pos = tf.reduce_sum(has_doc) + 1e-9
+
         if sample_weights is not None:
-            # Weight both SimCC and coord losses
-            weighted_mask = has_doc * sample_weights  # [B]
-            loss_simcc = tf.reduce_sum(ce * weighted_mask) / (tf.reduce_sum(weighted_mask) + 1e-9)
-            loss_coord = tf.reduce_sum(loss_per_sample * weighted_mask) / (tf.reduce_sum(weighted_mask) + 1e-9)
+            # Weight both SimCC and coord losses, but normalize by n_pos (not weight sum)
+            weighted_ce = ce * has_doc * sample_weights  # [B]
+            weighted_coord = loss_per_sample * has_doc * sample_weights  # [B]
+            loss_simcc = tf.reduce_sum(weighted_ce) / n_pos
+            loss_coord = tf.reduce_sum(weighted_coord) / n_pos
         else:
-            loss_simcc = tf.reduce_sum(ce * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
-            loss_coord = tf.reduce_sum(loss_per_sample * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
+            loss_simcc = tf.reduce_sum(ce * has_doc) / n_pos
+            loss_coord = tf.reduce_sum(loss_per_sample * has_doc) / n_pos
 
         # Score loss (not weighted - document detection should remain balanced)
         loss_score = tf.nn.sigmoid_cross_entropy_with_logits(
@@ -1044,6 +1113,30 @@ class Trainer:
 
         return tf.cond(n_pos > 0, compute_metrics, zero_metrics)
 
+    def compute_per_sample_max_corner_error(self, coords_pred, coords_gt, has_doc):
+        """
+        Compute max corner error per sample (for OHEM tracking).
+
+        Returns:
+            max_corner_errors: [B] tensor of max corner errors in pixels (0 for negative samples)
+        """
+        img_size = float(self.img_size)
+        # Reshape to [B, 4, 2]
+        pred_xy = tf.reshape(coords_pred, [-1, 4, 2])
+        gt_xy = tf.reshape(coords_gt, [-1, 4, 2])
+
+        # Per-corner Euclidean distance in pixels
+        diff = (pred_xy - gt_xy) * img_size  # [B, 4, 2]
+        corner_dist = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1))  # [B, 4]
+
+        # Max corner error per sample
+        max_corner_err = tf.reduce_max(corner_dist, axis=-1)  # [B]
+
+        # Zero out negative samples
+        max_corner_err = max_corner_err * tf.cast(has_doc, tf.float32)
+
+        return max_corner_err
+
     @tf.function
     def train_step(self, images, coords_gt, has_doc):
         """Training step (no accumulation - applies gradients immediately)."""
@@ -1067,7 +1160,7 @@ class Trainer:
         gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
-        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err, coords_pred
 
     @tf.function
     def train_step_accumulate(self, images, coords_gt, has_doc):
@@ -1098,7 +1191,7 @@ class Trainer:
 
         self._accumulation_count.assign_add(1)
         iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
-        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err, coords_pred
 
     @tf.function
     def apply_accumulated_gradients(self):
@@ -1140,7 +1233,7 @@ class Trainer:
         gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
-        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err, coords_pred
 
     @tf.function
     def train_step_accumulate_weighted(self, images, coords_gt, has_doc, sample_weights):
@@ -1171,7 +1264,7 @@ class Trainer:
 
         self._accumulation_count.assign_add(1)
         iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
-        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err, coords_pred
 
     @tf.function
     def val_step(self, images, coords_gt, has_doc):
@@ -1357,12 +1450,15 @@ def main():
     # Hard Mining (OHEM)
     parser.add_argument("--hard_mining", action="store_true",
                         help="Enable Online Hard Example Mining")
-    parser.add_argument("--hard_mining_weight", type=float, default=2.0,
-                        help="Extra weight for hard samples (total = 1 + this)")
-    parser.add_argument("--hard_mining_threshold", type=float, default=20.0,
-                        help="Corner error threshold (px) to classify as hard sample")
+    parser.add_argument("--hard_mining_weight", type=float, default=4.0,
+                        help="Extra weight for hard samples (total = 1 + this, default: 4.0)")
+    parser.add_argument("--hard_mining_threshold", type=float, default=10.0,
+                        help="Corner error threshold (px) to classify as hard sample (default: 10.0)")
+    parser.add_argument("--hard_mining_top_k", type=float, default=0.0,
+                        help="Fraction of hardest samples to upweight (0.0=disabled, 0.1=top 10%%). "
+                             "If > 0, samples are selected by BOTH top-k AND threshold.")
     parser.add_argument("--hard_mining_start", type=float, default=0.2,
-                        help="Fraction of epochs before activating hard mining (curriculum)")
+                        help="Fraction of epochs before activating hard mining (curriculum, default: 0.2)")
 
     args = parser.parse_args()
 
@@ -1559,7 +1655,8 @@ def main():
     if args.augment:
         print("Augmentation: ENABLED", flush=True)
     if args.hard_mining:
-        print(f"Hard mining: ENABLED (threshold={args.hard_mining_threshold}px, weight={args.hard_mining_weight}, start={args.hard_mining_start*100:.0f}%)", flush=True)
+        top_k_str = f", top_k={args.hard_mining_top_k*100:.0f}%" if args.hard_mining_top_k > 0 else ""
+        print(f"Hard mining: ENABLED (threshold={args.hard_mining_threshold}px, weight={args.hard_mining_weight}{top_k_str}, start={args.hard_mining_start*100:.0f}%)", flush=True)
     print("=" * 80, flush=True)
 
     best_iou = 0.0
@@ -1574,7 +1671,10 @@ def main():
     hard_mining_active = False
     hard_mining_start_epoch = int(args.epochs * args.hard_mining_start)
     if args.hard_mining:
-        hard_tracker = HardSampleTracker(threshold_px=args.hard_mining_threshold)
+        hard_tracker = HardSampleTracker(
+            threshold_px=args.hard_mining_threshold,
+            top_k_fraction=args.hard_mining_top_k
+        )
         # Load hard samples from previous checkpoint if exists
         hard_samples_path = output_dir / "hard_samples.npz"
         if hard_samples_path.exists():
@@ -1658,26 +1758,38 @@ def main():
             # Training step (weighted or standard)
             if sample_weights is not None:
                 if use_accumulation:
-                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate_weighted(
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err, coords_pred = trainer.train_step_accumulate_weighted(
                         images, coords, has_doc, sample_weights
                     )
                     if (batch_idx + 1) % accumulation_steps == 0:
                         trainer.apply_accumulated_gradients()
                 else:
-                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_weighted(
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err, coords_pred = trainer.train_step_weighted(
                         images, coords, has_doc, sample_weights
                     )
             else:
                 if use_accumulation:
-                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate(
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err, coords_pred = trainer.train_step_accumulate(
                         images, coords, has_doc
                     )
                     if (batch_idx + 1) % accumulation_steps == 0:
                         trainer.apply_accumulated_gradients()
                 else:
-                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err, coords_pred = trainer.train_step(
                         images, coords, has_doc
                     )
+
+            # Update hard sample tracker with per-sample errors (OHEM on training data)
+            if args.hard_mining and hard_tracker is not None and indices is not None:
+                # Compute max corner error per sample
+                max_corner_errors = trainer.compute_per_sample_max_corner_error(
+                    coords_pred, coords, has_doc
+                ).numpy()
+                # Update tracker with training batch errors
+                hard_tracker.update_from_training_batch(
+                    indices.numpy(),
+                    max_corner_errors
+                )
 
             loss_val = float(loss)
             train_losses.append(loss_val)
@@ -1766,8 +1878,8 @@ def main():
         # Compute metrics and update hard sample tracker
         if args.hard_mining:
             val_metrics, pos_indices, max_corner_errors = metrics.compute_with_indices()
-            # Update hard sample tracker with validation results
-            hard_tracker.update_from_validation(pos_indices, max_corner_errors)
+            # Recompute hard indices based on training errors (already updated during training)
+            hard_tracker.recompute_hard_indices()
             n_hard, avg_err = hard_tracker.get_stats()
             # Save hard samples to checkpoint
             hard_tracker.save(output_dir / "hard_samples.npz")
