@@ -557,7 +557,16 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 ```bash
 git clone https://github.com/mapo80/DocCornerNet-CoordClass.git
 cd DocCornerNet-CoordClass
+
+# CPU only
 pip install -r requirements.txt
+
+# GPU (CUDA) - recommended for training
+pip install -r requirements.txt
+pip install tensorflow[and-cuda]
+
+# Verify GPU is detected
+python -c "import tensorflow as tf; print('GPUs:', tf.config.list_physical_devices('GPU'))"
 ```
 
 #### CSPNeXt Backbone (Optional)
@@ -622,6 +631,26 @@ TF_USE_LEGACY_KERAS=1 python train_ultra.py \
     --fpn_ch 48 \
     --batch_size 64 \
     --epochs 200 \
+    --augment
+
+# CSPNeXt + GAU + FC Expansion + OHEM (full features, A40/A100 GPU)
+TF_USE_LEGACY_KERAS=1 python train_ultra.py \
+    --hf_dataset /workspace/hf_dataset \
+    --output_dir /workspace/checkpoints/cspnext_full \
+    --backbone cspnext \
+    --img_size 320 \
+    --num_bins 320 \
+    --simcc_ch 128 \
+    --fpn_ch 48 \
+    --batch_size 128 \
+    --accumulation_steps 4 \
+    --epochs 200 \
+    --use_gau \
+    --fc_expansion_dim 256 \
+    --hard_mining \
+    --hard_mining_threshold 15.0 \
+    --hard_mining_weight 2.5 \
+    --hard_mining_start 0.15 \
     --augment
 ```
 

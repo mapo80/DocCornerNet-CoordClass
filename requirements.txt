@@ -6,3 +6,7 @@ opencv-python-headless
 shapely
 huggingface_hub
 pyarrow
+
+# Optional: CSPNeXt backbone (requires legacy Keras)
+# pip install keras-cv-attention-models tf-keras
+# export TF_USE_LEGACY_KERAS=1
