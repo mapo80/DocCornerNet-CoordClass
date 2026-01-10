@@ -67,6 +67,72 @@ from PIL import Image
 
 
 # ============================================================================
+# Hard Sample Mining (OHEM)
+# ============================================================================
+class HardSampleTracker:
+    """
+    Tracks hard samples identified during validation for Online Hard Example Mining.
+
+    Hard samples are those with any corner error >= threshold (default 20px).
+    The tracker maintains a set of sample indices and their error scores,
+    updated after each validation epoch.
+    """
+
+    def __init__(self, threshold_px: float = 20.0):
+        self.threshold_px = threshold_px
+        self.hard_indices = set()  # Set of training sample indices
+        self.hard_scores = {}  # {idx: max_corner_error}
+
+    def update_from_validation(self, sample_indices: np.ndarray, max_corner_errors: np.ndarray):
+        """
+        Update hard sample list after validation epoch.
+
+        Args:
+            sample_indices: Array of sample indices (global training indices)
+            max_corner_errors: Array of max corner error per sample (in pixels)
+        """
+        self.hard_indices.clear()
+        self.hard_scores.clear()
+        for idx, err in zip(sample_indices, max_corner_errors):
+            idx_int = int(idx)
+            if err >= self.threshold_px:
+                self.hard_indices.add(idx_int)
+                self.hard_scores[idx_int] = float(err)
+
+    def is_hard(self, idx: int) -> bool:
+        """Check if a sample index is in the hard sample set."""
+        return int(idx) in self.hard_indices
+
+    def get_weight(self, idx: int, base_weight: float = 1.0, hard_weight: float = 2.0) -> float:
+        """Get sample weight: base_weight + hard_weight if hard, else base_weight."""
+        if self.is_hard(idx):
+            return base_weight + hard_weight
+        return base_weight
+
+    def get_stats(self) -> tuple:
+        """Return (num_hard_samples, avg_error_of_hard_samples)."""
+        if not self.hard_scores:
+            return 0, 0.0
+        return len(self.hard_indices), float(np.mean(list(self.hard_scores.values())))
+
+    def save(self, path: Path):
+        """Save hard sample list to file."""
+        path = Path(path)
+        if self.hard_indices:
+            indices = np.array(list(self.hard_indices), dtype=np.int64)
+            scores = np.array([self.hard_scores[i] for i in indices], dtype=np.float32)
+            np.savez(path, indices=indices, scores=scores)
+
+    def load(self, path: Path):
+        """Load hard sample list from file."""
+        path = Path(path)
+        if path.exists():
+            data = np.load(path)
+            self.hard_indices = set(data['indices'].tolist())
+            self.hard_scores = dict(zip(data['indices'].tolist(), data['scores'].tolist()))
+
+
+# ============================================================================
 # Platform detection and configuration
 # ============================================================================
 def _normalize_backbone_weights(value):
@@ -656,18 +722,20 @@ IMAGENET_STD_TF = tf.constant(IMAGENET_STD, dtype=tf.float32)
 class FastDataset:
     """Optimized dataset - keeps data in numpy, normalizes in tf.data."""
 
-    def __init__(self, images, coords, has_doc, batch_size, shuffle=True, drop_remainder=False, name="dataset"):
+    def __init__(self, images, coords, has_doc, batch_size, shuffle=True, drop_remainder=False, name="dataset", return_indices=False):
         self.n_samples = len(images)
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_remainder = drop_remainder
         self.name = name
         self.chunk_size = max(self.batch_size * 4, 1024)
+        self.return_indices = return_indices
 
         # Store raw uint8 images (3GB instead of 12GB float32)
         self.images = images
         self.coords = coords.astype(np.float32)
         self.has_doc = has_doc.astype(np.float32)
+        self.indices = np.arange(self.n_samples, dtype=np.int64)
 
         if drop_remainder:
             self.n_batches = self.n_samples // batch_size
@@ -685,13 +753,17 @@ class FastDataset:
 
         print(
             f"  Dataset ready: {self.n_batches} batches of {batch_size} "
-            f"(drop_remainder={self.drop_remainder})",
+            f"(drop_remainder={self.drop_remainder}, return_indices={self.return_indices})",
             flush=True,
         )
 
     def _build_base_dataset(self):
         if self.n_samples == 0:
             with tf.device("/CPU:0"):
+                if self.return_indices:
+                    return tf.data.Dataset.from_tensor_slices(
+                        (self.indices, self.images, self.coords, self.has_doc)
+                    )
                 return tf.data.Dataset.from_tensor_slices(
                     (self.images, self.coords, self.has_doc)
                 )
@@ -703,19 +775,28 @@ class FastDataset:
             unit="chunk",
         ):
             end = min(start + self.chunk_size, self.n_samples)
-            shard = (self.images[start:end], self.coords[start:end], self.has_doc[start:end])
+            if self.return_indices:
+                shard = (self.indices[start:end], self.images[start:end], self.coords[start:end], self.has_doc[start:end])
+            else:
+                shard = (self.images[start:end], self.coords[start:end], self.has_doc[start:end])
             with tf.device("/CPU:0"):
                 shard_ds = tf.data.Dataset.from_tensor_slices(shard)
             dataset = shard_ds if dataset is None else dataset.concatenate(shard_ds)
 
         return dataset
 
-    @staticmethod
-    def _normalize_batch(images, coords, has_doc):
+    def _normalize_batch(self, *args):
         """Normalize a batch with TF ops."""
-        images = tf.cast(images, tf.float32) / 255.0
-        images = (images - IMAGENET_MEAN_TF) / IMAGENET_STD_TF
-        return images, coords, has_doc
+        if self.return_indices:
+            indices, images, coords, has_doc = args
+            images = tf.cast(images, tf.float32) / 255.0
+            images = (images - IMAGENET_MEAN_TF) / IMAGENET_STD_TF
+            return indices, images, coords, has_doc
+        else:
+            images, coords, has_doc = args
+            images = tf.cast(images, tf.float32) / 255.0
+            images = (images - IMAGENET_MEAN_TF) / IMAGENET_STD_TF
+            return images, coords, has_doc
 
     def reshuffle(self):
         """No-op: shuffle handled by tf.data."""
@@ -782,8 +863,16 @@ class Trainer:
         """Apply augmentation to batch."""
         return tf_augment_batch(images, coords, has_doc, self.img_size, image_norm="imagenet")
 
-    def _compute_loss(self, images, coords_gt, has_doc, training):
-        """Compute total loss and its components."""
+    def _compute_loss(self, images, coords_gt, has_doc, training, sample_weights=None):
+        """Compute total loss and its components.
+
+        Args:
+            images: Input images [B, H, W, 3]
+            coords_gt: Ground truth coordinates [B, 8]
+            has_doc: Document presence mask [B]
+            training: Boolean for training mode
+            sample_weights: Optional per-sample weights [B] for OHEM (default: None, uses uniform weights)
+        """
         outputs = self.model(images, training=training)
 
         # Cast to float32 for stable loss computation (model outputs are float16 with mixed precision)
@@ -805,15 +894,23 @@ class Trainer:
 
         ce_x = -tf.reduce_sum(target_x * log_pred_x, axis=-1)
         ce_y = -tf.reduce_sum(target_y * log_pred_y, axis=-1)
-        ce = tf.reduce_mean(ce_x + ce_y, axis=-1)
-        loss_simcc = tf.reduce_sum(ce * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
+        ce = tf.reduce_mean(ce_x + ce_y, axis=-1)  # [B]
 
-        # Coord loss
+        # Coord loss per sample
         loss_per_coord = tf.abs(coords_pred - coords_gt)
-        loss_per_sample = tf.reduce_mean(loss_per_coord, axis=-1)
-        loss_coord = tf.reduce_sum(loss_per_sample * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
+        loss_per_sample = tf.reduce_mean(loss_per_coord, axis=-1)  # [B]
 
-        # Score loss
+        # Apply sample weights if provided (OHEM)
+        if sample_weights is not None:
+            # Weight both SimCC and coord losses
+            weighted_mask = has_doc * sample_weights  # [B]
+            loss_simcc = tf.reduce_sum(ce * weighted_mask) / (tf.reduce_sum(weighted_mask) + 1e-9)
+            loss_coord = tf.reduce_sum(loss_per_sample * weighted_mask) / (tf.reduce_sum(weighted_mask) + 1e-9)
+        else:
+            loss_simcc = tf.reduce_sum(ce * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
+            loss_coord = tf.reduce_sum(loss_per_sample * has_doc) / (tf.reduce_sum(has_doc) + 1e-9)
+
+        # Score loss (not weighted - document detection should remain balanced)
         loss_score = tf.nn.sigmoid_cross_entropy_with_logits(
             labels=has_doc[:, None],
             logits=score_logit
@@ -943,6 +1040,62 @@ class Trainer:
         self._accumulation_count.assign(0)
 
     @tf.function
+    def train_step_weighted(self, images, coords_gt, has_doc, sample_weights):
+        """Training step with sample weights (OHEM) - no accumulation."""
+        with tf.GradientTape() as tape:
+            (
+                total_loss,
+                coords_pred,
+                loss_simcc,
+                loss_coord,
+                loss_score,
+                _,
+            ) = self._compute_loss(images, coords_gt, has_doc, training=True, sample_weights=sample_weights)
+            if self.use_mixed_precision:
+                if hasattr(self.optimizer, "scale_loss"):
+                    scaled_loss = self.optimizer.scale_loss(total_loss)
+                else:
+                    scaled_loss = total_loss
+            else:
+                scaled_loss = total_loss
+
+        gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+
+    @tf.function
+    def train_step_accumulate_weighted(self, images, coords_gt, has_doc, sample_weights):
+        """Training step with sample weights (OHEM) and gradient accumulation."""
+        with tf.GradientTape() as tape:
+            (
+                total_loss,
+                coords_pred,
+                loss_simcc,
+                loss_coord,
+                loss_score,
+                _,
+            ) = self._compute_loss(images, coords_gt, has_doc, training=True, sample_weights=sample_weights)
+            if self.use_mixed_precision:
+                if hasattr(self.optimizer, "scale_loss"):
+                    scaled_loss = self.optimizer.scale_loss(total_loss)
+                else:
+                    scaled_loss = total_loss
+            else:
+                scaled_loss = total_loss
+
+        gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
+
+        # Accumulate gradients (add to existing)
+        for acc, grad in zip(self._gradient_accumulator, gradients):
+            if grad is not None:
+                acc.assign_add(grad)
+
+        self._accumulation_count.assign_add(1)
+        iou, corner_err = self._batch_metrics(coords_pred, coords_gt, has_doc)
+        return total_loss, loss_simcc, loss_coord, loss_score, iou, corner_err
+
+    @tf.function
     def val_step(self, images, coords_gt, has_doc):
         """Validation step - returns predictions."""
         (
@@ -1056,7 +1209,13 @@ def main():
     parser.add_argument("--experiment_name", type=str, default=None)
 
     # Model
-    parser.add_argument("--backbone", type=str, default="mobilenetv2")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="mobilenetv2",
+        choices=["mobilenetv2", "mobilenetv3_small", "mobilenetv3_large", "cspnext"],
+        help="Backbone architecture",
+    )
     parser.add_argument("--alpha", type=float, default=0.35)
     parser.add_argument(
         "--backbone_weights",
@@ -1116,6 +1275,16 @@ def main():
     # Augmentation
     parser.add_argument("--augment", action="store_true",
                         help="Enable data augmentation")
+
+    # Hard Mining (OHEM)
+    parser.add_argument("--hard_mining", action="store_true",
+                        help="Enable Online Hard Example Mining")
+    parser.add_argument("--hard_mining_weight", type=float, default=2.0,
+                        help="Extra weight for hard samples (total = 1 + this)")
+    parser.add_argument("--hard_mining_threshold", type=float, default=20.0,
+                        help="Corner error threshold (px) to classify as hard sample")
+    parser.add_argument("--hard_mining_start", type=float, default=0.2,
+                        help="Fraction of epochs before activating hard mining (curriculum)")
 
     args = parser.parse_args()
 
@@ -1194,13 +1363,15 @@ def main():
 
     print("Train dataset:", flush=True)
     train_ds = FastDataset(train_images, train_coords, train_has_doc,
-                           args.batch_size, shuffle=True, drop_remainder=True, name="train")
+                           args.batch_size, shuffle=True, drop_remainder=True, name="train",
+                           return_indices=args.hard_mining)
     del train_images, train_coords, train_has_doc
     gc.collect()
 
     print("Val dataset:", flush=True)
     val_ds = FastDataset(val_images, val_coords, val_has_doc,
-                         args.batch_size, shuffle=False, drop_remainder=False, name="val")
+                         args.batch_size, shuffle=False, drop_remainder=False, name="val",
+                         return_indices=args.hard_mining)
     del val_images, val_coords, val_has_doc
     gc.collect()
 
@@ -1283,12 +1454,16 @@ def main():
     # Warmup (compile XLA kernels)
     # ========================================================================
     print("\nCompiling (warmup)...", flush=True)
-    for images, coords, has_doc in tqdm(
+    for batch in tqdm(
         train_ds.dataset.take(1),
         total=1,
         desc="Warmup",
         unit="batch",
     ):
+        if args.hard_mining:
+            _, images, coords, has_doc = batch
+        else:
+            images, coords, has_doc = batch
         _ = trainer.train_step(images, coords, has_doc)
         _ = trainer.val_step(images, coords, has_doc)
     print("Warmup done!", flush=True)
@@ -1305,6 +1480,8 @@ def main():
         print(f"Batch size: {args.batch_size}", flush=True)
     if args.augment:
         print("Augmentation: ENABLED", flush=True)
+    if args.hard_mining:
+        print(f"Hard mining: ENABLED (threshold={args.hard_mining_threshold}px, weight={args.hard_mining_weight}, start={args.hard_mining_start*100:.0f}%)", flush=True)
     print("=" * 80, flush=True)
 
     best_iou = 0.0
@@ -1313,6 +1490,19 @@ def main():
     no_improve_count = 0
     lr_no_improve_count = 0
     history = {"train": [], "val": []}
+
+    # Initialize hard sample tracker for OHEM
+    hard_tracker = None
+    hard_mining_active = False
+    hard_mining_start_epoch = int(args.epochs * args.hard_mining_start)
+    if args.hard_mining:
+        hard_tracker = HardSampleTracker(threshold_px=args.hard_mining_threshold)
+        # Load hard samples from previous checkpoint if exists
+        hard_samples_path = output_dir / "hard_samples.npz"
+        if hard_samples_path.exists():
+            hard_tracker.load(hard_samples_path)
+            n_hard, avg_err = hard_tracker.get_stats()
+            print(f"Loaded {n_hard} hard samples from checkpoint (avg err: {avg_err:.1f}px)", flush=True)
 
     for epoch in range(args.epochs):
         epoch_start = time.time()
@@ -1326,7 +1516,18 @@ def main():
             optimizer.learning_rate.assign(warmup_lr)
             current_lr = warmup_lr
 
-        print(f"\nEpoch {epoch + 1}/{args.epochs}", flush=True)
+        # Activate hard mining after curriculum warmup
+        if args.hard_mining and epoch >= hard_mining_start_epoch:
+            hard_mining_active = True
+
+        epoch_status = f"Epoch {epoch + 1}/{args.epochs}"
+        if args.hard_mining:
+            if hard_mining_active:
+                n_hard, _ = hard_tracker.get_stats()
+                epoch_status += f" [OHEM: {n_hard} hard samples]"
+            else:
+                epoch_status += f" [OHEM: inactive until epoch {hard_mining_start_epoch + 1}]"
+        print(f"\n{epoch_status}", flush=True)
 
         # Training
         train_losses = []
@@ -1355,23 +1556,50 @@ def main():
         )
         batch_start_time = time.time()
         imgs_processed = 0
-        for batch_idx, (images, coords, has_doc) in enumerate(train_pbar):
+        for batch_idx, batch in enumerate(train_pbar):
+            # Unpack batch (with or without indices)
+            if args.hard_mining:
+                indices, images, coords, has_doc = batch
+            else:
+                images, coords, has_doc = batch
+                indices = None
+
             if args.augment:
                 images, coords = trainer.augment_batch(images, coords, has_doc)
 
-            if use_accumulation:
-                # Accumulate gradients
-                loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate(
-                    images, coords, has_doc
-                )
-                # Apply accumulated gradients every accumulation_steps
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    trainer.apply_accumulated_gradients()
+            # Compute sample weights for OHEM
+            sample_weights = None
+            if hard_mining_active and hard_tracker is not None and indices is not None:
+                # Build sample weights: 1.0 for normal, 1.0 + hard_mining_weight for hard
+                weights = np.ones(len(indices), dtype=np.float32)
+                for i, idx in enumerate(indices.numpy()):
+                    if hard_tracker.is_hard(idx):
+                        weights[i] = 1.0 + args.hard_mining_weight
+                sample_weights = tf.constant(weights, dtype=tf.float32)
+
+            # Training step (weighted or standard)
+            if sample_weights is not None:
+                if use_accumulation:
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate_weighted(
+                        images, coords, has_doc, sample_weights
+                    )
+                    if (batch_idx + 1) % accumulation_steps == 0:
+                        trainer.apply_accumulated_gradients()
+                else:
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_weighted(
+                        images, coords, has_doc, sample_weights
+                    )
             else:
-                # Standard training step
-                loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
-                    images, coords, has_doc
-                )
+                if use_accumulation:
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step_accumulate(
+                        images, coords, has_doc
+                    )
+                    if (batch_idx + 1) % accumulation_steps == 0:
+                        trainer.apply_accumulated_gradients()
+                else:
+                    loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
+                        images, coords, has_doc
+                    )
 
             loss_val = float(loss)
             train_losses.append(loss_val)
@@ -1422,7 +1650,14 @@ def main():
         )
         val_start_time = time.time()
         val_imgs_processed = 0
-        for images, coords, has_doc in val_pbar:
+        for batch in val_pbar:
+            # Unpack batch (with or without indices)
+            if args.hard_mining:
+                indices, images, coords, has_doc = batch
+            else:
+                images, coords, has_doc = batch
+                indices = None
+
             preds, score_logit, v_loss, v_simcc, v_coord, v_score = trainer.val_step(
                 images, coords, has_doc
             )
@@ -1431,7 +1666,14 @@ def main():
             val_coord.append(float(v_coord))
             val_score.append(float(v_score))
             score_pred = tf.sigmoid(score_logit).numpy()
-            metrics.update(preds.numpy(), coords.numpy(), score_pred, has_doc.numpy())
+
+            # Update metrics (with or without indices)
+            if args.hard_mining and indices is not None:
+                metrics.update_with_indices(
+                    indices.numpy(), preds.numpy(), coords.numpy(), score_pred, has_doc.numpy()
+                )
+            else:
+                metrics.update(preds.numpy(), coords.numpy(), score_pred, has_doc.numpy())
 
             # Calculate img/s
             val_imgs_processed += images.shape[0]
@@ -1443,7 +1685,16 @@ def main():
                 "img/s": f"{val_imgs_per_sec:.0f}",
             })
 
-        val_metrics = metrics.compute()
+        # Compute metrics and update hard sample tracker
+        if args.hard_mining:
+            val_metrics, pos_indices, max_corner_errors = metrics.compute_with_indices()
+            # Update hard sample tracker with validation results
+            hard_tracker.update_from_validation(pos_indices, max_corner_errors)
+            n_hard, avg_err = hard_tracker.get_stats()
+            # Save hard samples to checkpoint
+            hard_tracker.save(output_dir / "hard_samples.npz")
+        else:
+            val_metrics = metrics.compute()
 
         epoch_time = time.time() - epoch_start
         samples_per_sec = (len(train_ds) * args.batch_size) / epoch_time
@@ -1510,6 +1761,15 @@ def main():
             f"cls_f1={val_metrics['cls_f1']:.3f}",
             flush=True,
         )
+
+        # Hard mining stats
+        if args.hard_mining:
+            n_hard, avg_hard_err = hard_tracker.get_stats()
+            mining_status = "ACTIVE" if hard_mining_active else "inactive"
+            print(
+                f"           OHEM: {n_hard} hard samples (avg err: {avg_hard_err:.1f}px) [{mining_status}]",
+                flush=True,
+            )
 
         history["train"].append({
             "loss": avg_train_loss,

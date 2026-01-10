@@ -662,19 +662,16 @@ class CornerGAU(layers.Layer):
             ↓
         coords_refined = coords + delta
 
-    ~300 params total. XNNPACK-friendly (uses only Dense, matmul, softmax).
+    ~706 params total (with hidden_dim=64). XNNPACK-friendly (uses only Dense, matmul, softmax).
     """
 
     def __init__(self, hidden_dim: int = 32, **kwargs):
         super().__init__(**kwargs)
         self.hidden_dim = int(hidden_dim)
-        self._scale = None
-
-    def build(self, input_shape):
-        # Input: coords [B, 4, 2]
         self._scale = 1.0 / np.sqrt(float(self.hidden_dim))
 
         # Q, K, V projections: [B, 4, 2] -> [B, 4, hidden_dim]
+        # IMPORTANT: Create sublayers in __init__ so Keras tracks them properly for saving
         self.q_proj = layers.Dense(self.hidden_dim, use_bias=True, name="q_proj")
         self.k_proj = layers.Dense(self.hidden_dim, use_bias=True, name="k_proj")
         self.v_proj = layers.Dense(self.hidden_dim, use_bias=True, name="v_proj")
@@ -689,6 +686,10 @@ class CornerGAU(layers.Layer):
             name="out_proj"
         )
 
+    def build(self, input_shape):
+        # Input: coords [B, 4, 2]
+        if len(input_shape) != 3:
+            raise ValueError(f"CornerGAU expects rank-3 input [B, 4, 2], got shape={input_shape}")
         super().build(input_shape)
 
     def call(self, coords):
@@ -736,7 +737,10 @@ def _get_feature_layers(backbone, img_size: int):
     c4_hw = img_size // 16
     c5_hw = img_size // 32
 
-    for layer in backbone.layers:
+    # For CSPNeXt wrapped models, use the internal layer list
+    layers_to_search = getattr(backbone, '_cspnext_layers', None) or backbone.layers
+
+    for layer in layers_to_search:
         out = layer.output
         if not hasattr(out, 'shape') or len(out.shape) != 4:
             continue
@@ -857,9 +861,46 @@ def _build_backbone(
             alpha=alpha,
         )
 
+    if backbone_key in {"cspnext", "cspnext_tiny", "cspnexttiny"}:
+        # CSPNeXt-Tiny from keras_cv_attention_models
+        # NOTE: Requires keras-cv-attention-models package
+        # NOTE: NOT compatible with Keras 3.x - use tf-keras with TF_USE_LEGACY_KERAS=1
+        try:
+            from keras_cv_attention_models import cspnext
+        except ImportError:
+            raise ImportError(
+                "CSPNeXt backbone requires keras-cv-attention-models. "
+                "Install with: pip install keras-cv-attention-models\n"
+                "For TF >= 2.16: pip install tf-keras && export TF_USE_LEGACY_KERAS=1"
+            )
+
+        # Get input shape from inp tensor
+        input_shape = inp.shape[1:3]
+        if input_shape[0] is None:
+            img_h = img_w = 320
+        else:
+            img_h, img_w = int(input_shape[0]), int(input_shape[1])
+
+        # Build CSPNeXt-Tiny backbone
+        # pretrained options: "imagenet", "coco", None
+        pretrained = "imagenet" if backbone_weights == "imagenet" else backbone_weights
+        cspnext_model = cspnext.CSPNeXtTiny(
+            input_shape=(img_h, img_w, 3),
+            pretrained=pretrained,
+            num_classes=0,
+        )
+
+        # CSPNeXt creates its own input - we need to mark this for the caller
+        # The model returned here uses CSPNeXt's input tensor, not the passed `inp`
+        # Set a marker so build_doccorner_simcc_v3 can handle this case
+        cspnext_model._uses_own_input = True
+        cspnext_model._cspnext_layers = cspnext_model.layers
+
+        return cspnext_model
+
     raise ValueError(
         f"Unsupported backbone='{backbone}'. "
-        "Use one of: mobilenetv2, mobilenetv3_small, mobilenetv3_large."
+        "Use one of: mobilenetv2, mobilenetv3_small, mobilenetv3_large, cspnext."
     )
 
 
@@ -943,6 +984,11 @@ def build_doccorner_simcc_v3(
         backbone_include_preprocessing=backbone_include_preprocessing,
         backbone_nonfused_hardswish=backbone_nonfused_hardswish,
     )
+
+    # CSPNeXt uses its own input tensor (from keras_cv_attention_models)
+    # Other backbones use our inp tensor
+    if getattr(backbone_model, '_uses_own_input', False):
+        inp = backbone_model.input  # Use CSPNeXt's input tensor
 
     c2, c3, c4, c5 = _get_feature_layers(backbone_model, img_size=img_size)
 

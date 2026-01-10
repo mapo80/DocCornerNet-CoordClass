@@ -364,6 +364,73 @@ class ValidationMetrics:
 
         return results
 
+    def update_with_indices(
+        self,
+        indices: np.ndarray,
+        pred_coords: np.ndarray,
+        gt_coords: np.ndarray,
+        pred_scores: np.ndarray,
+        has_doc: np.ndarray,
+    ):
+        """
+        Add batch of predictions with sample indices (for OHEM).
+
+        Args:
+            indices: [B] sample indices
+            pred_coords: [B, 8] predicted coordinates
+            gt_coords: [B, 8] ground truth coordinates
+            pred_scores: [B] or [B, 1] predicted scores (after sigmoid)
+            has_doc: [B] or [B, 1] ground truth labels
+        """
+        if not hasattr(self, 'indices_list'):
+            self.indices_list = []
+
+        self.indices_list.append(indices)
+        self.update(pred_coords, gt_coords, pred_scores, has_doc)
+
+    def compute_with_indices(self) -> tuple:
+        """
+        Compute aggregate metrics and return per-sample error information for OHEM.
+
+        Returns:
+            Tuple of:
+            - results: Dictionary with all metrics
+            - pos_indices: Array of sample indices for positive samples (has_doc=1)
+            - max_corner_per_sample: Array of max corner error per positive sample (in pixels)
+        """
+        pred_coords = np.concatenate(self.pred_coords_list, axis=0)
+        gt_coords = np.concatenate(self.gt_coords_list, axis=0)
+        pred_scores = np.concatenate(self.pred_scores_list, axis=0)
+        has_doc = np.concatenate(self.has_doc_list, axis=0)
+
+        # Get indices if available
+        if hasattr(self, 'indices_list') and self.indices_list:
+            all_indices = np.concatenate(self.indices_list, axis=0)
+        else:
+            all_indices = np.arange(len(pred_coords))
+
+        mask = has_doc == 1
+        num_with_doc = int(mask.sum())
+
+        # Compute standard metrics first
+        results = self.compute()
+
+        # Compute per-sample max corner error for positive samples
+        if num_with_doc == 0:
+            return results, np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+
+        pred_coords_pos = pred_coords[mask]
+        gt_coords_pos = gt_coords[mask]
+        pos_indices = all_indices[mask]
+
+        # Corner error per sample (vectorized)
+        pred_px = pred_coords_pos.reshape(-1, 4, 2) * float(self.img_size)
+        gt_px = gt_coords_pos.reshape(-1, 4, 2) * float(self.img_size)
+        per_corner = np.sqrt(((pred_px - gt_px) ** 2).sum(axis=2))  # [N,4]
+        max_corner_per_sample = per_corner.max(axis=1)  # [N] max corner error per image
+
+        return results, pos_indices, max_corner_per_sample
+
 
 if __name__ == "__main__":
     print(f"Shapely available: {SHAPELY_AVAILABLE}")
