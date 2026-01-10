@@ -7,6 +7,6 @@ shapely
 huggingface_hub
 pyarrow
 
-# Optional: CSPNeXt backbone (requires legacy Keras)
-# pip install keras-cv-attention-models tf-keras
-# export TF_USE_LEGACY_KERAS=1
+# CSPNeXt backbone (requires legacy Keras for TF >= 2.16)
+keras-cv-attention-models
+tf-keras

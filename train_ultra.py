@@ -519,16 +519,25 @@ def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_w
     print(f"  Found {len(parquet_files)} parquet files", flush=True)
 
     # =========================================================================
-    # OPTIMIZED: Vectorized parquet reading with PyArrow
+    # OPTIMIZED: Parallel parquet reading with PyArrow + ThreadPool
     # =========================================================================
     import pyarrow as pa
 
-    # Read all parquet files and concatenate into single table
-    print("  Reading parquet files (vectorized)...", flush=True)
+    # Read parquet files in parallel (I/O bound)
+    print(f"  Reading parquet files (parallel, {num_workers} workers)...", flush=True)
     read_start = time.time()
-    tables = []
-    for pf in tqdm(parquet_files, desc="Reading parquet", unit="file"):
-        tables.append(pq.read_table(pf))
+
+    def read_parquet_file(pf):
+        return pq.read_table(pf)
+
+    with ThreadPoolExecutor(max_workers=min(num_workers, len(parquet_files))) as executor:
+        tables = list(tqdm(
+            executor.map(read_parquet_file, parquet_files),
+            total=len(parquet_files),
+            desc="Reading parquet",
+            unit="file"
+        ))
+
     combined = pa.concat_tables(tables)
     del tables
     read_time = time.time() - read_start
@@ -573,21 +582,35 @@ def load_dataset_from_parquet(parquet_dir: str, split: str, img_size: int, num_w
     # Pre-allocate image array
     images = np.empty((n_samples, img_size, img_size, 3), dtype=np.uint8)
 
-    def process_image(args):
-        """Process a single image from bytes."""
-        idx, img_bytes = args
-        img = Image.open(io.BytesIO(img_bytes))
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img = img.resize((img_size, img_size), Image.BILINEAR)
-        return idx, np.asarray(img, dtype=np.uint8).copy()
+    # Use OpenCV for faster decoding (3-5x faster than PIL)
+    import cv2
 
-    # Process images in parallel (this is the main bottleneck - I/O bound)
-    print(f"  Decoding {n_samples} images with {num_workers} workers...", flush=True)
+    def process_image_cv2(args):
+        """Process a single image from bytes using OpenCV (faster than PIL)."""
+        idx, img_bytes = args
+        # Decode JPEG/PNG from bytes
+        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            # Fallback to PIL if OpenCV fails
+            from PIL import Image
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img = img.resize((img_size, img_size), Image.BILINEAR)
+            return idx, np.asarray(img, dtype=np.uint8)
+        # OpenCV uses BGR, convert to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Resize
+        img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+        return idx, img
+
+    # Process images in parallel (CPU bound with OpenCV)
+    print(f"  Decoding {n_samples} images with {num_workers} workers (OpenCV)...", flush=True)
     decode_start = time.time()
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         for idx, img_array in tqdm(
-            executor.map(process_image, enumerate(image_bytes_list)),
+            executor.map(process_image_cv2, enumerate(image_bytes_list)),
             total=n_samples,
             desc=f"Decoding {split}",
             unit="img",
