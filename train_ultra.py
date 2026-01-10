@@ -799,17 +799,69 @@ class FastDataset:
     def _build_base_dataset(self):
         """Build tf.data.Dataset from numpy arrays.
 
-        OPTIMIZED: Single from_tensor_slices call instead of chunked concatenation.
-        This avoids O(n²) complexity from repeated concatenate() calls.
+        OPTIMIZED: Use range + py_function for instant dataset creation.
+        from_tensor_slices copies all data upfront which is slow for large arrays.
+        This approach uses lazy loading with numpy indexing.
         """
-        with tf.device("/CPU:0"):
-            if self.return_indices:
-                return tf.data.Dataset.from_tensor_slices(
-                    (self.indices, self.images, self.coords, self.has_doc)
+        img_size = self.images.shape[1]
+
+        # Use py_function for fast numpy indexing (avoids TF graph overhead)
+        if self.return_indices:
+            def get_sample(idx):
+                i = idx.numpy()
+                return (
+                    np.int64(i),
+                    self.images[i],
+                    self.coords[i],
+                    self.has_doc[i]
                 )
-            return tf.data.Dataset.from_tensor_slices(
-                (self.images, self.coords, self.has_doc)
+
+            dataset = tf.data.Dataset.range(self.n_samples)
+            dataset = dataset.map(
+                lambda idx: tf.py_function(
+                    get_sample,
+                    [idx],
+                    [tf.int64, tf.uint8, tf.float32, tf.float32]
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE
             )
+            # Set shapes explicitly for downstream ops
+            dataset = dataset.map(
+                lambda idx, img, coord, has_doc: (
+                    idx,
+                    tf.ensure_shape(img, [img_size, img_size, 3]),
+                    tf.ensure_shape(coord, [8]),
+                    has_doc
+                )
+            )
+        else:
+            def get_sample(idx):
+                i = idx.numpy()
+                return (
+                    self.images[i],
+                    self.coords[i],
+                    self.has_doc[i]
+                )
+
+            dataset = tf.data.Dataset.range(self.n_samples)
+            dataset = dataset.map(
+                lambda idx: tf.py_function(
+                    get_sample,
+                    [idx],
+                    [tf.uint8, tf.float32, tf.float32]
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+            # Set shapes explicitly for downstream ops
+            dataset = dataset.map(
+                lambda img, coord, has_doc: (
+                    tf.ensure_shape(img, [img_size, img_size, 3]),
+                    tf.ensure_shape(coord, [8]),
+                    has_doc
+                )
+            )
+
+        return dataset
 
     def _normalize_batch(self, *args):
         """Normalize a batch with TF ops."""
