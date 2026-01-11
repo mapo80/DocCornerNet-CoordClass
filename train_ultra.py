@@ -949,6 +949,72 @@ class FastDataset:
 
 
 # ============================================================================
+# EMA (Exponential Moving Average) for model weights
+# ============================================================================
+
+class EMAModel:
+    """
+    Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of model weights that is updated with EMA.
+    At inference time, swap in EMA weights for better generalization.
+
+    Usage:
+        ema = EMAModel(model, decay=0.999)
+        for epoch in range(epochs):
+            for batch in dataloader:
+                train_step(batch)
+                ema.update(model)  # Update EMA after each step
+            # Evaluate with EMA weights
+            ema.apply(model)
+            evaluate(model)
+            ema.restore(model)  # Restore original weights for training
+    """
+
+    def __init__(self, model, decay: float = 0.999):
+        """
+        Args:
+            model: Keras model to track
+            decay: EMA decay factor (0.999 = very smooth, 0.99 = more responsive)
+        """
+        self.decay = decay
+        # Store shadow weights as numpy arrays to avoid TF variable overhead
+        self.shadow_weights = [w.numpy().copy() for w in model.trainable_weights]
+        self.backup_weights = None
+
+    def update(self, model):
+        """Update EMA weights with current model weights."""
+        for i, w in enumerate(model.trainable_weights):
+            self.shadow_weights[i] = (
+                self.decay * self.shadow_weights[i] +
+                (1.0 - self.decay) * w.numpy()
+            )
+
+    def apply(self, model):
+        """Apply EMA weights to model (backup current weights first)."""
+        self.backup_weights = [w.numpy().copy() for w in model.trainable_weights]
+        for w, shadow in zip(model.trainable_weights, self.shadow_weights):
+            w.assign(shadow)
+
+    def restore(self, model):
+        """Restore original weights after apply()."""
+        if self.backup_weights is not None:
+            for w, backup in zip(model.trainable_weights, self.backup_weights):
+                w.assign(backup)
+            self.backup_weights = None
+
+    def save_weights(self, filepath: str):
+        """Save EMA weights to file."""
+        np.savez(filepath, *self.shadow_weights)
+
+    def load_weights(self, filepath: str, model):
+        """Load EMA weights from file."""
+        data = np.load(filepath)
+        for i, key in enumerate(data.files):
+            self.shadow_weights[i] = data[key]
+
+
+# ============================================================================
 # Training logic
 # ============================================================================
 
@@ -963,7 +1029,8 @@ class Trainer:
 
     def __init__(self, model, optimizer, img_size, sigma_px, tau,
                  w_simcc, w_coord, w_score, platform='cuda', augment=False,
-                 accumulation_steps=1):
+                 accumulation_steps=1, label_smoothing=0.0, mixup_alpha=0.0,
+                 rotation_range=0.0, perspective_intensity=0.0):
         self.model = model
         self.optimizer = optimizer
         self.platform = platform
@@ -971,6 +1038,10 @@ class Trainer:
         self.augment = augment
         self.img_size = img_size
         self.accumulation_steps = accumulation_steps
+        self.label_smoothing = label_smoothing
+        self.mixup_alpha = mixup_alpha
+        self.rotation_range = rotation_range
+        self.perspective_intensity = perspective_intensity
 
         # Pre-compute constants as tensors
         self.img_size_tf = tf.constant(img_size, dtype=tf.int32)
@@ -980,6 +1051,8 @@ class Trainer:
         self.w_simcc = tf.constant(w_simcc, dtype=tf.float32)
         self.w_coord = tf.constant(w_coord, dtype=tf.float32)
         self.w_score = tf.constant(w_score, dtype=tf.float32)
+        self.label_smoothing_tf = tf.constant(label_smoothing, dtype=tf.float32)
+        self.mixup_alpha_tf = tf.constant(mixup_alpha, dtype=tf.float32)
 
         # Gradient accumulation buffers (initialized lazily)
         self._gradient_accumulator = None
@@ -1003,7 +1076,58 @@ class Trainer:
     @tf.function
     def augment_batch(self, images, coords, has_doc):
         """Apply augmentation to batch."""
-        return tf_augment_batch(images, coords, has_doc, self.img_size, image_norm="imagenet")
+        return tf_augment_batch(
+            images, coords, has_doc, self.img_size,
+            image_norm="imagenet",
+            rotation_range=self.rotation_range,
+            perspective_intensity=self.perspective_intensity
+        )
+
+    @tf.function
+    def apply_mixup(self, images, coords, has_doc):
+        """
+        Apply MixUp augmentation to a batch.
+
+        MixUp blends pairs of samples with a random mixing coefficient lambda
+        drawn from Beta(alpha, alpha). This creates virtual training examples
+        and encourages the model to behave linearly in-between training examples.
+
+        Args:
+            images: [B, H, W, 3] input images
+            coords: [B, 8] corner coordinates
+            has_doc: [B] document presence mask
+
+        Returns:
+            mixed_images, mixed_coords, mixed_has_doc
+        """
+        batch_size = tf.shape(images)[0]
+
+        # Sample mixing coefficient from Beta distribution
+        # Beta(alpha, alpha) is symmetric around 0.5
+        # Using the fact that Beta(a,a) can be sampled via: lambda = gamma_a / (gamma_a + gamma_b)
+        gamma1 = tf.random.gamma([1], self.mixup_alpha_tf)[0]
+        gamma2 = tf.random.gamma([1], self.mixup_alpha_tf)[0]
+        lam = gamma1 / (gamma1 + gamma2 + 1e-8)
+
+        # Ensure lambda >= 0.5 so the original sample dominates (symmetric mixup)
+        lam = tf.maximum(lam, 1.0 - lam)
+
+        # Shuffle indices for pairing
+        indices = tf.random.shuffle(tf.range(batch_size))
+
+        # Mix images
+        images_shuffled = tf.gather(images, indices)
+        mixed_images = lam * images + (1.0 - lam) * images_shuffled
+
+        # Mix coordinates (only for positive samples)
+        coords_shuffled = tf.gather(coords, indices)
+        mixed_coords = lam * coords + (1.0 - lam) * coords_shuffled
+
+        # Mix has_doc (soft labels for document presence)
+        has_doc_shuffled = tf.gather(has_doc, indices)
+        mixed_has_doc = lam * has_doc + (1.0 - lam) * has_doc_shuffled
+
+        return mixed_images, mixed_coords, mixed_has_doc
 
     def _compute_loss(self, images, coords_gt, has_doc, training, sample_weights=None):
         """Compute total loss and its components.
@@ -1028,8 +1152,8 @@ class Trainer:
         gt_x = gt_coords_4x2[:, :, 0]
         gt_y = gt_coords_4x2[:, :, 1]
 
-        target_x = gaussian_1d_targets(gt_x, self.img_size_tf, self.sigma_px)
-        target_y = gaussian_1d_targets(gt_y, self.img_size_tf, self.sigma_px)
+        target_x = gaussian_1d_targets(gt_x, self.img_size_tf, self.sigma_px, self.label_smoothing_tf)
+        target_y = gaussian_1d_targets(gt_y, self.img_size_tf, self.sigma_px, self.label_smoothing_tf)
 
         log_pred_x = tf.nn.log_softmax(simcc_x / self.tau, axis=-1)
         log_pred_y = tf.nn.log_softmax(simcc_y / self.tau, axis=-1)
@@ -1421,10 +1545,13 @@ def main():
                         help="FC expansion dimension before classification (0=disabled, 256=RTMPose default)")
 
     # Loss
-    parser.add_argument("--sigma_px", type=float, default=3.0)
+    parser.add_argument("--sigma_px", type=float, default=3.0,
+                        help="Gaussian sigma for SimCC targets in pixels (default: 3.0, try 2.5 for small models)")
     parser.add_argument("--w_simcc", type=float, default=1.0)
     parser.add_argument("--w_coord", type=float, default=0.5)
     parser.add_argument("--w_score", type=float, default=0.5)
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing factor for SimCC targets (0.0=none, 0.1=typical)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=128)
@@ -1438,6 +1565,9 @@ def main():
     parser.add_argument("--lr_patience", type=int, default=7)
     parser.add_argument("--lr_factor", type=float, default=0.5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--lr_schedule", type=str, default="plateau",
+                        choices=["plateau", "cosine"],
+                        help="Learning rate schedule: 'plateau' (reduce on plateau) or 'cosine' (cosine annealing)")
 
     # Loading
     parser.add_argument("--num_workers", type=int, default=8,
@@ -1445,7 +1575,17 @@ def main():
 
     # Augmentation
     parser.add_argument("--augment", action="store_true",
-                        help="Enable data augmentation")
+                        help="Enable data augmentation (color jitter + horizontal flip)")
+    parser.add_argument("--rotation_range", type=float, default=0.0,
+                        help="Max rotation angle in degrees (0.0=disabled, 15.0=typical)")
+    parser.add_argument("--perspective_intensity", type=float, default=0.0,
+                        help="Perspective transform intensity (0.0=disabled, 0.05=mild, 0.1=strong)")
+    parser.add_argument("--mixup_alpha", type=float, default=0.0,
+                        help="MixUp alpha parameter (0.0=disabled, 0.2=typical). "
+                             "Blends pairs of samples for regularization.")
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay for model weights (0.0=disabled, 0.999=typical). "
+                             "Maintains exponential moving average of weights for better generalization.")
 
     # Hard Mining (OHEM)
     parser.add_argument("--hard_mining", action="store_true",
@@ -1621,7 +1761,11 @@ def main():
         model, optimizer, args.img_size, args.sigma_px, args.tau,
         args.w_simcc, args.w_coord, args.w_score,
         platform=platform, augment=args.augment,
-        accumulation_steps=args.accumulation_steps
+        accumulation_steps=args.accumulation_steps,
+        label_smoothing=args.label_smoothing,
+        mixup_alpha=args.mixup_alpha,
+        rotation_range=args.rotation_range,
+        perspective_intensity=args.perspective_intensity
     )
 
     # ========================================================================
@@ -1657,6 +1801,17 @@ def main():
     if args.hard_mining:
         top_k_str = f", top_k={args.hard_mining_top_k*100:.0f}%" if args.hard_mining_top_k > 0 else ""
         print(f"Hard mining: ENABLED (threshold={args.hard_mining_threshold}px, weight={args.hard_mining_weight}{top_k_str}, start={args.hard_mining_start*100:.0f}%)", flush=True)
+    if args.label_smoothing > 0:
+        print(f"Label smoothing: {args.label_smoothing}", flush=True)
+    if args.mixup_alpha > 0:
+        print(f"MixUp: alpha={args.mixup_alpha}", flush=True)
+    if args.rotation_range > 0:
+        print(f"Rotation: ±{args.rotation_range}°", flush=True)
+    if args.perspective_intensity > 0:
+        print(f"Perspective: intensity={args.perspective_intensity}", flush=True)
+    if args.ema_decay > 0:
+        print(f"EMA: decay={args.ema_decay}", flush=True)
+    print(f"LR schedule: {args.lr_schedule}", flush=True)
     print("=" * 80, flush=True)
 
     best_iou = 0.0
@@ -1665,6 +1820,11 @@ def main():
     no_improve_count = 0
     lr_no_improve_count = 0
     history = {"train": [], "val": []}
+
+    # Initialize EMA model if enabled
+    ema_model = None
+    if args.ema_decay > 0:
+        ema_model = EMAModel(model, decay=args.ema_decay)
 
     # Initialize hard sample tracker for OHEM
     hard_tracker = None
@@ -1688,11 +1848,22 @@ def main():
         # Reshuffle training data for new epoch
         train_ds.reshuffle()
 
-        # Warmup LR
+        # Learning rate scheduling
         if epoch < args.warmup_epochs:
+            # Warmup LR (linear increase from lr/warmup_epochs to lr)
             warmup_lr = args.lr * (epoch + 1) / args.warmup_epochs
             optimizer.learning_rate.assign(warmup_lr)
             current_lr = warmup_lr
+        elif args.lr_schedule == "cosine":
+            # Cosine annealing after warmup
+            # Progress from 0 to 1 over remaining epochs after warmup
+            remaining_epochs = args.epochs - args.warmup_epochs
+            progress = (epoch - args.warmup_epochs) / remaining_epochs
+            # Cosine decay from lr to min_lr
+            cosine_lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + np.cos(np.pi * progress))
+            optimizer.learning_rate.assign(cosine_lr)
+            current_lr = cosine_lr
+        # Note: for "plateau" schedule, LR is reduced in the checkpointing section when no improvement
 
         # Activate hard mining after curriculum warmup
         if args.hard_mining and epoch >= hard_mining_start_epoch:
@@ -1745,6 +1916,10 @@ def main():
             if args.augment:
                 images, coords = trainer.augment_batch(images, coords, has_doc)
 
+            # Apply MixUp augmentation (if enabled)
+            if trainer.mixup_alpha > 0:
+                images, coords, has_doc = trainer.apply_mixup(images, coords, has_doc)
+
             # Compute sample weights for OHEM
             sample_weights = None
             if hard_mining_active and hard_tracker is not None and indices is not None:
@@ -1778,6 +1953,10 @@ def main():
                     loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err, coords_pred = trainer.train_step(
                         images, coords, has_doc
                     )
+
+            # Update EMA weights
+            if ema_model is not None:
+                ema_model.update(model)
 
             # Update hard sample tracker with per-sample errors (OHEM on training data)
             if args.hard_mining and hard_tracker is not None and indices is not None:
@@ -1822,7 +2001,10 @@ def main():
         avg_train_iou = float(np.mean(train_iou)) if train_iou else 0.0
         avg_train_err = float(np.mean(train_err)) if train_err else 0.0
 
-        # Validation
+        # Validation (use EMA weights if enabled)
+        if ema_model is not None:
+            ema_model.apply(model)
+
         val_losses = []
         val_simcc = []
         val_coord = []
@@ -1885,6 +2067,10 @@ def main():
             hard_tracker.save(output_dir / "hard_samples.npz")
         else:
             val_metrics = metrics.compute()
+
+        # Restore original weights after validation (EMA weights stay in shadow)
+        if ema_model is not None:
+            ema_model.restore(model)
 
         epoch_time = time.time() - epoch_start
         samples_per_sec = (len(train_ds) * args.batch_size) / epoch_time
@@ -1984,16 +2170,26 @@ def main():
             no_improve_count = 0
             lr_no_improve_count = 0
 
-            model.save_weights(str(output_dir / "best_model.weights.h5"))
-            inference_model = create_inference_model(model)
-            inference_model.save(output_dir / "best_model_inference.keras")
+            # Save EMA weights if enabled, otherwise save regular weights
+            if ema_model is not None:
+                # Apply EMA weights, save, then restore
+                ema_model.apply(model)
+                model.save_weights(str(output_dir / "best_model.weights.h5"))
+                inference_model = create_inference_model(model)
+                inference_model.save(output_dir / "best_model_inference.keras")
+                ema_model.restore(model)
+            else:
+                model.save_weights(str(output_dir / "best_model.weights.h5"))
+                inference_model = create_inference_model(model)
+                inference_model.save(output_dir / "best_model_inference.keras")
 
             print(f"  * New best IoU: {best_iou:.4f}", flush=True)
         else:
             no_improve_count += 1
             lr_no_improve_count += 1
 
-            if epoch >= args.warmup_epochs:
+            # Reduce LR on plateau (only for "plateau" schedule)
+            if args.lr_schedule == "plateau" and epoch >= args.warmup_epochs:
                 if lr_no_improve_count >= args.lr_patience and current_lr > args.min_lr:
                     current_lr = max(current_lr * args.lr_factor, args.min_lr)
                     optimizer.learning_rate.assign(current_lr)
@@ -2007,7 +2203,12 @@ def main():
             print(f"\nEarly stopping at epoch {epoch + 1}", flush=True)
             break
 
-    model.save_weights(str(output_dir / "final_model.weights.h5"))
+    # Save final model (use EMA weights if enabled)
+    if ema_model is not None:
+        ema_model.apply(model)
+        model.save_weights(str(output_dir / "final_model.weights.h5"))
+    else:
+        model.save_weights(str(output_dir / "final_model.weights.h5"))
 
     print("\n" + "=" * 80, flush=True)
     print("Training Complete!", flush=True)

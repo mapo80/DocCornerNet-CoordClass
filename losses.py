@@ -13,7 +13,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 
-def gaussian_1d_targets(coords_01, bins=224, sigma_px=2.0):
+def gaussian_1d_targets(coords_01, bins=224, sigma_px=2.0, label_smoothing=0.0):
     """
     Generate 1D Gaussian target distributions for SimCC.
 
@@ -21,6 +21,7 @@ def gaussian_1d_targets(coords_01, bins=224, sigma_px=2.0):
         coords_01: [B, 4] coordinates in [0, 1] for one axis (X or Y)
         bins: Number of bins (typically img_size)
         sigma_px: Gaussian sigma in pixel space
+        label_smoothing: Label smoothing factor (0.0 = no smoothing, 0.1 = 10% uniform)
 
     Returns:
         targets: [B, 4, bins] normalized Gaussian distributions
@@ -40,6 +41,11 @@ def gaussian_1d_targets(coords_01, bins=224, sigma_px=2.0):
     # Normalize to probability distribution
     gauss = gauss / (tf.reduce_sum(gauss, axis=-1, keepdims=True) + 1e-9)
 
+    # Apply label smoothing: blend with uniform distribution
+    if label_smoothing > 0:
+        uniform = 1.0 / tf.cast(bins, tf.float32)
+        gauss = (1.0 - label_smoothing) * gauss + label_smoothing * uniform
+
     return gauss
 
 
@@ -51,17 +57,19 @@ class SimCCLoss(keras.layers.Layer):
     cross-entropy between predicted logits and target Gaussian distributions.
     """
 
-    def __init__(self, bins=224, sigma_px=2.0, tau=1.0, **kwargs):
+    def __init__(self, bins=224, sigma_px=2.0, tau=1.0, label_smoothing=0.0, **kwargs):
         """
         Args:
             bins: Number of bins (img_size)
             sigma_px: Gaussian sigma for targets
             tau: Temperature for predicted softmax
+            label_smoothing: Label smoothing factor (0.0 = no smoothing)
         """
         super().__init__(**kwargs)
         self.bins = bins
         self.sigma_px = sigma_px
         self.tau = tau
+        self.label_smoothing = label_smoothing
 
     def call(self, simcc_x, simcc_y, gt_coords, mask):
         """
@@ -82,8 +90,8 @@ class SimCCLoss(keras.layers.Layer):
         gt_y = gt_coords_4x2[:, :, 1]  # [B, 4]
 
         # Generate target distributions
-        target_x = gaussian_1d_targets(gt_x, self.bins, self.sigma_px)  # [B, 4, bins]
-        target_y = gaussian_1d_targets(gt_y, self.bins, self.sigma_px)
+        target_x = gaussian_1d_targets(gt_x, self.bins, self.sigma_px, self.label_smoothing)  # [B, 4, bins]
+        target_y = gaussian_1d_targets(gt_y, self.bins, self.sigma_px, self.label_smoothing)
 
         # Cross-entropy with soft targets
         # CE = -sum(target * log(softmax(logits)))

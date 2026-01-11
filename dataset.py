@@ -49,6 +49,7 @@ DEFAULT_AUG_CONFIG = {
     "blur_kernel": 3,
     "translate": 0.0,
     "perspective": (0.0, 0.03),
+    "perspective_intensity": 0.0,  # Random perspective transform (0.0=disabled, 0.05=mild)
 }
 
 
@@ -110,6 +111,100 @@ def load_outlier_list(outlier_path: str) -> set:
         return set()
     with open(outlier_path, 'r') as f:
         return {line.strip() for line in f if line.strip()}
+
+
+def apply_perspective_transform(
+    image: Image.Image,
+    coords: np.ndarray,
+    intensity: float = 0.05,
+) -> Tuple[Image.Image, np.ndarray]:
+    """
+    Apply random perspective transform to image and coordinates.
+
+    This simulates different viewing angles by applying a random homography.
+
+    Args:
+        image: PIL Image (should be square)
+        coords: [8] array of normalized coordinates (x0,y0,x1,y1,...)
+        intensity: Transform intensity (0.0-0.1, higher = more extreme)
+
+    Returns:
+        Transformed image and coordinates
+    """
+    w, h = image.size
+
+    # Generate random corner offsets
+    # Each corner moves by a random amount within intensity * size
+    offset = intensity * min(w, h)
+
+    # Original corners: TL, TR, BR, BL
+    src_corners = np.array([
+        [0, 0],
+        [w, 0],
+        [w, h],
+        [0, h],
+    ], dtype=np.float32)
+
+    # Randomly perturb destination corners
+    dst_corners = src_corners.copy()
+    for i in range(4):
+        dst_corners[i, 0] += random.uniform(-offset, offset)
+        dst_corners[i, 1] += random.uniform(-offset, offset)
+
+    # Compute perspective transform coefficients
+    # Using the 8-parameter perspective transform formula
+    # See: https://web.archive.org/web/20150222120106/xenia.media.mit.edu/~cwren/interpolator/
+
+    def find_coeffs(source_coords, target_coords):
+        """Find perspective transform coefficients."""
+        matrix = []
+        for s, t in zip(source_coords, target_coords):
+            matrix.append([t[0], t[1], 1, 0, 0, 0, -s[0]*t[0], -s[0]*t[1]])
+            matrix.append([0, 0, 0, t[0], t[1], 1, -s[1]*t[0], -s[1]*t[1]])
+        A = np.array(matrix, dtype=np.float64)
+        B = np.array(source_coords, dtype=np.float64).reshape(8)
+        res = np.linalg.lstsq(A, B, rcond=None)[0]
+        return res.tolist()
+
+    # Transform image
+    # PIL transform goes from output to input, so we swap src and dst
+    coeffs = find_coeffs(dst_corners, src_corners)
+    transformed_image = image.transform(
+        (w, h),
+        Image.PERSPECTIVE,
+        coeffs,
+        Image.BILINEAR,
+        fillcolor=(128, 128, 128)
+    )
+
+    # Transform coordinates
+    # For each point, apply the inverse transform (src -> dst mapping)
+    # We need to compute the forward transform matrix
+    def perspective_transform_point(x, y, coeffs):
+        """Apply perspective transform to a single point."""
+        a, b, c, d, e, f, g, h = coeffs
+        denom = g * x + h * y + 1
+        new_x = (a * x + b * y + c) / denom
+        new_y = (d * x + e * y + f) / denom
+        return new_x, new_y
+
+    # Compute inverse coefficients (dst -> src, which is what we applied to image)
+    inv_coeffs = find_coeffs(src_corners, dst_corners)
+
+    # Transform each coordinate point
+    transformed_coords = []
+    for i in range(0, 8, 2):
+        # Convert normalized to pixel
+        px = coords[i] * w
+        py = coords[i + 1] * h
+
+        # Apply transform
+        new_px, new_py = perspective_transform_point(px, py, inv_coeffs)
+
+        # Convert back to normalized
+        transformed_coords.extend([new_px / w, new_py / h])
+
+    return transformed_image, np.array(transformed_coords, dtype=np.float32)
 
 
 def rotate_coords(coords: np.ndarray, angle_deg: float, aspect_ratio: float = 1.0) -> np.ndarray:
@@ -260,6 +355,11 @@ def apply_geometric_augmentation(
             1.0 - x2, y2,  # new BL = old BR
         ], dtype=np.float32)
 
+    # Perspective transform (simulates different viewing angles)
+    perspective_intensity = cfg.get("perspective_intensity", 0.0)
+    if perspective_intensity > 0:
+        image, coords = apply_perspective_transform(image, coords, perspective_intensity)
+
     return image, coords
 
 
@@ -294,7 +394,248 @@ def apply_full_augmentation(
 # TensorFlow GPU Augmentations (fast, runs on GPU)
 # =============================================================================
 
-def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, image_norm: str = "imagenet"):
+def tf_rotate_batch(images, coords, has_doc, max_angle_deg=15.0, fill_value=0.0):
+    """
+    Apply random rotation to a batch of images and coordinates using TensorFlow.
+
+    Uses tf.raw_ops.ImageProjectiveTransformV3 for GPU-accelerated rotation.
+
+    Args:
+        images: [B, H, W, 3] float32 tensor
+        coords: [B, 8] float32 tensor (normalized [0,1])
+        has_doc: [B] float32 tensor
+        max_angle_deg: Maximum rotation angle in degrees (±max_angle_deg)
+        fill_value: Value to fill empty areas (default 0.0 for ImageNet normalized)
+
+    Returns:
+        rotated_images: [B, H, W, 3] float32
+        rotated_coords: [B, 8] float32
+    """
+    batch_size = tf.shape(images)[0]
+    h = tf.cast(tf.shape(images)[1], tf.float32)
+    w = tf.cast(tf.shape(images)[2], tf.float32)
+
+    # Random angles per sample (in radians)
+    max_angle_rad = max_angle_deg * (np.pi / 180.0)
+    angles_rad = tf.random.uniform([batch_size], -max_angle_rad, max_angle_rad)
+
+    # Build affine transform matrices for tf.raw_ops.ImageProjectiveTransformV3
+    # The transform matrix is [a, b, c, d, e, f, g, h] where:
+    # x' = (a*x + b*y + c) / (g*x + h*y + 1)
+    # y' = (d*x + e*y + f) / (g*x + h*y + 1)
+    # For rotation around center with g=h=0:
+    # x' = a*x + b*y + c
+    # y' = d*x + e*y + f
+
+    cos_a = tf.cos(angles_rad)
+    sin_a = tf.sin(angles_rad)
+
+    # Center of image (in pixel coordinates)
+    cx = w / 2.0
+    cy = h / 2.0
+
+    # Rotation matrix around center:
+    # x' = cos(θ)*(x-cx) - sin(θ)*(y-cy) + cx
+    # y' = sin(θ)*(x-cx) + cos(θ)*(y-cy) + cy
+    # Expanding:
+    # x' = cos(θ)*x - sin(θ)*y + cx*(1-cos(θ)) + cy*sin(θ)
+    # y' = sin(θ)*x + cos(θ)*y + cy*(1-cos(θ)) - cx*sin(θ)
+
+    a = cos_a
+    b = -sin_a
+    c = cx * (1.0 - cos_a) + cy * sin_a
+    d = sin_a
+    e = cos_a
+    f = cy * (1.0 - cos_a) - cx * sin_a
+    g = tf.zeros([batch_size], dtype=tf.float32)
+    h_coef = tf.zeros([batch_size], dtype=tf.float32)
+
+    transforms = tf.stack([a, b, c, d, e, f, g, h_coef], axis=1)
+
+    # Apply transform to images
+    output_shape = tf.stack([tf.shape(images)[1], tf.shape(images)[2]])
+    rotated_images = tf.raw_ops.ImageProjectiveTransformV3(
+        images=images,
+        transforms=transforms,
+        output_shape=output_shape,
+        interpolation='BILINEAR',
+        fill_mode='CONSTANT',
+        fill_value=fill_value
+    )
+
+    # Transform coordinates
+    # For normalized coords in [0,1], we rotate around (0.5, 0.5)
+    # x' = cos(θ)*(x-0.5) - sin(θ)*(y-0.5) + 0.5
+    # y' = sin(θ)*(x-0.5) + cos(θ)*(y-0.5) + 0.5
+
+    # Reshape coords to [B, 4, 2]
+    coords_4x2 = tf.reshape(coords, [-1, 4, 2])
+
+    # Center at origin
+    coords_centered = coords_4x2 - 0.5
+
+    # Expand angles for broadcasting [B, 1, 1]
+    cos_a_exp = tf.reshape(cos_a, [-1, 1, 1])
+    sin_a_exp = tf.reshape(sin_a, [-1, 1, 1])
+
+    # Rotate
+    x_rot = coords_centered[:, :, 0:1] * cos_a_exp - coords_centered[:, :, 1:2] * sin_a_exp
+    y_rot = coords_centered[:, :, 0:1] * sin_a_exp + coords_centered[:, :, 1:2] * cos_a_exp
+
+    # Shift back to [0, 1] range
+    coords_rotated = tf.concat([x_rot + 0.5, y_rot + 0.5], axis=-1)
+    coords_rotated = tf.reshape(coords_rotated, [-1, 8])
+
+    # Only apply to positive samples (has_doc > 0.5)
+    has_doc_mask = tf.reshape(tf.cast(has_doc > 0.5, tf.float32), [-1, 1])
+    coords_out = coords * (1.0 - has_doc_mask) + coords_rotated * has_doc_mask
+
+    # Clip to valid range
+    coords_out = tf.clip_by_value(coords_out, 0.0, 1.0)
+
+    return rotated_images, coords_out
+
+
+def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0):
+    """
+    Apply random perspective transform to a batch of images and coordinates.
+
+    Simulates different viewing angles by perturbing the four image corners
+    and computing the corresponding homography.
+
+    Args:
+        images: [B, H, W, 3] float32 tensor
+        coords: [B, 8] float32 tensor (normalized [0,1])
+        has_doc: [B] float32 tensor
+        intensity: Corner perturbation as fraction of image size (0.05 = 5%)
+        fill_value: Value to fill empty areas
+
+    Returns:
+        transformed_images: [B, H, W, 3] float32
+        transformed_coords: [B, 8] float32
+    """
+    batch_size = tf.shape(images)[0]
+    h = tf.cast(tf.shape(images)[1], tf.float32)
+    w = tf.cast(tf.shape(images)[2], tf.float32)
+
+    # Random corner offsets [B, 4, 2] for 4 corners (in normalized coords)
+    offsets = tf.random.uniform([batch_size, 4, 2], -intensity, intensity)
+
+    # Source corners (normalized [0,1])
+    # Order: TL, TR, BR, BL
+    src = tf.constant([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=tf.float32)
+    src = tf.tile(tf.reshape(src, [1, 4, 2]), [batch_size, 1, 1])  # [B, 4, 2]
+
+    # Destination corners (perturbed)
+    dst = src + offsets  # [B, 4, 2]
+
+    # Convert to pixel coordinates for transform computation
+    src_px = src * tf.reshape(tf.stack([w, h]), [1, 1, 2])
+    dst_px = dst * tf.reshape(tf.stack([w, h]), [1, 1, 2])
+
+    # Compute perspective transform matrix for each sample
+    # We need to solve for 8 parameters [a,b,c,d,e,f,g,h] such that:
+    # x' = (a*x + b*y + c) / (g*x + h*y + 1)
+    # y' = (d*x + e*y + f) / (g*x + h*y + 1)
+
+    def compute_homography_params(src_dst):
+        """Compute 8-parameter homography from 4 point correspondences."""
+        src_pts = src_dst[0]  # [4, 2]
+        dst_pts = src_dst[1]  # [4, 2]
+
+        # Build the 8x8 matrix A and 8x1 vector b for Ax = b
+        # For each point pair (x,y) -> (x',y'):
+        # [x, y, 1, 0, 0, 0, -x'*x, -x'*y] [a]   [x']
+        # [0, 0, 0, x, y, 1, -y'*x, -y'*y] [b] = [y']
+        #                                  ...
+
+        rows = []
+        b_vals = []
+        for i in range(4):
+            x, y = src_pts[i, 0], src_pts[i, 1]
+            xp, yp = dst_pts[i, 0], dst_pts[i, 1]
+            rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -xp * x, -xp * y])
+            rows.append([0.0, 0.0, 0.0, x, y, 1.0, -yp * x, -yp * y])
+            b_vals.append(xp)
+            b_vals.append(yp)
+
+        A = tf.stack(rows)  # [8, 8]
+        b = tf.reshape(tf.stack(b_vals), [8, 1])  # [8, 1]
+
+        # Solve using least squares
+        params = tf.linalg.lstsq(A, b)  # [8, 1]
+        return tf.squeeze(params)  # [8]
+
+    # Compute transforms for all samples
+    transforms = tf.map_fn(
+        compute_homography_params,
+        (src_px, dst_px),
+        fn_output_signature=tf.TensorSpec([8], dtype=tf.float32)
+    )
+
+    # Apply transform to images
+    output_shape = tf.stack([tf.shape(images)[1], tf.shape(images)[2]])
+    transformed_images = tf.raw_ops.ImageProjectiveTransformV3(
+        images=images,
+        transforms=transforms,
+        output_shape=output_shape,
+        interpolation='BILINEAR',
+        fill_mode='CONSTANT',
+        fill_value=fill_value
+    )
+
+    # Transform document coordinates using the same homography
+    # For each point (x, y) in normalized coords:
+    # 1. Convert to pixel coords
+    # 2. Apply homography: x' = (a*x + b*y + c) / (g*x + h*y + 1)
+    # 3. Convert back to normalized
+
+    def transform_coords(inputs):
+        """Transform coordinates using homography params."""
+        pts = inputs[0]  # [8] flattened coords
+        params = inputs[1]  # [8] homography params
+        has_doc_val = inputs[2]  # scalar
+
+        # Only transform if has_doc
+        def do_transform():
+            a, b, c, d, e, f, g, h_p = tf.unstack(params)
+
+            # Reshape to [4, 2]
+            pts_4x2 = tf.reshape(pts, [4, 2])
+
+            # Convert to pixel coords
+            pts_px = pts_4x2 * tf.stack([w, h])
+
+            # Apply homography
+            x = pts_px[:, 0]
+            y = pts_px[:, 1]
+            denom = g * x + h_p * y + 1.0
+            x_new = (a * x + b * y + c) / denom
+            y_new = (d * x + e * y + f) / denom
+
+            # Convert back to normalized
+            pts_new = tf.stack([x_new / w, y_new / h], axis=1)
+            return tf.reshape(pts_new, [8])
+
+        def no_transform():
+            return pts
+
+        return tf.cond(has_doc_val > 0.5, do_transform, no_transform)
+
+    transformed_coords = tf.map_fn(
+        transform_coords,
+        (coords, transforms, has_doc),
+        fn_output_signature=tf.TensorSpec([8], dtype=tf.float32)
+    )
+
+    # Clip to valid range
+    transformed_coords = tf.clip_by_value(transformed_coords, 0.0, 1.0)
+
+    return transformed_images, transformed_coords
+
+
+def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, image_norm: str = "imagenet",
+                     rotation_range: float = 0.0, perspective_intensity: float = 0.0):
     """
     Apply augmentation to a batch using TensorFlow ops (runs on GPU).
 
@@ -307,6 +648,9 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, ima
         has_doc: [B] float32 tensor
         img_size: Image size
         is_outlier: [B] float32 tensor (1.0 for outlier, 0.0 for normal) or None
+        image_norm: Normalization mode ('imagenet', 'zero_one', 'raw255')
+        rotation_range: Max rotation angle in degrees (0=disabled)
+        perspective_intensity: Perspective transform intensity (0=disabled, 0.05=mild)
 
     Returns:
         augmented_images: [B, H, W, 3] float32
@@ -362,6 +706,22 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, ima
     gray = tf.reduce_mean(images, axis=-1, keepdims=True)
     gray = tf.tile(gray, [1, 1, 1, 3])
     images = gray + sat_factor * (images - gray)
+
+    # Determine fill value for geometric transforms based on normalization
+    if norm_mode in {"zero_one", "0_1", "01"}:
+        fill_value = 0.5  # Gray in [0,1] range
+    elif norm_mode in {"raw255", "0_255", "0255"}:
+        fill_value = 128.0  # Gray in [0,255] range
+    else:
+        fill_value = 0.0  # ~Gray for ImageNet normalized (mean is ~0)
+
+    # Random rotation (if enabled)
+    if rotation_range > 0:
+        images, coords = tf_rotate_batch(images, coords, has_doc, rotation_range, fill_value)
+
+    # Random perspective transform (if enabled)
+    if perspective_intensity > 0:
+        images, coords = tf_perspective_batch(images, coords, has_doc, perspective_intensity, fill_value)
 
     # Random horizontal flip (vectorized)
     flip_mask = tf.random.uniform([batch_size]) > 0.5
