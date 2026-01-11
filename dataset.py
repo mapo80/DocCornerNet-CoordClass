@@ -419,27 +419,28 @@ def tf_rotate_batch(images, coords, has_doc, max_angle_deg=15.0, fill_value=0.0)
     max_angle_rad = max_angle_deg * (np.pi / 180.0)
     angles_rad = tf.random.uniform([batch_size], -max_angle_rad, max_angle_rad)
 
-    # Build affine transform matrices for tf.raw_ops.ImageProjectiveTransformV3
+    # IMPORTANT: ImageProjectiveTransformV3 expects the INVERSE transform!
+    # It maps output coords -> input coords for pixel sampling.
+    # So if we want to rotate by +θ, we pass the matrix for -θ.
+    #
     # The transform matrix is [a, b, c, d, e, f, g, h] where:
-    # x' = (a*x + b*y + c) / (g*x + h*y + 1)
-    # y' = (d*x + e*y + f) / (g*x + h*y + 1)
-    # For rotation around center with g=h=0:
-    # x' = a*x + b*y + c
-    # y' = d*x + e*y + f
+    # x_in = (a*x_out + b*y_out + c) / (g*x_out + h*y_out + 1)
+    # y_in = (d*x_out + e*y_out + f) / (g*x_out + h*y_out + 1)
 
-    cos_a = tf.cos(angles_rad)
-    sin_a = tf.sin(angles_rad)
+    # For the INVERSE rotation (to rotate image by +θ, we sample from -θ positions)
+    cos_a = tf.cos(-angles_rad)  # Note: negated for inverse
+    sin_a = tf.sin(-angles_rad)  # Note: negated for inverse
 
     # Center of image (in pixel coordinates)
     cx = w / 2.0
     cy = h / 2.0
 
-    # Rotation matrix around center:
-    # x' = cos(θ)*(x-cx) - sin(θ)*(y-cy) + cx
-    # y' = sin(θ)*(x-cx) + cos(θ)*(y-cy) + cy
+    # Inverse rotation matrix around center (rotate by -θ to get source pixel):
+    # x_in = cos(-θ)*(x_out-cx) - sin(-θ)*(y_out-cy) + cx
+    # y_in = sin(-θ)*(x_out-cx) + cos(-θ)*(y_out-cy) + cy
     # Expanding:
-    # x' = cos(θ)*x - sin(θ)*y + cx*(1-cos(θ)) + cy*sin(θ)
-    # y' = sin(θ)*x + cos(θ)*y + cy*(1-cos(θ)) - cx*sin(θ)
+    # x_in = cos(-θ)*x_out - sin(-θ)*y_out + cx*(1-cos(-θ)) + cy*sin(-θ)
+    # y_in = sin(-θ)*x_out + cos(-θ)*y_out + cy*(1-cos(-θ)) - cx*sin(-θ)
 
     a = cos_a
     b = -sin_a
@@ -463,7 +464,7 @@ def tf_rotate_batch(images, coords, has_doc, max_angle_deg=15.0, fill_value=0.0)
         fill_value=fill_value
     )
 
-    # Transform coordinates
+    # Transform coordinates using the FORWARD rotation (original angle, not negated)
     # For normalized coords in [0,1], we rotate around (0.5, 0.5)
     # x' = cos(θ)*(x-0.5) - sin(θ)*(y-0.5) + 0.5
     # y' = sin(θ)*(x-0.5) + cos(θ)*(y-0.5) + 0.5
@@ -474,11 +475,15 @@ def tf_rotate_batch(images, coords, has_doc, max_angle_deg=15.0, fill_value=0.0)
     # Center at origin
     coords_centered = coords_4x2 - 0.5
 
-    # Expand angles for broadcasting [B, 1, 1]
-    cos_a_exp = tf.reshape(cos_a, [-1, 1, 1])
-    sin_a_exp = tf.reshape(sin_a, [-1, 1, 1])
+    # Use the ORIGINAL angles for coordinate transform (not the negated ones used for image)
+    cos_a_fwd = tf.cos(angles_rad)  # Original angle
+    sin_a_fwd = tf.sin(angles_rad)  # Original angle
 
-    # Rotate
+    # Expand angles for broadcasting [B, 1, 1]
+    cos_a_exp = tf.reshape(cos_a_fwd, [-1, 1, 1])
+    sin_a_exp = tf.reshape(sin_a_fwd, [-1, 1, 1])
+
+    # Rotate coordinates forward
     x_rot = coords_centered[:, :, 0:1] * cos_a_exp - coords_centered[:, :, 1:2] * sin_a_exp
     y_rot = coords_centered[:, :, 0:1] * sin_a_exp + coords_centered[:, :, 1:2] * cos_a_exp
 
@@ -533,27 +538,27 @@ def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0
     src_px = src * tf.reshape(tf.stack([w, h]), [1, 1, 2])
     dst_px = dst * tf.reshape(tf.stack([w, h]), [1, 1, 2])
 
-    # Compute perspective transform matrix for each sample
-    # We need to solve for 8 parameters [a,b,c,d,e,f,g,h] such that:
-    # x' = (a*x + b*y + c) / (g*x + h*y + 1)
-    # y' = (d*x + e*y + f) / (g*x + h*y + 1)
+    # IMPORTANT: ImageProjectiveTransformV3 expects the INVERSE transform!
+    # We want to warp image from src -> dst (original corners to perturbed).
+    # But TensorFlow needs the inverse: dst -> src (to sample from original).
+    # So we compute homography from dst -> src (swap the order!).
 
-    def compute_homography_params(src_dst):
-        """Compute 8-parameter homography from 4 point correspondences."""
-        src_pts = src_dst[0]  # [4, 2]
-        dst_pts = src_dst[1]  # [4, 2]
+    def compute_homography_params(dst_src):
+        """Compute 8-parameter homography from dst to src (INVERSE transform)."""
+        dst_pts = dst_src[0]  # [4, 2] - destination (perturbed corners)
+        src_pts = dst_src[1]  # [4, 2] - source (original corners)
 
         # Build the 8x8 matrix A and 8x1 vector b for Ax = b
-        # For each point pair (x,y) -> (x',y'):
+        # Maps dst -> src: for each dst point, find corresponding src point
         # [x, y, 1, 0, 0, 0, -x'*x, -x'*y] [a]   [x']
         # [0, 0, 0, x, y, 1, -y'*x, -y'*y] [b] = [y']
-        #                                  ...
+        # where (x,y) is dst and (x',y') is src
 
         rows = []
         b_vals = []
         for i in range(4):
-            x, y = src_pts[i, 0], src_pts[i, 1]
-            xp, yp = dst_pts[i, 0], dst_pts[i, 1]
+            x, y = dst_pts[i, 0], dst_pts[i, 1]    # Input: dst
+            xp, yp = src_pts[i, 0], src_pts[i, 1]  # Output: src
             rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -xp * x, -xp * y])
             rows.append([0.0, 0.0, 0.0, x, y, 1.0, -yp * x, -yp * y])
             b_vals.append(xp)
@@ -566,10 +571,10 @@ def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0
         params = tf.linalg.lstsq(A, b)  # [8, 1]
         return tf.squeeze(params)  # [8]
 
-    # Compute transforms for all samples
+    # Compute INVERSE transforms (dst -> src) for all samples
     transforms = tf.map_fn(
         compute_homography_params,
-        (src_px, dst_px),
+        (dst_px, src_px),  # Note: swapped order - dst first, then src
         fn_output_signature=tf.TensorSpec([8], dtype=tf.float32)
     )
 
@@ -584,16 +589,43 @@ def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0
         fill_value=fill_value
     )
 
-    # Transform document coordinates using the same homography
-    # For each point (x, y) in normalized coords:
-    # 1. Convert to pixel coords
-    # 2. Apply homography: x' = (a*x + b*y + c) / (g*x + h*y + 1)
-    # 3. Convert back to normalized
+    # Transform document coordinates using the FORWARD homography (src -> dst)
+    # Note: 'transforms' contains the INVERSE (dst -> src) for image sampling.
+    # For coordinates, we need the FORWARD transform.
+    # We compute it separately.
+
+    def compute_forward_homography(src_dst):
+        """Compute FORWARD homography from src to dst."""
+        src_pts = src_dst[0]  # [4, 2] - source (original corners)
+        dst_pts = src_dst[1]  # [4, 2] - destination (perturbed corners)
+
+        # Maps src -> dst
+        rows = []
+        b_vals = []
+        for i in range(4):
+            x, y = src_pts[i, 0], src_pts[i, 1]    # Input: src
+            xp, yp = dst_pts[i, 0], dst_pts[i, 1]  # Output: dst
+            rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -xp * x, -xp * y])
+            rows.append([0.0, 0.0, 0.0, x, y, 1.0, -yp * x, -yp * y])
+            b_vals.append(xp)
+            b_vals.append(yp)
+
+        A = tf.stack(rows)
+        b = tf.reshape(tf.stack(b_vals), [8, 1])
+        params = tf.linalg.lstsq(A, b)
+        return tf.squeeze(params)
+
+    # Compute FORWARD transforms (src -> dst) for coordinate transformation
+    forward_transforms = tf.map_fn(
+        compute_forward_homography,
+        (src_px, dst_px),  # src first, dst second
+        fn_output_signature=tf.TensorSpec([8], dtype=tf.float32)
+    )
 
     def transform_coords(inputs):
-        """Transform coordinates using homography params."""
+        """Transform coordinates using FORWARD homography params."""
         pts = inputs[0]  # [8] flattened coords
-        params = inputs[1]  # [8] homography params
+        params = inputs[1]  # [8] FORWARD homography params
         has_doc_val = inputs[2]  # scalar
 
         # Only transform if has_doc
@@ -606,7 +638,7 @@ def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0
             # Convert to pixel coords
             pts_px = pts_4x2 * tf.stack([w, h])
 
-            # Apply homography
+            # Apply FORWARD homography (src -> dst)
             x = pts_px[:, 0]
             y = pts_px[:, 1]
             denom = g * x + h_p * y + 1.0
@@ -624,7 +656,7 @@ def tf_perspective_batch(images, coords, has_doc, intensity=0.05, fill_value=0.0
 
     transformed_coords = tf.map_fn(
         transform_coords,
-        (coords, transforms, has_doc),
+        (coords, forward_transforms, has_doc),  # Use FORWARD transforms
         fn_output_signature=tf.TensorSpec([8], dtype=tf.float32)
     )
 
