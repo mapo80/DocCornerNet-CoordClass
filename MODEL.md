@@ -389,14 +389,16 @@ checkpoints_remote/geom_aug_plateau_ohem
 
 **INT8 PTQ (XNNPACK delegated):**
 
-| Modello | Input | Size | Test mIoU | Test R@95 | Latenza (p50) |
-|---------|-------|------|-----------|-----------|---------------|
-| **geom_aug_320_int8** | **320** | **1.16 MB** | **0.9108** | **63.6%** | **5.78 ms** |
+| Modello | Input | Size | Test mIoU | Latenza (p50) | XNNPACK |
+|---------|-------|------|-----------|---------------|---------|
+| geom_aug_320_int8 | 320 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ Parziale |
+| **geom_aug_320_int8_static** | **320** | **0.94 MB** | **0.9050** | **4.43 ms** | ✅ Full |
 
 **Trade-off Float16 vs INT8:**
-- Float16: migliore accuratezza (0.9219 vs 0.9108 IoU), più veloce (4.64 vs 5.78 ms)
-- INT8: minor perdita di precisione, ma XNNPACK warning sui tensori dinamici
-- **Raccomandato: Float16** per questo modello con GAU attention
+- Float16: migliore accuratezza (0.9219 vs 0.9050 IoU)
+- INT8 static: **più veloce** (4.43 vs 4.64 ms), full XNNPACK delegation
+- INT8 dynamic: warning tensori dinamici, più lento
+- **Raccomandato:** Float16 per massima accuratezza, INT8 static per velocità su mobile
 
 **Trade-off generale:**
 - geom_aug_320 è 1.8× più lento dei modelli 224px ma +10% IoU sul test set
@@ -482,6 +484,32 @@ python export_tflite_int8.py \
     --output exported_tflite/geom_aug_320_int8_simcc.tflite
 ```
 
+#### 🚀 INT8 Full XNNPACK Delegate (Raccomandato per Mobile)
+
+Per modelli con GAU attention, usa `--static_batch` per ottenere full XNNPACK delegation:
+
+```bash
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format coords9 \
+    --static_batch \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output checkpoints_remote/geom_aug_plateau_ohem/model_int8_static.tflite
+```
+
+**Vantaggi di `--static_batch`:**
+- ✅ Nessun warning "dynamic-sized tensors"
+- ✅ Full XNNPACK delegation per INT8
+- ✅ Latenza più veloce di float16 (4.43 vs 4.64 ms)
+- ✅ Output coords9 con decode interno (più semplice da usare)
+- ⚠️ Solo batch_size=1 (standard per inference mobile)
+
 ### 7.4 Parametri Export INT8
 
 | Parametro | Valori | Default | Descrizione |
@@ -499,12 +527,14 @@ python export_tflite_int8.py \
 | `--axis_mean_impl` | mean/avgpool/dwconv_* | dwconv_full | Impl riduzione assi |
 | `--global_pool_impl` | mean/avgpool/dwconv_* | dwconv_full | Impl global pooling |
 | `--allow_float_fallback` | flag | False | Permetti fallback float |
+| `--static_batch` | flag | False | Batch statico=1 per full XNNPACK |
 
 ### 7.5 Output Formats INT8
 
 | Format | Output Shape | Decode | XNNPACK | Note |
 |--------|--------------|--------|---------|------|
-| `coords9` | [B, 9] | Interno | Parziale | Float output, dynamic tensors |
+| `coords9` | [B, 9] | Interno | Parziale | Dynamic tensors senza --static_batch |
+| `coords9 + --static_batch` | [1, 9] | Interno | ✅ Full | **Raccomandato per mobile** |
 | `simcc_logits` | [B, num_bins, 8] | Esterno | Migliore | INT8 output, decode esterno |
 
 **simcc_logits con `bins_first` layout:**
@@ -534,16 +564,17 @@ python export_tflite_int8.py \
 
 ### 7.8 Risultati INT8 su Test Set
 
-| Modello | Format | Size | Test mIoU | Latency (p50) |
-|---------|--------|------|-----------|---------------|
-| geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | **4.64 ms** |
-| geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms |
-| geom_aug_320_int8_simcc | simcc_logits | 0.90 MB | 0.9184 | 11.39 ms |
+| Modello | Format | Size | Test mIoU | Latency (p50) | XNNPACK |
+|---------|--------|------|-----------|---------------|---------|
+| geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | 4.64 ms | ✅ |
+| geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ |
+| geom_aug_320_int8_simcc | simcc_logits | 0.90 MB | 0.9184 | 11.39 ms | ⚠️ |
+| **geom_aug_320_int8_static** | **coords9** | **0.94 MB** | 0.9050 | **4.43 ms** | ✅ |
 
-**Raccomandazione:** Per questo modello con GAU attention, **float16 è preferibile** a INT8:
-- Migliore accuratezza (+0.35-1.1% mIoU)
-- Minore latenza (2-2.5× più veloce)
-- Dimensione simile (~1 MB)
+**Raccomandazione:**
+- **Massima accuratezza:** float16 (mIoU 0.9219)
+- **Massima velocità:** INT8 + `--static_batch` (4.43 ms, full XNNPACK)
+- **Evitare:** INT8 senza `--static_batch` (warning tensori dinamici, più lento)
 
 ---
 

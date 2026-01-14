@@ -231,6 +231,11 @@ def parse_args():
         help="Output TFLite file path",
     )
     p.add_argument("--threads", type=int, default=1, help="Threads for verification interpreter")
+    p.add_argument(
+        "--static_batch",
+        action="store_true",
+        help="Use static batch_size=1 for full XNNPACK delegation (recommended for INT8 performance)",
+    )
     return p.parse_args()
 
 
@@ -308,6 +313,52 @@ def _apply_norm_transform(x, src_norm: str, dst_norm: str):
     raise ValueError(f"Unsupported dst_norm='{dst_norm}'")
 
 
+def _decode_simcc_static(simcc_x, simcc_y, num_bins: int, tau: float = 1.0):
+    """
+    Decode SimCC logits to normalized coords with static batch_size=1.
+
+    This function replicates SimCCDecode logic but uses explicit reshape
+    dimensions instead of -1, enabling full XNNPACK delegation for INT8.
+
+    Args:
+        simcc_x: [1, 4, num_bins] - X logits for 4 corners
+        simcc_y: [1, 4, num_bins] - Y logits for 4 corners
+        num_bins: number of bins (e.g., 320)
+        tau: softmax temperature
+
+    Returns:
+        coords: [1, 8] - (x0,y0,x1,y1,x2,y2,x3,y3) in [0,1]
+    """
+    # Cast to float32
+    sx = tf.cast(simcc_x, tf.float32)
+    sy = tf.cast(simcc_y, tf.float32)
+
+    # Softmax
+    px = tf.nn.softmax(sx / tau, axis=-1)
+    py = tf.nn.softmax(sy / tau, axis=-1)
+
+    # Bin centers [num_bins, 1]
+    centers = tf.constant(
+        np.linspace(0.0, 1.0, num_bins, dtype=np.float32).reshape(num_bins, 1),
+        dtype=tf.float32,
+    )
+
+    # CRITICAL: batch=1 hardcoded, not -1
+    # [1, 4, num_bins] -> [4, num_bins]
+    px2 = tf.reshape(px, [4, num_bins])
+    py2 = tf.reshape(py, [4, num_bins])
+
+    # [4, num_bins] @ [num_bins, 1] -> [4, 1] -> [1, 4]
+    x = tf.reshape(tf.matmul(px2, centers), [1, 4])
+    y = tf.reshape(tf.matmul(py2, centers), [1, 4])
+
+    # Interleave: [1,4] -> [1,4,1] concat -> [1,4,2] -> [1,8]
+    xy = tf.concat([tf.reshape(x, [1, 4, 1]), tf.reshape(y, [1, 4, 1])], axis=-1)
+    coords = tf.reshape(xy, [1, 8])
+
+    return tf.clip_by_value(coords, 0.0, 1.0)
+
+
 def create_tflite_inference_model(
     model: keras.Model,
     img_size: int,
@@ -315,13 +366,23 @@ def create_tflite_inference_model(
     tflite_input_norm: str,
     output_format: str = "coords9",
     simcc_packed_layout: str = "8_first",
+    static_batch: bool = False,
+    tau: float = 1.0,
 ) -> keras.Model:
     """
     Build a TFLite-friendly inference model:
     - Optional input preprocessing: `tflite_input_norm` -> `model_input_norm`
     - Output: single [B, 9] tensor: [x0..y3, score]
+
+    Args:
+        static_batch: If True, use batch_size=1 with static reshape ops for
+                      full XNNPACK delegation (recommended for INT8 performance).
+        tau: Softmax temperature for SimCC decode (only used when static_batch=True).
     """
-    inputs = keras.Input(shape=(img_size, img_size, 3), dtype=tf.float32, name="image")
+    if static_batch:
+        inputs = keras.Input(shape=(img_size, img_size, 3), batch_size=1, dtype=tf.float32, name="image")
+    else:
+        inputs = keras.Input(shape=(img_size, img_size, 3), dtype=tf.float32, name="image")
     x = _apply_norm_transform(inputs, tflite_input_norm, model_input_norm)
 
     outputs = model(x, training=False)
@@ -340,6 +401,28 @@ def create_tflite_inference_model(
 
     fmt = (output_format or "coords9").lower().strip()
     if fmt == "coords9":
+        # When static_batch=True, replace dynamic SimCCDecode with static version
+        if static_batch and simcc_x is not None and simcc_y is not None:
+            num_bins = int(simcc_x.shape[-1])
+            coords_decoded = _decode_simcc_static(simcc_x, simcc_y, num_bins=num_bins, tau=tau)
+
+            # Apply GAU if present in the model
+            gau_layer = None
+            for layer in model.layers:
+                layer_name = getattr(layer, 'name', '')
+                layer_type = type(layer).__name__
+                if 'corner_gau' in layer_name.lower() or layer_type == 'CornerGAU':
+                    gau_layer = layer
+                    break
+
+            if gau_layer is not None:
+                # GAU operates on [B, 4, 2]
+                coords_4x2 = tf.reshape(coords_decoded, [1, 4, 2])
+                coords_refined = gau_layer(coords_4x2)
+                coords = tf.reshape(coords_refined, [1, 8])
+            else:
+                coords = coords_decoded
+
         score = tf.nn.sigmoid(score_logit)
         out = tf.concat([coords, score], axis=-1)
         return keras.Model(inputs=inputs, outputs=out, name="doccornernet_inference")
@@ -519,6 +602,9 @@ def main():
     )
     _copy_weights_by_path(base_model, export_model)
 
+    if args.static_batch:
+        print(f"  static_batch=True (full XNNPACK delegation for INT8)")
+
     infer_model = create_tflite_inference_model(
         model=export_model,
         img_size=img_size,
@@ -526,6 +612,8 @@ def main():
         tflite_input_norm=tflite_input_norm,
         output_format=args.output_format,
         simcc_packed_layout=str(args.simcc_packed_layout),
+        static_batch=args.static_batch,
+        tau=tau,
     )
 
     # Convert
