@@ -152,7 +152,7 @@ class AxisMean(layers.Layer):
             if self._filters_strided is None or self._strides_strided is None:
                 raise RuntimeError("AxisMean dwconv_strided filters missing.")
             x = inputs
-            for f, s in zip(self._filters_strided, self._strides_strided, strict=False):
+            for f, s in zip(self._filters_strided, self._strides_strided):
                 x = tf.nn.depthwise_conv2d(x, f, strides=s, padding="VALID")
             if self.axis == 1:
                 return tf.reshape(x, [-1, self._w, self._c])
@@ -509,7 +509,7 @@ class GlobalAveragePool2DAsAvgPool(layers.Layer):
             if self._filters_strided is None or self._strides_strided is None:
                 raise RuntimeError("GlobalAveragePool2DAsAvgPool dwconv_strided filters missing.")
             x = inputs
-            for f, s in zip(self._filters_strided, self._strides_strided, strict=False):
+            for f, s in zip(self._filters_strided, self._strides_strided):
                 x = tf.nn.depthwise_conv2d(x, f, strides=s, padding="VALID")
             return tf.reshape(x, [-1, self._c])
 

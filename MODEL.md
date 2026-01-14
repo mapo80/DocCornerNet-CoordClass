@@ -8,6 +8,30 @@
 
 ---
 
+## 🏆 Quick Summary: Best Model (Gennaio 2026)
+
+| Metrica | Valore |
+|---------|--------|
+| **Modello** | `geom_aug_plateau_ohem` |
+| **Backbone** | MobileNetV2 α=0.35 |
+| **Input** | 320×320 |
+| **Parametri** | ~500K |
+| **Test mIoU** | **0.9221** |
+| **Test R@95** | **68.9%** |
+| **Val mIoU** | 0.9879 |
+| **TFLite Size** | 1.11 MB (float16) |
+| **Latenza CPU** | 4.64 ms |
+
+**Caratteristiche chiave:**
+- GAU attention + fc_expansion=256
+- OHEM (Online Hard Example Mining)
+- Geometric augmentation (rotation ±10°, perspective 0.03)
+- LR schedule: plateau (non cosine)
+
+**File:** `checkpoints_remote/geom_aug_plateau_ohem/model_float16.tflite`
+
+---
+
 ## 1. Architettura del Modello
 
 ### 1.1 Design Generale
@@ -324,55 +348,73 @@ class_id x₀ y₀ x₁ y₁ x₂ y₂ x₃ y₃
 
 ## 6. Risultati e Modelli Migliori
 
-### 6.1 Modelli Raccomandati per Produzione
+### 6.1 🏆 Modello Vincitore: geom_aug_plateau_ohem (320×320)
 
-**Per velocità/accuratezza (raccomandato):**
+```
+checkpoints_remote/geom_aug_plateau_ohem
+├── Backbone: MobileNetV2 alpha=0.35
+├── Input: 320×320
+├── Parametri: ~500K
+├── GAU attention + fc_expansion=256
+├── OHEM (threshold=12px, weight=2.5)
+├── Geometric augmentation (rotation=10°, perspective=0.03)
+├── Val mIoU: 0.9879
+└── Test mIoU: 0.9221 ← BEST GENERALIZATION
+```
+
+**Perché è il vincitore:**
+- Miglior generalizzazione sul test set (+8.6% vs modelli 224/256)
+- Geometric augmentation migliora robustezza a rotazioni e prospettive
+- GAU attention cattura dipendenze spaziali globali
+- OHEM focalizza training su casi difficili
+
+### 6.2 Confronto Modelli su Test Set
+
+| Modello | Input | GAU | GeomAug | Test mIoU | Test R@95 | Val mIoU |
+|---------|-------|-----|---------|-----------|-----------|----------|
+| mobilenetv2_224_best | 224 | No | No | 0.8572 | 48.5% | 0.9894 |
+| mobilenetv2_256_best | 256 | No | No | 0.8572 | 48.2% | 0.9902 |
+| mobilenetv2_320_gau_ohem | 320 | Yes | No | 0.9014 | 63.2% | ~0.988 |
+| **geom_aug_plateau_ohem** | **320** | **Yes** | **Yes** | **0.9221** | **68.9%** | **0.9879** |
+
+### 6.3 Benchmark TFLite su Test Set (CPU, batch=1)
+
+**Float16 (raccomandato per WASM/browser):**
+
+| Modello | Input | Size | Test mIoU | Test R@95 | Latenza (p50) |
+|---------|-------|------|-----------|-----------|---------------|
+| mnv2_224_revlast_f16 | 224 | 0.98 MB | 0.8361 | 52.1% | 2.60 ms |
+| mnv2_256_revlast_f16 | 256 | 0.98 MB | 0.8344 | 52.0% | 3.05 ms |
+| **geom_aug_320_f16** | **320** | **1.11 MB** | **0.9219** | **68.9%** | **4.64 ms** |
+
+**INT8 PTQ (XNNPACK delegated):**
+
+| Modello | Input | Size | Test mIoU | Test R@95 | Latenza (p50) |
+|---------|-------|------|-----------|-----------|---------------|
+| **geom_aug_320_int8** | **320** | **1.16 MB** | **0.9108** | **63.6%** | **5.78 ms** |
+
+**Trade-off Float16 vs INT8:**
+- Float16: migliore accuratezza (0.9219 vs 0.9108 IoU), più veloce (4.64 vs 5.78 ms)
+- INT8: minor perdita di precisione, ma XNNPACK warning sui tensori dinamici
+- **Raccomandato: Float16** per questo modello con GAU attention
+
+**Trade-off generale:**
+- geom_aug_320 è 1.8× più lento dei modelli 224px ma +10% IoU sul test set
+- Per applicazioni real-time con requisiti di generalizzazione, geom_aug_320 è raccomandato
+
+### 6.4 Modelli Legacy per Produzione
+
+**Per velocità estrema (se generalizzazione non è critica):**
 ```
 checkpoints/mobilenetv2_224_best
 ├── Parametri: 495K
 ├── Input: 224×224
 ├── Val mIoU: 0.9894
-└── Robustezza outlier: 0.7075
+├── Test mIoU: 0.8572
+└── Latenza: 2.60 ms (float16)
 ```
 
-**Per massima accuratezza:**
-```
-checkpoints/mobilenetv2_256_best
-├── Parametri: 495K
-├── Input: 256×256
-├── Val mIoU: 0.9902 (best su clean)
-└── Robustezza outlier: 0.6281
-```
-
-**Per generalizzazione cross-dataset:**
-```
-mobilenetv2_224_from256_clean_iter3
-├── Fine-tuned da 256→224
-├── Worst-case mIoU: 0.9047
-└── Miglior performance bilanciata
-```
-
-### 6.2 Benchmark TFLite (CPU, batch=1)
-
-**Modelli Float16 (coords9 output):**
-
-| Modello | Input | Latenza (p50) | Size | mIoU |
-|---------|-------|---------------|------|------|
-| mnv2_224_best | 224 | 4.24 ms | 0.98 MB | 0.9894 |
-| mnv2_256_best | 256 | 8.18 ms | 0.98 MB | 0.9902 |
-| mnv3_224 | 224 | 3.96 ms | 1.47 MB | 0.9842 |
-
-**Modelli INT8 Full-Quant (simcc_logits output):**
-
-| Modello | Input | Latenza (p50) | Size | mIoU |
-|---------|-------|---------------|------|------|
-| mnv2_224_best | 224 | **2.53 ms** | 0.82 MB | 0.9888 |
-| mnv2_256_best | 256 | 2.92 ms | 0.84 MB | 0.9893 |
-| mnv3_224 | 224 | 3.15 ms | 1.04 MB | 0.3519 |
-
-**Vincitore:** mnv2_224_best INT8 - più veloce (2.53ms) con eccellente accuratezza (0.9888)
-
-### 6.3 Speedup Float16 vs INT8
+### 6.5 Speedup Float16 vs INT8
 
 - MobileNetV2: 1.6-2.8× più veloce con perdita minima (<0.001 mIoU)
 - MobileNetV3: PTQ INT8 **non raccomandato** (collasso accuratezza)
@@ -404,50 +446,104 @@ python export_tflite.py \
 - ~50% più piccolo di float32
 - Perdita accuratezza minima
 
-### 7.3 Export TFLite INT8 (più veloce, full XNNPACK)
+### 7.3 Export TFLite INT8 (PTQ Quantization)
+
+#### Comando Base (con dataset legacy)
 
 ```bash
 python export_tflite_int8.py \
-  --checkpoint ./checkpoints/mobilenetv2_224_best \
-  --data_root $DATA_ROOT \
-  --split val_cleaned \
-  --quantization int8 \
-  --io_dtype int8 \
-  --output_dtype int8 \
-  --output_format simcc_logits \
-  --simcc_packed_layout bins_first \
-  --axis_mean_impl dwconv_full \
-  --global_pool_impl dwconv_strided
+    --checkpoint ./checkpoints/mobilenetv2_224_best \
+    --data_root /path/to/doc-scanner-dataset-labeled \
+    --split val_cleaned \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output exported_tflite/model_int8.tflite
 ```
-- Output: packed SimCC logits + score (int8)
-- Decode coordinate esterno al modello
-- 1.6-2.8× più veloce di float16
-- 100% delegazione XNNPACK su WASM
 
-### 7.4 Opzioni Export
+#### Comando con HuggingFace Parquet Dataset
 
-**Schemi di quantizzazione:**
-| Schema | Descrizione |
-|--------|-------------|
-| int8 | Full int8 dove possibile |
-| int16x8 | Attivazioni int16 + pesi int8 (maggior accuratezza) |
-| dynamic | Solo pesi quantizzati (attivazioni float) |
+```bash
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output exported_tflite/geom_aug_320_int8_simcc.tflite
+```
 
-**I/O dtypes:**
-| Dtype | Note |
-|-------|------|
-| float32 | Standard, più grande |
-| int8 | Richiede calibrazione |
-| uint8 | Alternativa int8 |
+### 7.4 Parametri Export INT8
 
-**Implementazioni pooling (per XNNPACK):**
-| Impl | Descrizione |
-|------|-------------|
-| mean | Standard (potrebbe non delegare completamente) |
-| avgpool | Basato su pool |
-| dwconv_full | Singola depthwise conv |
-| dwconv_strided | Riduzione con stride |
-| dwconv_pyramid | Riduzione gerarchica |
+| Parametro | Valori | Default | Descrizione |
+|-----------|--------|---------|-------------|
+| `--checkpoint` | path | (required) | Directory checkpoint o file .h5 |
+| `--data_root` | path | None | Dataset legacy per calibrazione |
+| `--hf_dataset` | path | None | Dataset HuggingFace parquet |
+| `--split` | train/val/test | val_cleaned | Split per calibrazione |
+| `--num_calib` | int | 500 | Numero campioni calibrazione |
+| `--quantization` | int8/int16x8/dynamic | int8 | Schema quantizzazione |
+| `--io_dtype` | float32/int8/uint8 | float32 | Tipo I/O modello |
+| `--output_dtype` | float32/int8/uint8 | float32 | Tipo output modello |
+| `--output_format` | coords9/simcc_logits | coords9 | Formato output |
+| `--simcc_packed_layout` | 8_first/bins_first | 8_first | Layout packed logits |
+| `--axis_mean_impl` | mean/avgpool/dwconv_* | dwconv_full | Impl riduzione assi |
+| `--global_pool_impl` | mean/avgpool/dwconv_* | dwconv_full | Impl global pooling |
+| `--allow_float_fallback` | flag | False | Permetti fallback float |
+
+### 7.5 Output Formats INT8
+
+| Format | Output Shape | Decode | XNNPACK | Note |
+|--------|--------------|--------|---------|------|
+| `coords9` | [B, 9] | Interno | Parziale | Float output, dynamic tensors |
+| `simcc_logits` | [B, num_bins, 8] | Esterno | Migliore | INT8 output, decode esterno |
+
+**simcc_logits con `bins_first` layout:**
+- Output shape: [B, 320, 8]
+- Layout: [x0, x1, x2, x3, y0, y1, y2, y3] per ogni bin
+- Decoding esterno: dequantize → argmax su ogni blocco di 320 bins → normalize
+
+### 7.6 Schemi Quantizzazione
+
+| Schema | Descrizione | Velocità | Accuratezza |
+|--------|-------------|----------|-------------|
+| `int8` | Full INT8 | ★★★ | ★★ |
+| `int16x8` | Attivazioni INT16 + pesi INT8 | ★★ | ★★★ |
+| `dynamic` | Solo pesi quantizzati | ★ | ★★★ |
+
+### 7.7 Implementazioni Pooling (XNNPACK)
+
+| Impl | Descrizione | XNNPACK |
+|------|-------------|---------|
+| `mean` | tf.reduce_mean | ❌ Parziale |
+| `avgpool` | tf.nn.avg_pool2d | ❌ Parziale |
+| `dwconv_full` | Singola depthwise conv | ✅ Full |
+| `dwconv_strided` | Multi-step con stride | ✅ Full |
+| `dwconv_pyramid` | Riduzione gerarchica 2x2 | ✅ Full |
+
+**Raccomandato per full XNNPACK:** `--axis_mean_impl dwconv_full --global_pool_impl dwconv_strided`
+
+### 7.8 Risultati INT8 su Test Set
+
+| Modello | Format | Size | Test mIoU | Latency (p50) |
+|---------|--------|------|-----------|---------------|
+| geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | **4.64 ms** |
+| geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms |
+| geom_aug_320_int8_simcc | simcc_logits | 0.90 MB | 0.9184 | 11.39 ms |
+
+**Raccomandazione:** Per questo modello con GAU attention, **float16 è preferibile** a INT8:
+- Migliore accuratezza (+0.35-1.1% mIoU)
+- Minore latenza (2-2.5× più veloce)
+- Dimensione simile (~1 MB)
 
 ---
 
