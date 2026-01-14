@@ -10,17 +10,18 @@
 
 ## 🏆 Quick Summary: Best Model (Gennaio 2026)
 
-| Metrica | Valore |
-|---------|--------|
-| **Modello** | `geom_aug_plateau_ohem` |
-| **Backbone** | MobileNetV2 α=0.35 |
-| **Input** | 320×320 |
-| **Parametri** | ~500K |
-| **Test mIoU** | **0.9221** |
-| **Test R@95** | **68.9%** |
-| **Val mIoU** | 0.9879 |
-| **TFLite Size** | 1.11 MB (float16) |
-| **Latenza CPU** | 4.64 ms |
+| Metrica | Float16 | INT8 SimCC |
+|---------|---------|------------|
+| **Modello** | `geom_aug_plateau_ohem` | `geom_aug_plateau_ohem` |
+| **Backbone** | MobileNetV2 α=0.35 | MobileNetV2 α=0.35 |
+| **Input** | 320×320 | 320×320 |
+| **Parametri** | ~500K | ~500K |
+| **Test mIoU** | **0.9219** | **0.9183** |
+| **Test R@95** | **68.9%** | ~68% |
+| **TFLite Size** | 1.11 MB | **0.89 MB** |
+| **Latenza CPU** | 4.64 ms | **4.41 ms** |
+| **XNNPACK** | ✅ Full | ✅ Full |
+| **Decode** | Interno | **Esterno** |
 
 **Caratteristiche chiave:**
 - GAU attention + fc_expansion=256
@@ -28,7 +29,8 @@
 - Geometric augmentation (rotation ±10°, perspective 0.03)
 - LR schedule: plateau (non cosine)
 
-**File:** `checkpoints_remote/geom_aug_plateau_ohem/model_float16.tflite`
+**File Float16:** `checkpoints_remote/geom_aug_plateau_ohem/model_float16.tflite`
+**File INT8 (BEST):** `checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_static.tflite`
 
 ---
 
@@ -389,16 +391,17 @@ checkpoints_remote/geom_aug_plateau_ohem
 
 **INT8 PTQ (XNNPACK delegated):**
 
-| Modello | Input | Size | Test mIoU | Latenza (p50) | XNNPACK |
-|---------|-------|------|-----------|---------------|---------|
-| geom_aug_320_int8 | 320 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ Parziale |
-| **geom_aug_320_int8_static** | **320** | **0.94 MB** | **0.9050** | **4.43 ms** | ✅ Full |
+| Modello | Input | Size | Test mIoU | Latenza (p50) | XNNPACK | Decode |
+|---------|-------|------|-----------|---------------|---------|--------|
+| geom_aug_320_int8 | 320 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ Parziale | Interno |
+| geom_aug_320_int8_static | 320 | 0.94 MB | 0.9050 | 4.43 ms | ✅ Full | Interno |
+| **geom_aug_320_int8_simcc_static** | **320** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ Full | **Esterno** |
 
 **Trade-off Float16 vs INT8:**
-- Float16: migliore accuratezza (0.9219 vs 0.9050 IoU)
-- INT8 static: **più veloce** (4.43 vs 4.64 ms), full XNNPACK delegation
-- INT8 dynamic: warning tensori dinamici, più lento
-- **Raccomandato:** Float16 per massima accuratezza, INT8 static per velocità su mobile
+- Float16: migliore accuratezza (0.9219 IoU), decode interno
+- INT8 coords9 static: veloce (4.43 ms), ma accuratezza ridotta (0.9050 IoU)
+- **INT8 simcc_logits static:** **BEST** - veloce (4.41 ms) E alta accuratezza (0.9183 IoU)
+- **Raccomandato:** `model_int8_simcc_static.tflite` con decode esterno per massime performance
 
 **Trade-off generale:**
 - geom_aug_320 è 1.8× più lento dei modelli 224px ma +10% IoU sul test set
@@ -484,9 +487,73 @@ python export_tflite_int8.py \
     --output exported_tflite/geom_aug_320_int8_simcc.tflite
 ```
 
-#### 🚀 INT8 Full XNNPACK Delegate (Raccomandato per Mobile)
+#### 🚀 INT8 Full XNNPACK Delegate con SimCC Logits (BEST - Raccomandato)
 
-Per modelli con GAU attention, usa `--static_batch` per ottenere full XNNPACK delegation:
+Per ottenere **massima accuratezza (mIoU ≥ 0.91) E velocità**, usa `simcc_logits` con decode esterno:
+
+```bash
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout 8_first \
+    --static_batch \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_static.tflite
+```
+
+**Risultati:**
+- ✅ mIoU: **0.9183** (target ≥ 0.91)
+- ✅ Latenza: **4.41 ms** (target ≤ 4.43 ms)
+- ✅ Full XNNPACK delegation (nessun warning)
+- ✅ Size: **0.89 MB** (più piccolo di float16)
+
+**Decode esterno in Python/NumPy:**
+```python
+def decode_simcc(simcc_xy, tau=1.0):
+    """
+    Decode SimCC logits to normalized coordinates.
+
+    Args:
+        simcc_xy: [1, 8, num_bins] - packed logits (8_first layout)
+                  First 4 channels are X coords, next 4 are Y coords
+        tau: softmax temperature (default 1.0)
+
+    Returns:
+        coords: [1, 8] - (x0,y0,x1,y1,x2,y2,x3,y3) in [0,1]
+    """
+    simcc_xy = simcc_xy.astype(np.float32)
+    simcc_x = simcc_xy[:, :4, :]  # [1, 4, num_bins]
+    simcc_y = simcc_xy[:, 4:, :]  # [1, 4, num_bins]
+
+    num_bins = simcc_x.shape[2]
+    centers = np.linspace(0, 1, num_bins, dtype=np.float32)
+
+    # Stable softmax
+    sx = simcc_x / tau
+    sy = simcc_y / tau
+    sx = sx - np.max(sx, axis=-1, keepdims=True)
+    sy = sy - np.max(sy, axis=-1, keepdims=True)
+    px = np.exp(sx) / (np.sum(np.exp(sx), axis=-1, keepdims=True) + 1e-8)
+    py = np.exp(sy) / (np.sum(np.exp(sy), axis=-1, keepdims=True) + 1e-8)
+
+    # Expectation (soft-argmax)
+    ex = np.sum(px * centers, axis=-1)  # [1, 4]
+    ey = np.sum(py * centers, axis=-1)  # [1, 4]
+
+    # Interleave: [x0,y0,x1,y1,x2,y2,x3,y3]
+    coords = np.stack([ex, ey], axis=-1).reshape(-1, 8)
+    return np.clip(coords, 0, 1)
+```
+
+#### INT8 coords9 con Static Batch (alternativa più semplice)
+
+Se preferisci decode interno (meno codice, ma accuratezza inferiore):
 
 ```bash
 python export_tflite_int8.py \
@@ -506,8 +573,8 @@ python export_tflite_int8.py \
 **Vantaggi di `--static_batch`:**
 - ✅ Nessun warning "dynamic-sized tensors"
 - ✅ Full XNNPACK delegation per INT8
-- ✅ Latenza più veloce di float16 (4.43 vs 4.64 ms)
 - ✅ Output coords9 con decode interno (più semplice da usare)
+- ⚠️ Accuratezza ridotta: mIoU 0.9050 (vs 0.9183 con simcc_logits)
 - ⚠️ Solo batch_size=1 (standard per inference mobile)
 
 ### 7.4 Parametri Export INT8
@@ -531,16 +598,22 @@ python export_tflite_int8.py \
 
 ### 7.5 Output Formats INT8
 
-| Format | Output Shape | Decode | XNNPACK | Note |
-|--------|--------------|--------|---------|------|
-| `coords9` | [B, 9] | Interno | Parziale | Dynamic tensors senza --static_batch |
-| `coords9 + --static_batch` | [1, 9] | Interno | ✅ Full | **Raccomandato per mobile** |
-| `simcc_logits` | [B, num_bins, 8] | Esterno | Migliore | INT8 output, decode esterno |
+| Format | Output Shape | Decode | XNNPACK | mIoU | Note |
+|--------|--------------|--------|---------|------|------|
+| `coords9` | [B, 9] | Interno | ⚠️ Parziale | 0.9108 | Dynamic tensors senza --static_batch |
+| `coords9 + --static_batch` | [1, 9] | Interno | ✅ Full | 0.9050 | Semplice ma meno accurato |
+| `simcc_logits` | [B, 8, num_bins] | Esterno | ⚠️ Parziale | ~0.92 | Richiede decode esterno |
+| **`simcc_logits + --static_batch`** | **[1, 8, num_bins]** | **Esterno** | ✅ **Full** | **0.9183** | **BEST: veloce + accurato** |
 
-**simcc_logits con `bins_first` layout:**
-- Output shape: [B, 320, 8]
+**simcc_logits con `8_first` layout (raccomandato):**
+- Output shape: [1, 8, 320] (con --static_batch)
+- Layout: primi 4 canali sono X coords, successivi 4 sono Y coords
+- Decoding esterno: dequantize → softmax → expectation (vedi funzione decode_simcc sopra)
+
+**simcc_logits con `bins_first` layout (alternativa):**
+- Output shape: [1, 320, 8]
 - Layout: [x0, x1, x2, x3, y0, y1, y2, y3] per ogni bin
-- Decoding esterno: dequantize → argmax su ogni blocco di 320 bins → normalize
+- Decoding esterno: transpose → softmax → expectation
 
 ### 7.6 Schemi Quantizzazione
 
@@ -564,16 +637,17 @@ python export_tflite_int8.py \
 
 ### 7.8 Risultati INT8 su Test Set
 
-| Modello | Format | Size | Test mIoU | Latency (p50) | XNNPACK |
-|---------|--------|------|-----------|---------------|---------|
-| geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | 4.64 ms | ✅ |
-| geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ |
-| geom_aug_320_int8_simcc | simcc_logits | 0.90 MB | 0.9184 | 11.39 ms | ⚠️ |
-| **geom_aug_320_int8_static** | **coords9** | **0.94 MB** | 0.9050 | **4.43 ms** | ✅ |
+| Modello | Format | Size | Test mIoU | Latency (p50) | XNNPACK | Decode |
+|---------|--------|------|-----------|---------------|---------|--------|
+| geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | 4.64 ms | ✅ | Interno |
+| geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ | Interno |
+| geom_aug_320_int8_static | coords9 | 0.94 MB | 0.9050 | 4.43 ms | ✅ | Interno |
+| **geom_aug_320_int8_simcc_static** | **simcc_logits** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ | **Esterno** |
 
 **Raccomandazione:**
-- **Massima accuratezza:** float16 (mIoU 0.9219)
-- **Massima velocità:** INT8 + `--static_batch` (4.43 ms, full XNNPACK)
+- **Massima accuratezza assoluta:** float16 (mIoU 0.9219) - decode interno
+- **Miglior rapporto accuratezza/velocità:** INT8 simcc_logits + `--static_batch` (mIoU 0.9183, 4.41 ms) - **BEST**
+- **Più semplice:** INT8 coords9 + `--static_batch` (4.43 ms, full XNNPACK) - ma mIoU solo 0.9050
 - **Evitare:** INT8 senza `--static_batch` (warning tensori dinamici, più lento)
 
 ---
