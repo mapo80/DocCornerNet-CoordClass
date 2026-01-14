@@ -30,7 +30,7 @@
 - LR schedule: plateau (non cosine)
 
 **File Float16:** `checkpoints_remote/geom_aug_plateau_ohem/model_float16.tflite`
-**File INT8 (BEST):** `checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_static.tflite`
+**File INT8 (BEST):** `checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_bins_first.tflite`
 
 ---
 
@@ -395,13 +395,13 @@ checkpoints_remote/geom_aug_plateau_ohem
 |---------|-------|------|-----------|---------------|---------|--------|
 | geom_aug_320_int8 | 320 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ Parziale | Interno |
 | geom_aug_320_int8_static | 320 | 0.94 MB | 0.9050 | 4.43 ms | ✅ Full | Interno |
-| **geom_aug_320_int8_simcc_static** | **320** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ Full | **Esterno** |
+| **geom_aug_320_int8_simcc_bins_first** | **320** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ Full | **Esterno** |
 
 **Trade-off Float16 vs INT8:**
 - Float16: migliore accuratezza (0.9219 IoU), decode interno
 - INT8 coords9 static: veloce (4.43 ms), ma accuratezza ridotta (0.9050 IoU)
-- **INT8 simcc_logits static:** **BEST** - veloce (4.41 ms) E alta accuratezza (0.9183 IoU)
-- **Raccomandato:** `model_int8_simcc_static.tflite` con decode esterno per massime performance
+- **INT8 simcc_logits bins_first:** **BEST** - veloce (4.41 ms) E alta accuratezza (0.9183 IoU)
+- **Raccomandato:** `model_int8_simcc_bins_first.tflite` con decode esterno per massime performance
 
 **Trade-off generale:**
 - geom_aug_320 è 1.8× più lento dei modelli 224px ma +10% IoU sul test set
@@ -489,7 +489,7 @@ python export_tflite_int8.py \
 
 #### 🚀 INT8 Full XNNPACK Delegate con SimCC Logits (BEST - Raccomandato)
 
-Per ottenere **massima accuratezza (mIoU ≥ 0.91) E velocità**, usa `simcc_logits` con decode esterno:
+Per ottenere **massima accuratezza (mIoU ≥ 0.91) E velocità**, usa `simcc_logits` con layout `bins_first` (compatibile con modelli esistenti):
 
 ```bash
 python export_tflite_int8.py \
@@ -500,11 +500,11 @@ python export_tflite_int8.py \
     --io_dtype int8 \
     --output_dtype int8 \
     --output_format simcc_logits \
-    --simcc_packed_layout 8_first \
+    --simcc_packed_layout bins_first \
     --static_batch \
     --axis_mean_impl dwconv_full \
     --global_pool_impl dwconv_strided \
-    --output checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_static.tflite
+    --output checkpoints_remote/geom_aug_plateau_ohem/model_int8_simcc_bins_first.tflite
 ```
 
 **Risultati:**
@@ -512,26 +512,29 @@ python export_tflite_int8.py \
 - ✅ Latenza: **4.41 ms** (target ≤ 4.43 ms)
 - ✅ Full XNNPACK delegation (nessun warning)
 - ✅ Size: **0.89 MB** (più piccolo di float16)
+- ✅ Output shape: `[1, 320, 8]` (compatibile con modelli esistenti in `models-last/`)
 
-**Decode esterno in Python/NumPy:**
+**Decode esterno in Python/NumPy (bins_first layout):**
 ```python
-def decode_simcc(simcc_xy, tau=1.0):
+def decode_simcc_bins_first(simcc_xy, tau=1.0):
     """
     Decode SimCC logits to normalized coordinates.
 
     Args:
-        simcc_xy: [1, 8, num_bins] - packed logits (8_first layout)
-                  First 4 channels are X coords, next 4 are Y coords
+        simcc_xy: [1, num_bins, 8] - packed logits (bins_first layout)
+                  Layout per bin: [x0, x1, x2, x3, y0, y1, y2, y3]
         tau: softmax temperature (default 1.0)
 
     Returns:
         coords: [1, 8] - (x0,y0,x1,y1,x2,y2,x3,y3) in [0,1]
     """
-    simcc_xy = simcc_xy.astype(np.float32)
-    simcc_x = simcc_xy[:, :4, :]  # [1, 4, num_bins]
-    simcc_y = simcc_xy[:, 4:, :]  # [1, 4, num_bins]
+    simcc_xy = simcc_xy.astype(np.float32)  # [1, 320, 8]
+    num_bins = simcc_xy.shape[1]
 
-    num_bins = simcc_x.shape[2]
+    # Split X and Y, then transpose to [1, 4, num_bins]
+    simcc_x = np.transpose(simcc_xy[:, :, :4], (0, 2, 1))  # [1, 4, 320]
+    simcc_y = np.transpose(simcc_xy[:, :, 4:], (0, 2, 1))  # [1, 4, 320]
+
     centers = np.linspace(0, 1, num_bins, dtype=np.float32)
 
     # Stable softmax
@@ -642,7 +645,7 @@ python export_tflite_int8.py \
 | geom_aug_320_float16 | coords9 | 1.11 MB | **0.9219** | 4.64 ms | ✅ | Interno |
 | geom_aug_320_int8 | coords9 | 1.16 MB | 0.9108 | 5.78 ms | ⚠️ | Interno |
 | geom_aug_320_int8_static | coords9 | 0.94 MB | 0.9050 | 4.43 ms | ✅ | Interno |
-| **geom_aug_320_int8_simcc_static** | **simcc_logits** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ | **Esterno** |
+| **geom_aug_320_int8_simcc_bins_first** | **simcc_logits** | **0.89 MB** | **0.9183** | **4.41 ms** | ✅ | **Esterno** |
 
 **Raccomandazione:**
 - **Massima accuratezza assoluta:** float16 (mIoU 0.9219) - decode interno
