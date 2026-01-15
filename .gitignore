@@ -25,6 +25,7 @@ exported/
 *.onnx
 *.npz
 *.tflite
+!models-last/*.tflite
 *.pb
 saved_model/
 savedmodel*/
