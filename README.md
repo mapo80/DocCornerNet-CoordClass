@@ -720,10 +720,11 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | 🥈 | `gau_ohem_320_fp16_coords9` | 320 | 0.9885 | 1.06 | **99.0%** | 7.80 |
 | 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9881 | 0.76 | 98.9% | **3.79** |
 | 4 | `gau_ohem_256_transfer_fp16_coords9` | 256 | 0.9828 | 1.22 | 97.5% | 5.41 |
-| 5 | `min_revlast_fp16_256_coords9` | 256 | 0.9695 | 2.17 | 91.0% | 4.80 |
-| 6 | `min_revlast_fp16_224_coords9` | 224 | 0.9693 | 1.91 | 90.6% | 3.74 |
-| 7 | `best_labeled_fp16_224_coords9` | 224 | 0.9615 | 2.77 | 83.9% | 3.82 |
-| 8 | `best_labeled_fp16_256_coords9` | 256 | 0.9612 | 3.18 | 82.6% | 4.82 |
+| 5 | `gau_ohem_224_transfer_fp16_coords9` | 224 | 0.9814 | 1.15 | 97.1% | 6.07 |
+| 6 | `min_revlast_fp16_256_coords9` | 256 | 0.9695 | 2.17 | 91.0% | 4.80 |
+| 7 | `min_revlast_fp16_224_coords9` | 224 | 0.9693 | 1.91 | 90.6% | 3.74 |
+| 8 | `best_labeled_fp16_224_coords9` | 224 | 0.9615 | 2.77 | 83.9% | 3.82 |
+| 9 | `best_labeled_fp16_256_coords9` | 256 | 0.9612 | 3.18 | 82.6% | 4.82 |
 
 #### INT8 Models (simcc output)
 
@@ -733,10 +734,11 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | 🥈 | `best_generalist_int8_256_simcc` | 256 | 0.9866 | 0.95 | 98.5% | 2.87 |
 | 🥉 | `medium_generalist_int8_224_simcc` | 224 | 0.9851 | **0.93** | 97.8% | **2.22** |
 | 4 | `gau_ohem_256_transfer_int8_simcc` | 256 | 0.9828 | 1.22 | 97.5% | 3.26 |
-| 5 | `min_revlast_int8_224_simcc` | 224 | 0.9693 | 1.91 | 90.5% | 2.75 |
-| 6 | `min_revlast_int8_256_simcc` | 256 | 0.9679 | 2.30 | 90.2% | 2.87 |
-| 7 | `best_labeled_int8_224_simcc` | 224 | 0.9609 | 2.79 | 83.3% | 2.20 |
-| 8 | `best_labeled_int8_256_simcc` | 256 | 0.9596 | 3.31 | 82.0% | 2.85 |
+| 5 | `gau_ohem_224_transfer_int8_simcc` | 224 | 0.9804 | 1.21 | 96.5% | 2.65 |
+| 6 | `min_revlast_int8_224_simcc` | 224 | 0.9693 | 1.91 | 90.5% | 2.75 |
+| 7 | `min_revlast_int8_256_simcc` | 256 | 0.9679 | 2.30 | 90.2% | 2.87 |
+| 8 | `best_labeled_int8_224_simcc` | 224 | 0.9609 | 2.79 | 83.3% | 2.20 |
+| 9 | `best_labeled_int8_256_simcc` | 256 | 0.9596 | 3.31 | 82.0% | 2.85 |
 
 ### Recommendations
 
@@ -746,6 +748,8 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | **Best INT8 320** | `gau_ohem_320_int8_simcc` | 0.9183 | 4.54ms | Full XNNPACK, 44% faster |
 | **Best 256px** | `gau_ohem_256_transfer_fp16_coords9` | 0.9113 | 5.41ms | Transfer learning from 320px |
 | **Best INT8 256** | `gau_ohem_256_transfer_int8_simcc` | 0.9054 | 3.26ms | Fast + accurate |
+| **Best 224px** | `gau_ohem_224_transfer_fp16_coords9` | 0.9021 | 6.40ms | Smallest GAU+OHEM model |
+| **Best INT8 224** | `gau_ohem_224_transfer_int8_simcc` | 0.8927 | 2.57ms | Ultra-fast INT8 |
 | **Mobile/WASM** | `medium_generalist_int8_224_simcc` | 0.8876 | 2.21ms | Fastest, good accuracy |
 
 ---
@@ -954,20 +958,23 @@ python export_onnx.py \
 
 **FP16 Export (coords9 output - decode interno)**
 
+Use `export_tflite_fp16.py` for models with GAU (Gated Attention Unit):
+
 ```bash
 # Export 320px model to FP16 TFLite
-python export.py \
-    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
-    --output models-last/gau_ohem_320_fp16_coords9.tflite \
-    --format tflite \
-    --quantization float16
+python export_tflite_fp16.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem/mobilenetv2_320_* \
+    --output models-last/gau_ohem_320_fp16_coords9.tflite
 
 # Export 256px transfer model to FP16 TFLite
-python export.py \
+python export_tflite_fp16.py \
     --checkpoint checkpoints_remote/gau_ohem_256_transfer/mobilenetv2_256_* \
-    --output models-last/gau_ohem_256_transfer_fp16_coords9.tflite \
-    --format tflite \
-    --quantization float16
+    --output models-last/gau_ohem_256_transfer_fp16_coords9.tflite
+
+# Export 224px transfer model to FP16 TFLite
+python export_tflite_fp16.py \
+    --checkpoint checkpoints_remote/gau_ohem_224_transfer/mobilenetv2_224_* \
+    --output models-last/gau_ohem_224_transfer_fp16_coords9.tflite
 ```
 
 **INT8 Export (simcc output - decode esterno, BEST for mobile)**
@@ -975,7 +982,7 @@ python export.py \
 ```bash
 # Export 320px model to INT8 TFLite with SimCC logits output
 python export_tflite_int8.py \
-    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem/mobilenetv2_320_* \
     --hf_dataset ./hf_dataset \
     --split val \
     --quantization int8 \
@@ -1002,13 +1009,30 @@ python export_tflite_int8.py \
     --axis_mean_impl dwconv_full \
     --global_pool_impl dwconv_strided \
     --output models-last/gau_ohem_256_transfer_int8_simcc.tflite
+
+# Export 224px transfer model to INT8 TFLite
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/gau_ohem_224_transfer/mobilenetv2_224_* \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --static_batch \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output models-last/gau_ohem_224_transfer_int8_simcc.tflite
 ```
 
-**INT8 Export Notes:**
+**Export Notes:**
+- `export_tflite_fp16.py`: Use for FP16 export with GAU models (coords9 output format)
+- `export_tflite_int8.py`: Use for INT8 export with full XNNPACK delegation
 - `--static_batch`: Required for full XNNPACK delegation (no dynamic tensor warnings)
 - `--simcc_packed_layout bins_first`: Output shape `[1, num_bins, 8]` for efficient decode
 - `--output_format simcc_logits`: Higher accuracy than coords9 (0.9183 vs 0.9050 mIoU)
-- Requires external decode (see `decode_simcc_bins_first()` function in MODEL.md)
+- INT8 simcc requires external decode (see `decode_simcc_bins_first()` function in MODEL.md)
 
 ---
 
