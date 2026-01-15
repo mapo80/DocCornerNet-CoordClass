@@ -719,10 +719,11 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | 🥇 | `medium_generalist_fp16_256_coords9` | 256 | **0.9888** | **0.81** | 98.8% | 4.81 |
 | 🥈 | `gau_ohem_320_fp16_coords9` | 320 | 0.9885 | 1.06 | **99.0%** | 7.80 |
 | 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9881 | 0.76 | 98.9% | **3.79** |
-| 4 | `min_revlast_fp16_256_coords9` | 256 | 0.9695 | 2.17 | 91.0% | 4.80 |
-| 5 | `min_revlast_fp16_224_coords9` | 224 | 0.9693 | 1.91 | 90.6% | 3.74 |
-| 6 | `best_labeled_fp16_224_coords9` | 224 | 0.9615 | 2.77 | 83.9% | 3.82 |
-| 7 | `best_labeled_fp16_256_coords9` | 256 | 0.9612 | 3.18 | 82.6% | 4.82 |
+| 4 | `gau_ohem_256_transfer_fp16_coords9` | 256 | 0.9828 | 1.22 | 97.5% | 5.41 |
+| 5 | `min_revlast_fp16_256_coords9` | 256 | 0.9695 | 2.17 | 91.0% | 4.80 |
+| 6 | `min_revlast_fp16_224_coords9` | 224 | 0.9693 | 1.91 | 90.6% | 3.74 |
+| 7 | `best_labeled_fp16_224_coords9` | 224 | 0.9615 | 2.77 | 83.9% | 3.82 |
+| 8 | `best_labeled_fp16_256_coords9` | 256 | 0.9612 | 3.18 | 82.6% | 4.82 |
 
 #### INT8 Models (simcc output)
 
@@ -731,10 +732,11 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | 🥇 | `gau_ohem_320_int8_simcc` | 320 | **0.9881** | 1.09 | **98.8%** | 4.44 |
 | 🥈 | `best_generalist_int8_256_simcc` | 256 | 0.9866 | 0.95 | 98.5% | 2.87 |
 | 🥉 | `medium_generalist_int8_224_simcc` | 224 | 0.9851 | **0.93** | 97.8% | **2.22** |
-| 4 | `min_revlast_int8_224_simcc` | 224 | 0.9693 | 1.91 | 90.5% | 2.75 |
-| 5 | `min_revlast_int8_256_simcc` | 256 | 0.9679 | 2.30 | 90.2% | 2.87 |
-| 6 | `best_labeled_int8_224_simcc` | 224 | 0.9609 | 2.79 | 83.3% | 2.20 |
-| 7 | `best_labeled_int8_256_simcc` | 256 | 0.9596 | 3.31 | 82.0% | 2.85 |
+| 4 | `gau_ohem_256_transfer_int8_simcc` | 256 | 0.9828 | 1.22 | 97.5% | 3.26 |
+| 5 | `min_revlast_int8_224_simcc` | 224 | 0.9693 | 1.91 | 90.5% | 2.75 |
+| 6 | `min_revlast_int8_256_simcc` | 256 | 0.9679 | 2.30 | 90.2% | 2.87 |
+| 7 | `best_labeled_int8_224_simcc` | 224 | 0.9609 | 2.79 | 83.3% | 2.20 |
+| 8 | `best_labeled_int8_256_simcc` | 256 | 0.9596 | 3.31 | 82.0% | 2.85 |
 
 ### Recommendations
 
