@@ -674,39 +674,77 @@ y' = (d*x + e*y + f) / (g*x + h*y + 1)
 
 ## Leaderboard
 
-### Test Set Results
+### Test Set Results (TFLite Models)
 
-Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset) **test split** (6,652 samples):
+Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset) **test split** (6,652 samples).
 
-| Model | Alpha | Params | Size | mean_iou | Corner err (px) | Recall@95 | Recall@99 |
-|-------|-------|--------|------|----------|-----------------|-----------|-----------|
-| `mobilenetv2_320_a1.0_baseline` | 1.0 | 2.4M | 9.84 MB | **0.9197** | **6.90** | **67.2%** | **26.5%** |
-| `mobilenetv2_320_a0.35_baseline` | 0.35 | 495K | 2.41 MB | 0.9044 | 8.41 | 64.1% | 23.2% |
-| `mobilenetv2_320_a0.35_gau_fc256_ohem` | 0.35 | ~550K | 3.85 MB | 0.9014 | 8.78 | 63.2% | 20.6% |
-| `cspnext_320_gau_fc256_ohem` | - | ~2.5M | 10.43 MB | 0.8970 | 9.29 | 63.8% | 24.4% |
-| `mobilenetv2_320_a1.0_gau_fc256` | 1.0 | 2.4M | 9.75 MB | 0.8959 | 9.20 | 60.5% | 25.6% |
-| `mobilenetv2_320_a0.35_fc256` | 0.35 | 546K | 2.62 MB | 0.8939 | 9.50 | 63.1% | 22.9% |
-| `mobilenetv2_320_a0.35_gau_v2_fc256` | 0.35 | 546K | 2.63 MB | 0.8771 | 11.00 | 56.3% | 18.8% |
+#### FP16 Models (coords9 output)
 
-**Winner**: `mobilenetv2_320_a1.0_baseline` - Best accuracy on test set with IoU=0.9197 and corner error 6.90px.
+| Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
+|------|-------|-------|------|-----------------|-----------|--------------|
+| 🥇 | `gau_ohem_320_fp16_coords9` | 320 | **0.9219** | **5.96** | **68.9%** | 8.14 |
+| 🥈 | `gau_ohem_256_transfer_fp16_coords9` | 256 | **0.9113** | 5.96 | 62.6% | 5.41 |
+| 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9053 | 5.67 | 62.7% | 3.83 |
+| 4 | `medium_generalist_fp16_256_coords9` | 256 | 0.9010 | 6.84 | 62.9% | 4.90 |
+| 5 | `best_labeled_fp16_224_coords9` | 224 | 0.8576 | 9.97 | 48.5% | 3.78 |
+| 6 | `best_labeled_fp16_256_coords9` | 256 | 0.8576 | 11.33 | 48.3% | 4.86 |
+| 7 | `min_revlast_fp16_224_coords9` | 224 | 0.8361 | 11.67 | 52.1% | 3.80 |
 
-**Notes**:
-- GAU (Gated Attention Unit) and FC expansion (256-dim) did not improve accuracy over the baseline
-- OHEM (Online Hard Example Mining) models show similar performance to non-OHEM variants
-- CSPNeXt backbone (10.43 MB) underperforms MobileNetV2 α=1.0 baseline (9.84 MB) despite larger size
+#### INT8 Models (simcc output)
 
-### Validation Set Results
+| Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
+|------|-------|-------|------|-----------------|-----------|--------------|
+| 🥇 | `gau_ohem_320_int8_simcc` | 320 | **0.9183** | **7.04** | **68.2%** | 4.54 |
+| 🥈 | `gau_ohem_256_transfer_int8_simcc` | 256 | **0.9054** | 6.42 | 61.1% | **3.26** |
+| 🥉 | `best_generalist_int8_256_simcc` | 256 | 0.8913 | 7.60 | 61.3% | 2.92 |
+| 4 | `medium_generalist_int8_224_simcc` | 224 | 0.8876 | 7.00 | 60.5% | 2.21 |
+| 5 | `best_labeled_int8_224_simcc` | 224 | 0.8566 | 9.93 | 47.5% | 2.28 |
+| 6 | `best_labeled_int8_256_simcc` | 256 | 0.8535 | 11.72 | 47.6% | 2.98 |
+| 7 | `min_revlast_int8_224_simcc` | 224 | 0.8345 | 11.74 | 51.4% | 2.26 |
 
-Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset) validation split:
+**🏆 Winner**: `gau_ohem_320_fp16_coords9` - Best accuracy on test set with **mIoU=0.9219** and corner error 5.96px.
 
-| Model | Input | mean_iou | Corner err (px) | Latency (ms) | Size |
-|-------|-------|----------|-----------------|--------------|------|
-| `mobilenetv2_224_best` | 224 | 0.9894 | 0.57 | 4.24 | 0.98 MB |
-| `mobilenetv2_256_best` | 256 | **0.9902** | 0.60 | 8.18 | 0.98 MB |
-| `mobilenetv2_320` | 320 | 0.9855 | 1.13 | 5.36 | 0.88 MB |
-| `mobilenetv3_224` | 224 | 0.9842 | 0.86 | 3.96 | 1.47 MB |
+**🚀 Best INT8**: `gau_ohem_320_int8_simcc` - mIoU=0.9183 with only 4.54ms latency (44% faster than FP16).
 
-**Recommended for deployment**: `mobilenetv2_224_best` - Best speed/accuracy/robustness tradeoff.
+**⚡ Best 256px**: `gau_ohem_256_transfer` - FP16 mIoU=0.9113, INT8 mIoU=0.9054 @ 3.26ms (transfer learning from 320px).
+
+### Validation Set Results (TFLite Models)
+
+Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCornerDataset) **validation split** (8,645 samples).
+
+#### FP16 Models (coords9 output)
+
+| Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
+|------|-------|-------|------|-----------------|-----------|--------------|
+| 🥇 | `medium_generalist_fp16_256_coords9` | 256 | **0.9888** | **0.81** | 98.8% | 4.81 |
+| 🥈 | `gau_ohem_320_fp16_coords9` | 320 | 0.9885 | 1.06 | **99.0%** | 7.80 |
+| 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9881 | 0.76 | 98.9% | **3.79** |
+| 4 | `min_revlast_fp16_256_coords9` | 256 | 0.9695 | 2.17 | 91.0% | 4.80 |
+| 5 | `min_revlast_fp16_224_coords9` | 224 | 0.9693 | 1.91 | 90.6% | 3.74 |
+| 6 | `best_labeled_fp16_224_coords9` | 224 | 0.9615 | 2.77 | 83.9% | 3.82 |
+| 7 | `best_labeled_fp16_256_coords9` | 256 | 0.9612 | 3.18 | 82.6% | 4.82 |
+
+#### INT8 Models (simcc output)
+
+| Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
+|------|-------|-------|------|-----------------|-----------|--------------|
+| 🥇 | `gau_ohem_320_int8_simcc` | 320 | **0.9881** | 1.09 | **98.8%** | 4.44 |
+| 🥈 | `best_generalist_int8_256_simcc` | 256 | 0.9866 | 0.95 | 98.5% | 2.87 |
+| 🥉 | `medium_generalist_int8_224_simcc` | 224 | 0.9851 | **0.93** | 97.8% | **2.22** |
+| 4 | `min_revlast_int8_224_simcc` | 224 | 0.9693 | 1.91 | 90.5% | 2.75 |
+| 5 | `min_revlast_int8_256_simcc` | 256 | 0.9679 | 2.30 | 90.2% | 2.87 |
+| 6 | `best_labeled_int8_224_simcc` | 224 | 0.9609 | 2.79 | 83.3% | 2.20 |
+| 7 | `best_labeled_int8_256_simcc` | 256 | 0.9596 | 3.31 | 82.0% | 2.85 |
+
+### Recommendations
+
+| Use Case | Model | mIoU (test) | Latency | Notes |
+|----------|-------|-------------|---------|-------|
+| **Best Accuracy** | `gau_ohem_320_fp16_coords9` | 0.9219 | 8.14ms | Winner on test set |
+| **Best INT8 320** | `gau_ohem_320_int8_simcc` | 0.9183 | 4.54ms | Full XNNPACK, 44% faster |
+| **Best 256px** | `gau_ohem_256_transfer_fp16_coords9` | 0.9113 | 5.41ms | Transfer learning from 320px |
+| **Best INT8 256** | `gau_ohem_256_transfer_int8_simcc` | 0.9054 | 3.26ms | Fast + accurate |
+| **Mobile/WASM** | `medium_generalist_int8_224_simcc` | 0.8876 | 2.21ms | Fastest, good accuracy |
 
 ---
 
