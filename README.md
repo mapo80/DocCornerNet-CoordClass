@@ -696,8 +696,8 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 | Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
 |------|-------|-------|------|-----------------|-----------|--------------|
 | 🥇 | `gau_ohem_320_int8_simcc` | 320 | **0.9183** | **7.04** | **68.2%** | 4.54 |
-| 🥈 | `best_generalist_int8_256_simcc` | 256 | 0.8913 | 7.60 | 61.3% | 2.92 |
-| 🥉 | `gau_ohem_224_transfer_int8_simcc` | 224 | 0.8927 | 6.49 | 57.8% | **2.57** |
+| 🥈 | `gau_ohem_224_transfer_int8_simcc` | 224 | 0.8927 | 6.49 | 57.8% | **2.57** |
+| 🥉 | `best_generalist_int8_256_simcc` | 256 | 0.8913 | 7.60 | 61.3% | 2.92 |
 | 4 | `medium_generalist_int8_224_simcc` | 224 | 0.8876 | 7.00 | 60.5% | 2.21 |
 | 5 | `best_labeled_int8_224_simcc` | 224 | 0.8566 | 9.93 | 47.5% | 2.28 |
 | 6 | `best_labeled_int8_256_simcc` | 256 | 0.8535 | 11.72 | 47.6% | 2.98 |
