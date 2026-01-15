@@ -852,6 +852,78 @@ TF_USE_LEGACY_KERAS=1 python train_ultra.py \
     --augment
 ```
 
+#### Best Model Training Commands (January 2026)
+
+These are the exact commands used to train the best performing models:
+
+**🥇 GAU+OHEM 320px (Best Model - mIoU 0.9219 on test)**
+
+```bash
+# Train from scratch with GAU + OHEM + geometric augmentation
+python train_ultra.py \
+    --hf_dataset /workspace/hf_dataset \
+    --output_dir /workspace/checkpoints/geom_aug_plateau_ohem \
+    --backbone mobilenetv2 --alpha 0.35 \
+    --img_size 320 --num_bins 320 \
+    --fpn_ch 32 --simcc_ch 96 \
+    --use_gau --gau_hidden_dim 64 --fc_expansion_dim 256 \
+    --batch_size 64 --accumulation_steps 4 \
+    --epochs 200 --lr 0.0003 \
+    --lr_schedule plateau --patience 20 --lr_patience 7 \
+    --warmup_epochs 5 \
+    --augment \
+    --rotation_range 10.0 \
+    --perspective_intensity 0.03 \
+    --ema_decay 0.999 \
+    --hard_mining --hard_mining_weight 2.5 --hard_mining_threshold 12.0 --hard_mining_start 0.15
+```
+
+**🥈 GAU+OHEM 256px Transfer Learning (mIoU 0.9113 on test)**
+
+```bash
+# Transfer learning from 320px model to 256px
+python train_ultra.py \
+    --hf_dataset /workspace/hf_dataset \
+    --output_dir /workspace/checkpoints/gau_ohem_256_transfer \
+    --backbone mobilenetv2 --alpha 0.35 \
+    --img_size 256 --num_bins 256 \
+    --fpn_ch 32 --simcc_ch 96 \
+    --use_gau --gau_hidden_dim 64 --fc_expansion_dim 256 \
+    --batch_size 64 --accumulation_steps 4 \
+    --epochs 100 --lr 0.0001 \
+    --lr_schedule plateau --patience 15 --lr_patience 5 \
+    --warmup_epochs 3 \
+    --augment \
+    --rotation_range 10.0 \
+    --perspective_intensity 0.03 \
+    --hard_mining --hard_mining_weight 2.5 --hard_mining_threshold 12.0 \
+    --init_weights /workspace/checkpoints/geom_aug_plateau_ohem/mobilenetv2_320_*/best_model.weights.h5 \
+    --init_partial
+```
+
+**🥉 GAU+OHEM 224px Transfer Learning**
+
+```bash
+# Transfer learning from 320px model to 224px
+python train_ultra.py \
+    --hf_dataset /workspace/hf_dataset \
+    --output_dir /workspace/checkpoints/gau_ohem_224_transfer \
+    --backbone mobilenetv2 --alpha 0.35 \
+    --img_size 224 --num_bins 224 \
+    --fpn_ch 32 --simcc_ch 96 \
+    --use_gau --gau_hidden_dim 64 --fc_expansion_dim 256 \
+    --batch_size 64 --accumulation_steps 4 \
+    --epochs 100 --lr 0.0001 \
+    --lr_schedule plateau --patience 15 --lr_patience 5 \
+    --warmup_epochs 3 \
+    --augment \
+    --rotation_range 10.0 \
+    --perspective_intensity 0.03 \
+    --hard_mining --hard_mining_weight 2.5 --hard_mining_threshold 12.0 \
+    --init_weights /workspace/checkpoints/geom_aug_plateau_ohem/mobilenetv2_320_*/best_model.weights.h5 \
+    --init_partial
+```
+
 ### Evaluate
 
 ```bash
@@ -864,7 +936,7 @@ python evaluate.py \
 ### Export
 
 ```bash
-# TFLite
+# TFLite (basic)
 python export.py \
     --checkpoint ./checkpoints/mobilenetv2_256_best \
     --output ./exported/model.tflite \
@@ -875,6 +947,66 @@ python export_onnx.py \
     --checkpoint ./checkpoints/mobilenetv2_256_best \
     --output ./exported/model.onnx
 ```
+
+#### TFLite Export Commands (Best Models)
+
+**FP16 Export (coords9 output - decode interno)**
+
+```bash
+# Export 320px model to FP16 TFLite
+python export.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --output models-last/gau_ohem_320_fp16_coords9.tflite \
+    --format tflite \
+    --quantization float16
+
+# Export 256px transfer model to FP16 TFLite
+python export.py \
+    --checkpoint checkpoints_remote/gau_ohem_256_transfer/mobilenetv2_256_* \
+    --output models-last/gau_ohem_256_transfer_fp16_coords9.tflite \
+    --format tflite \
+    --quantization float16
+```
+
+**INT8 Export (simcc output - decode esterno, BEST for mobile)**
+
+```bash
+# Export 320px model to INT8 TFLite with SimCC logits output
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/geom_aug_plateau_ohem \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --static_batch \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output models-last/gau_ohem_320_int8_simcc.tflite
+
+# Export 256px transfer model to INT8 TFLite
+python export_tflite_int8.py \
+    --checkpoint checkpoints_remote/gau_ohem_256_transfer/mobilenetv2_256_* \
+    --hf_dataset ./hf_dataset \
+    --split val \
+    --quantization int8 \
+    --io_dtype int8 \
+    --output_dtype int8 \
+    --output_format simcc_logits \
+    --simcc_packed_layout bins_first \
+    --static_batch \
+    --axis_mean_impl dwconv_full \
+    --global_pool_impl dwconv_strided \
+    --output models-last/gau_ohem_256_transfer_int8_simcc.tflite
+```
+
+**INT8 Export Notes:**
+- `--static_batch`: Required for full XNNPACK delegation (no dynamic tensor warnings)
+- `--simcc_packed_layout bins_first`: Output shape `[1, num_bins, 8]` for efficient decode
+- `--output_format simcc_logits`: Higher accuracy than coords9 (0.9183 vs 0.9050 mIoU)
+- Requires external decode (see `decode_simcc_bins_first()` function in MODEL.md)
 
 ---
 
