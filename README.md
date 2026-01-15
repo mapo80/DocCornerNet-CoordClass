@@ -682,31 +682,34 @@ Evaluated on [DocCornerDataset](https://huggingface.co/datasets/mapo80/DocCorner
 
 | Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
 |------|-------|-------|------|-----------------|-----------|--------------|
-| 🥇 | `gau_ohem_320_fp16_coords9` | 320 | **0.9219** | **5.96** | **68.9%** | 8.14 |
-| 🥈 | `gau_ohem_256_transfer_fp16_coords9` | 256 | **0.9113** | 5.96 | 62.6% | 5.41 |
-| 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9053 | 5.67 | 62.7% | 3.83 |
-| 4 | `medium_generalist_fp16_256_coords9` | 256 | 0.9010 | 6.84 | 62.9% | 4.90 |
-| 5 | `best_labeled_fp16_224_coords9` | 224 | 0.8576 | 9.97 | 48.5% | 3.78 |
-| 6 | `best_labeled_fp16_256_coords9` | 256 | 0.8576 | 11.33 | 48.3% | 4.86 |
-| 7 | `min_revlast_fp16_224_coords9` | 224 | 0.8361 | 11.67 | 52.1% | 3.80 |
+| 🥇 | `gau_ohem_320_fp16_coords9` | 320 | **0.9219** | 6.67 | **68.9%** | 8.14 |
+| 🥈 | `gau_ohem_256_transfer_fp16_coords9` | 256 | 0.9113 | **5.96** | 62.6% | 5.41 |
+| 🥉 | `best_generalist_fp16_224_coords9` | 224 | 0.9053 | 5.67 | 62.7% | **3.83** |
+| 4 | `gau_ohem_224_transfer_fp16_coords9` | 224 | 0.9021 | 5.80 | 58.9% | 6.40 |
+| 5 | `medium_generalist_fp16_256_coords9` | 256 | 0.9010 | 6.84 | 62.9% | 4.90 |
+| 6 | `best_labeled_fp16_224_coords9` | 224 | 0.8576 | 9.97 | 48.5% | 3.78 |
+| 7 | `best_labeled_fp16_256_coords9` | 256 | 0.8576 | 11.33 | 48.3% | 4.86 |
+| 8 | `min_revlast_fp16_224_coords9` | 224 | 0.8361 | 11.67 | 52.1% | 3.80 |
 
 #### INT8 Models (simcc output)
 
 | Rank | Model | Input | mIoU | Corner err (px) | Recall@95 | Latency (ms) |
 |------|-------|-------|------|-----------------|-----------|--------------|
 | 🥇 | `gau_ohem_320_int8_simcc` | 320 | **0.9183** | **7.04** | **68.2%** | 4.54 |
-| 🥈 | `gau_ohem_256_transfer_int8_simcc` | 256 | **0.9054** | 6.42 | 61.1% | **3.26** |
-| 🥉 | `best_generalist_int8_256_simcc` | 256 | 0.8913 | 7.60 | 61.3% | 2.92 |
+| 🥈 | `best_generalist_int8_256_simcc` | 256 | 0.8913 | 7.60 | 61.3% | 2.92 |
+| 🥉 | `gau_ohem_224_transfer_int8_simcc` | 224 | 0.8927 | 6.49 | 57.8% | **2.57** |
 | 4 | `medium_generalist_int8_224_simcc` | 224 | 0.8876 | 7.00 | 60.5% | 2.21 |
 | 5 | `best_labeled_int8_224_simcc` | 224 | 0.8566 | 9.93 | 47.5% | 2.28 |
 | 6 | `best_labeled_int8_256_simcc` | 256 | 0.8535 | 11.72 | 47.6% | 2.98 |
 | 7 | `min_revlast_int8_224_simcc` | 224 | 0.8345 | 11.74 | 51.4% | 2.26 |
 
-**🏆 Winner**: `gau_ohem_320_fp16_coords9` - Best accuracy on test set with **mIoU=0.9219** and corner error 5.96px.
+**🏆 Winner**: `gau_ohem_320_fp16_coords9` - Best accuracy on test set with **mIoU=0.9219** and corner error 6.67px.
 
 **🚀 Best INT8**: `gau_ohem_320_int8_simcc` - mIoU=0.9183 with only 4.54ms latency (44% faster than FP16).
 
-**⚡ Best 256px**: `gau_ohem_256_transfer` - FP16 mIoU=0.9113, INT8 mIoU=0.9054 @ 3.26ms (transfer learning from 320px).
+**⚡ Best 256px**: `gau_ohem_256_transfer_fp16_coords9` - mIoU=0.9113 @ 5.41ms (transfer learning from 320px).
+
+**⚡ Best 224px**: `gau_ohem_224_transfer_fp16_coords9` - mIoU=0.9021 @ 6.40ms, INT8 mIoU=0.8927 @ 2.57ms.
 
 ### Validation Set Results (TFLite Models)
 
