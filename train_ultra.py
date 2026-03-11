@@ -50,6 +50,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -735,31 +736,64 @@ from metrics import ValidationMetrics
 from dataset import tf_augment_batch
 
 
+class EMA:
+    """Exponential Moving Average of model weights (includes BatchNorm stats)."""
+
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = [tf.Variable(v, trainable=False) for v in model.variables]
+        self.backup = None
+
+    def update(self):
+        for shadow, var in zip(self.shadow, self.model.variables):
+            shadow.assign(self.decay * shadow + (1.0 - self.decay) * var)
+
+    def apply(self):
+        """Swap model weights with EMA weights (save originals for restore)."""
+        self.backup = [tf.identity(v) for v in self.model.variables]
+        for shadow, var in zip(self.shadow, self.model.variables):
+            var.assign(shadow)
+
+    def restore(self):
+        """Restore original model weights after apply()."""
+        if self.backup is not None:
+            for backup, var in zip(self.backup, self.model.variables):
+                var.assign(backup)
+            self.backup = None
+
+
 class Trainer:
     """Efficient trainer with compiled functions."""
 
-    def __init__(self, model, optimizer, img_size, sigma_px, tau,
-                 w_simcc, w_coord, w_score, platform='cuda', augment=False):
+    def __init__(self, model, optimizer, img_size, num_bins, sigma_px, tau,
+                 w_simcc, w_coord, w_score, platform='cuda', augment=False,
+                 label_smoothing=0.0, rotation_range=0.0):
         self.model = model
         self.optimizer = optimizer
         self.platform = platform
         self.use_mixed_precision = platform == 'cuda'
         self.augment = augment
         self.img_size = img_size
+        self.num_bins = num_bins
 
         # Pre-compute constants as tensors
         self.img_size_tf = tf.constant(img_size, dtype=tf.int32)
         self.img_size_float = tf.constant(float(img_size), dtype=tf.float32)
+        self.num_bins_tf = tf.constant(num_bins, dtype=tf.int32)
         self.sigma_px = tf.constant(sigma_px, dtype=tf.float32)
         self.tau = tf.constant(tau, dtype=tf.float32)
         self.w_simcc = tf.constant(w_simcc, dtype=tf.float32)
         self.w_coord = tf.constant(w_coord, dtype=tf.float32)
         self.w_score = tf.constant(w_score, dtype=tf.float32)
+        self.label_smoothing = tf.constant(label_smoothing, dtype=tf.float32)
+        self.rotation_range = rotation_range
 
     @tf.function
     def augment_batch(self, images, coords, has_doc):
         """Apply augmentation to batch."""
-        return tf_augment_batch(images, coords, has_doc, self.img_size, image_norm="imagenet")
+        return tf_augment_batch(images, coords, has_doc, self.img_size,
+                                image_norm="imagenet", rotation_range=self.rotation_range)
 
     def _compute_loss(self, images, coords_gt, has_doc, training):
         """Compute total loss and its components."""
@@ -776,8 +810,8 @@ class Trainer:
         gt_x = gt_coords_4x2[:, :, 0]
         gt_y = gt_coords_4x2[:, :, 1]
 
-        target_x = gaussian_1d_targets(gt_x, self.img_size_tf, self.sigma_px)
-        target_y = gaussian_1d_targets(gt_y, self.img_size_tf, self.sigma_px)
+        target_x = gaussian_1d_targets(gt_x, self.num_bins_tf, self.sigma_px, self.label_smoothing)
+        target_y = gaussian_1d_targets(gt_y, self.num_bins_tf, self.sigma_px, self.label_smoothing)
 
         log_pred_x = tf.nn.log_softmax(simcc_x / self.tau, axis=-1)
         log_pred_y = tf.nn.log_softmax(simcc_y / self.tau, axis=-1)
@@ -961,6 +995,19 @@ def compute_metrics(coords_pred, coords_gt, has_doc, img_size, score_logit=None)
 
 
 # ============================================================================
+# LR Schedules
+# ============================================================================
+
+def cosine_lr(epoch, total_epochs, lr_max, lr_min, warmup_epochs=0):
+    """Cosine annealing LR with optional linear warmup."""
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return lr_min + (lr_max - lr_min) * (epoch + 1) / warmup_epochs
+    effective_epoch = epoch - warmup_epochs
+    effective_total = max(total_epochs - warmup_epochs - 1, 1)
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * effective_epoch / effective_total))
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -1020,6 +1067,10 @@ def main():
     parser.add_argument("--w_simcc", type=float, default=1.0)
     parser.add_argument("--w_coord", type=float, default=0.5)
     parser.add_argument("--w_score", type=float, default=0.5)
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for SimCC targets (0.0 = disabled)")
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay rate (0.0 = disabled, 0.999 = typical)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=128)
@@ -1031,6 +1082,9 @@ def main():
     parser.add_argument("--lr_patience", type=int, default=7)
     parser.add_argument("--lr_factor", type=float, default=0.5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--lr_schedule", type=str, default="plateau",
+                        choices=["plateau", "cosine"],
+                        help="LR schedule: 'plateau' (ReduceLROnPlateau) or 'cosine' (cosine annealing)")
 
     # Loading
     parser.add_argument("--num_workers", type=int, default=64,
@@ -1039,6 +1093,8 @@ def main():
     # Augmentation
     parser.add_argument("--augment", action="store_true",
                         help="Enable data augmentation")
+    parser.add_argument("--rotation_range", type=float, default=0.0,
+                        help="Random rotation range in degrees (0.0 = disabled, requires --augment)")
 
     args = parser.parse_args()
 
@@ -1056,6 +1112,22 @@ def main():
         parser.error("Cannot specify both --data_root and --hf_dataset")
     if args.output_dir is None:
         parser.error("--output_dir is required for training")
+
+    # Capability check for rotation augmentation
+    if args.rotation_range > 0:
+        try:
+            _dummy = tf.zeros([1, 4, 4, 1])
+            _transforms = tf.constant([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+            tf.raw_ops.ImageProjectiveTransformV3(
+                images=_dummy, transforms=_transforms,
+                output_shape=[4, 4], interpolation="BILINEAR",
+                fill_mode="NEAREST", fill_value=0.0)
+            print(f"Rotation augmentation: ImageProjectiveTransformV3 OK (range={args.rotation_range}°)",
+                  flush=True)
+        except Exception as e:
+            print(f"WARNING: ImageProjectiveTransformV3 not available ({e}), disabling rotation",
+                  flush=True)
+            args.rotation_range = 0.0
 
     # Auto-detect val_split name for local datasets
     if args.data_root is not None and args.val_split == "validation":
@@ -1189,10 +1261,17 @@ def main():
 
     # Trainer
     trainer = Trainer(
-        model, optimizer, args.img_size, args.sigma_px, args.tau,
+        model, optimizer, args.img_size, args.num_bins, args.sigma_px, args.tau,
         args.w_simcc, args.w_coord, args.w_score,
-        platform=platform, augment=args.augment
+        platform=platform, augment=args.augment,
+        label_smoothing=args.label_smoothing,
+        rotation_range=args.rotation_range
     )
+
+    # EMA
+    ema = EMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"EMA enabled: decay={args.ema_decay}, tracking {len(model.variables)} variables", flush=True)
 
     # ========================================================================
     # Warmup (compile XLA kernels)
@@ -1230,8 +1309,11 @@ def main():
         # Reshuffle training data for new epoch
         train_ds.reshuffle()
 
-        # Warmup LR
-        if epoch < args.warmup_epochs:
+        # LR scheduling
+        if args.lr_schedule == "cosine":
+            current_lr = cosine_lr(epoch, args.epochs, args.lr, args.min_lr, args.warmup_epochs)
+            optimizer.learning_rate.assign(current_lr)
+        elif epoch < args.warmup_epochs:
             warmup_lr = args.lr * (epoch + 1) / args.warmup_epochs
             optimizer.learning_rate.assign(warmup_lr)
             current_lr = warmup_lr
@@ -1261,6 +1343,8 @@ def main():
             loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
                 images, coords, has_doc
             )
+            if ema is not None:
+                ema.update()
             loss_val = float(loss)
             train_losses.append(loss_val)
             train_simcc.append(float(loss_simcc))
@@ -1281,37 +1365,43 @@ def main():
         avg_train_iou = float(np.mean(train_iou)) if train_iou else 0.0
         avg_train_err = float(np.mean(train_err)) if train_err else 0.0
 
-        # Validation
-        val_losses = []
-        val_simcc = []
-        val_coord = []
-        val_score = []
-        metrics = ValidationMetrics(img_size=args.img_size)
-        val_pbar = tqdm(
-            val_ds.dataset,
-            total=len(val_ds),
-            desc="  Val  ",
-            unit="batch",
-            ncols=100,
-            leave=True,
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
-            ascii=True,
-        )
-        for images, coords, has_doc in val_pbar:
-            preds, score_logit, v_loss, v_simcc, v_coord, v_score = trainer.val_step(
-                images, coords, has_doc
+        # Validation (with EMA weights if enabled)
+        if ema is not None:
+            ema.apply()
+        try:
+            val_losses = []
+            val_simcc = []
+            val_coord = []
+            val_score = []
+            metrics = ValidationMetrics(img_size=args.img_size)
+            val_pbar = tqdm(
+                val_ds.dataset,
+                total=len(val_ds),
+                desc="  Val  ",
+                unit="batch",
+                ncols=100,
+                leave=True,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
+                ascii=True,
             )
-            val_losses.append(float(v_loss))
-            val_simcc.append(float(v_simcc))
-            val_coord.append(float(v_coord))
-            val_score.append(float(v_score))
-            score_pred = tf.sigmoid(score_logit).numpy()
-            metrics.update(preds.numpy(), coords.numpy(), score_pred, has_doc.numpy())
-            val_pbar.set_postfix({
-                "loss": f"{np.mean(val_losses):.4f}",
-            })
+            for images, coords, has_doc in val_pbar:
+                preds, score_logit, v_loss, v_simcc, v_coord, v_score = trainer.val_step(
+                    images, coords, has_doc
+                )
+                val_losses.append(float(v_loss))
+                val_simcc.append(float(v_simcc))
+                val_coord.append(float(v_coord))
+                val_score.append(float(v_score))
+                score_pred = tf.sigmoid(score_logit).numpy()
+                metrics.update(preds.numpy(), coords.numpy(), score_pred, has_doc.numpy())
+                val_pbar.set_postfix({
+                    "loss": f"{np.mean(val_losses):.4f}",
+                })
 
-        val_metrics = metrics.compute()
+            val_metrics = metrics.compute()
+        finally:
+            if ema is not None:
+                ema.restore()
 
         epoch_time = time.time() - epoch_start
         samples_per_sec = (len(train_ds) * args.batch_size) / epoch_time
@@ -1388,23 +1478,29 @@ def main():
             **val_metrics,
         })
 
-        # Checkpointing
+        # Checkpointing (save with EMA weights if enabled)
         if val_metrics["mean_iou"] > best_iou:
             best_iou = val_metrics["mean_iou"]
             best_epoch = epoch + 1
             no_improve_count = 0
             lr_no_improve_count = 0
 
-            model.save_weights(str(output_dir / "best_model.weights.h5"))
-            inference_model = create_inference_model(model)
-            inference_model.save(output_dir / "best_model_inference.keras")
+            if ema is not None:
+                ema.apply()
+            try:
+                model.save_weights(str(output_dir / "best_model.weights.h5"))
+                inference_model = create_inference_model(model)
+                inference_model.save(output_dir / "best_model_inference.keras")
+            finally:
+                if ema is not None:
+                    ema.restore()
 
             print(f"  * New best IoU: {best_iou:.4f}", flush=True)
         else:
             no_improve_count += 1
             lr_no_improve_count += 1
 
-            if epoch >= args.warmup_epochs:
+            if args.lr_schedule == "plateau" and epoch >= args.warmup_epochs:
                 if lr_no_improve_count >= args.lr_patience and current_lr > args.min_lr:
                     current_lr = max(current_lr * args.lr_factor, args.min_lr)
                     optimizer.learning_rate.assign(current_lr)
@@ -1414,7 +1510,7 @@ def main():
         with open(output_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-        if no_improve_count >= args.patience:
+        if args.lr_schedule == "plateau" and no_improve_count >= args.patience:
             print(f"\nEarly stopping at epoch {epoch + 1}", flush=True)
             break
 

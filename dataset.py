@@ -294,7 +294,67 @@ def apply_full_augmentation(
 # TensorFlow GPU Augmentations (fast, runs on GPU)
 # =============================================================================
 
-def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, image_norm: str = "imagenet"):
+def _tf_rotate_batch(images, coords, has_doc, rotation_range):
+    """Apply random rotation to a batch using TF ops.
+
+    Args:
+        images: [B, H, W, 3] float32
+        coords: [B, 8] float32 normalized [0,1]
+        has_doc: [B] float32
+        rotation_range: max rotation in degrees
+
+    Returns:
+        rotated_images, rotated_coords
+    """
+    batch_size = tf.shape(images)[0]
+    h = tf.cast(tf.shape(images)[1], tf.float32)
+    w = tf.cast(tf.shape(images)[2], tf.float32)
+
+    # Random angles in radians
+    angles = tf.random.uniform([batch_size], -rotation_range, rotation_range) * (3.14159265 / 180.0)
+    cos_a = tf.cos(angles)
+    sin_a = tf.sin(angles)
+
+    # Center of image (aligned with normalized coord convention: 0.5 maps to (dim-1)/2)
+    cx = (w - 1.0) / 2.0
+    cy = (h - 1.0) / 2.0
+
+    # Inverse affine transform for ImageProjectiveTransformV3
+    tx = cx - cos_a * cx - sin_a * cy
+    ty = cy + sin_a * cx - cos_a * cy
+
+    transforms = tf.stack([
+        cos_a, sin_a, tx,
+        -sin_a, cos_a, ty,
+        tf.zeros([batch_size]), tf.zeros([batch_size])
+    ], axis=1)
+
+    images = tf.raw_ops.ImageProjectiveTransformV3(
+        images=images, transforms=transforms,
+        output_shape=tf.shape(images)[1:3],
+        interpolation="BILINEAR", fill_mode="NEAREST", fill_value=0.0)
+
+    # Forward transform for coordinates (normalized [0,1])
+    coords_4x2 = tf.reshape(coords, [-1, 4, 2])
+    x = coords_4x2[:, :, 0] - 0.5
+    y = coords_4x2[:, :, 1] - 0.5
+
+    new_x = cos_a[:, None] * x - sin_a[:, None] * y + 0.5
+    new_y = sin_a[:, None] * x + cos_a[:, None] * y + 0.5
+
+    new_coords = tf.stack([new_x, new_y], axis=-1)
+    new_coords = tf.reshape(new_coords, [-1, 8])
+
+    # Only rotate positive samples' coords
+    has_doc_mask = tf.cast(tf.reshape(has_doc > 0.5, [-1, 1]), tf.float32)
+    coords = coords * (1.0 - has_doc_mask) + new_coords * has_doc_mask
+    coords = tf.clip_by_value(coords, 0.0, 1.0)
+
+    return images, coords
+
+
+def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None,
+                     image_norm: str = "imagenet", rotation_range=0.0):
     """
     Apply augmentation to a batch using TensorFlow ops (runs on GPU).
 
@@ -394,6 +454,10 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None, ima
     # Clip values
     images = tf.clip_by_value(images, clip_min, clip_max)
     coords = tf.clip_by_value(coords, 0.0, 1.0)
+
+    # Rotation augmentation
+    if rotation_range > 0:
+        images, coords = _tf_rotate_batch(images, coords, has_doc, rotation_range)
 
     return images, coords
 
