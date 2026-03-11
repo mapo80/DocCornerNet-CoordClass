@@ -733,7 +733,7 @@ class FastDataset:
 from model import create_model, create_inference_model
 from losses import gaussian_1d_targets
 from metrics import ValidationMetrics
-from dataset import tf_augment_batch
+from dataset import tf_augment_batch, tf_augment_color_only
 
 
 class EMA:
@@ -768,7 +768,8 @@ class Trainer:
 
     def __init__(self, model, optimizer, img_size, num_bins, sigma_px, tau,
                  w_simcc, w_coord, w_score, platform='cuda', augment=False,
-                 label_smoothing=0.0, rotation_range=0.0):
+                 label_smoothing=0.0, rotation_range=0.0, loss_tau=None,
+                 scale_range=0.0):
         self.model = model
         self.optimizer = optimizer
         self.platform = platform
@@ -786,14 +787,17 @@ class Trainer:
         self.w_simcc = tf.constant(w_simcc, dtype=tf.float32)
         self.w_coord = tf.constant(w_coord, dtype=tf.float32)
         self.w_score = tf.constant(w_score, dtype=tf.float32)
+        self.loss_tau = tf.constant(loss_tau if loss_tau is not None else tau, dtype=tf.float32)
         self.label_smoothing = tf.constant(label_smoothing, dtype=tf.float32)
         self.rotation_range = rotation_range
+        self.scale_range = scale_range
 
     @tf.function
     def augment_batch(self, images, coords, has_doc):
         """Apply augmentation to batch."""
         return tf_augment_batch(images, coords, has_doc, self.img_size,
-                                image_norm="imagenet", rotation_range=self.rotation_range)
+                                image_norm="imagenet", rotation_range=self.rotation_range,
+                                scale_range=self.scale_range)
 
     def _compute_loss(self, images, coords_gt, has_doc, training):
         """Compute total loss and its components."""
@@ -813,8 +817,8 @@ class Trainer:
         target_x = gaussian_1d_targets(gt_x, self.num_bins_tf, self.sigma_px, self.label_smoothing)
         target_y = gaussian_1d_targets(gt_y, self.num_bins_tf, self.sigma_px, self.label_smoothing)
 
-        log_pred_x = tf.nn.log_softmax(simcc_x / self.tau, axis=-1)
-        log_pred_y = tf.nn.log_softmax(simcc_y / self.tau, axis=-1)
+        log_pred_x = tf.nn.log_softmax(simcc_x / self.loss_tau, axis=-1)
+        log_pred_y = tf.nn.log_softmax(simcc_y / self.loss_tau, axis=-1)
 
         ce_x = -tf.reduce_sum(target_x * log_pred_x, axis=-1)
         ce_y = -tf.reduce_sum(target_y * log_pred_y, axis=-1)
@@ -1069,6 +1073,8 @@ def main():
     parser.add_argument("--w_score", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.0,
                         help="Label smoothing for SimCC targets (0.0 = disabled)")
+    parser.add_argument("--loss_tau", type=float, default=0.1,
+                        help="Temperature for SimCC loss softmax (RTMPose uses 0.1; separate from decode tau)")
     parser.add_argument("--ema_decay", type=float, default=0.0,
                         help="EMA decay rate (0.0 = disabled, 0.999 = typical)")
 
@@ -1095,6 +1101,10 @@ def main():
                         help="Enable data augmentation")
     parser.add_argument("--rotation_range", type=float, default=0.0,
                         help="Random rotation range in degrees (0.0 = disabled, requires --augment)")
+    parser.add_argument("--scale_range", type=float, default=0.0,
+                        help="Random scale range (0.15 means 0.85x-1.15x, 0.0 = disabled)")
+    parser.add_argument("--aug_weak_epochs", type=int, default=0,
+                        help="Last N epochs use weak augmentation (color only, no geometric). 0 = disabled")
 
     args = parser.parse_args()
 
@@ -1265,7 +1275,9 @@ def main():
         args.w_simcc, args.w_coord, args.w_score,
         platform=platform, augment=args.augment,
         label_smoothing=args.label_smoothing,
-        rotation_range=args.rotation_range
+        rotation_range=args.rotation_range,
+        loss_tau=args.loss_tau,
+        scale_range=args.scale_range
     )
 
     # EMA
@@ -1337,9 +1349,19 @@ def main():
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{postfix}]",
             ascii=True,
         )
+        # Two-stage augmentation: disable geometric augs in final epochs
+        use_weak_aug = (args.aug_weak_epochs > 0 and
+                        epoch >= args.epochs - args.aug_weak_epochs)
+        if use_weak_aug and not hasattr(trainer, '_weak_aug_logged'):
+            print(f"  -> Switching to weak augmentation (color only) for final {args.aug_weak_epochs} epochs", flush=True)
+            trainer._weak_aug_logged = True
+
         for images, coords, has_doc in train_pbar:
             if args.augment:
-                images, coords = trainer.augment_batch(images, coords, has_doc)
+                if use_weak_aug:
+                    images = tf_augment_color_only(images)
+                else:
+                    images, coords = trainer.augment_batch(images, coords, has_doc)
             loss, loss_simcc, loss_coord, loss_score, batch_iou, batch_err = trainer.train_step(
                 images, coords, has_doc
             )

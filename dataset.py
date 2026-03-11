@@ -294,6 +294,60 @@ def apply_full_augmentation(
 # TensorFlow GPU Augmentations (fast, runs on GPU)
 # =============================================================================
 
+def _tf_scale_batch(images, coords, has_doc, scale_range):
+    """Apply random scale augmentation to batch.
+
+    Scale range 0.15 means uniform scale in [0.85, 1.15].
+    Zoom-in (>1): center crop + resize. Zoom-out (<1): shrink + pad with nearest edge.
+    Coordinates are transformed: coords_new = 0.5 + (coords - 0.5) / scale.
+    Samples where any coord goes outside [0,1] after transform are left unchanged.
+    """
+    batch_size = tf.shape(images)[0]
+    h = tf.cast(tf.shape(images)[1], tf.float32)
+    w = tf.cast(tf.shape(images)[2], tf.float32)
+
+    # Random scale per sample
+    scales = tf.random.uniform([batch_size], 1.0 - scale_range, 1.0 + scale_range)
+
+    has_doc_1d = tf.cast(tf.reshape(has_doc > 0.5, [batch_size]), tf.float32)
+
+    # Transform coordinates: zoom around center
+    coords_4x2 = tf.reshape(coords, [-1, 4, 2])
+    new_coords_4x2 = 0.5 + (coords_4x2 - 0.5) / scales[:, None, None]
+    new_coords = tf.reshape(new_coords_4x2, [-1, 8])
+
+    # Check if any coord goes OOB — if so, skip transform for that sample
+    coords_min = tf.reduce_min(new_coords_4x2, axis=[1, 2])  # [B]
+    coords_max = tf.reduce_max(new_coords_4x2, axis=[1, 2])  # [B]
+    valid = tf.cast((coords_min >= 0.0) & (coords_max <= 1.0), tf.float32)  # [B]
+    apply_mask = valid * has_doc_1d  # Only apply to valid positive samples
+
+    # Transform images using crop-and-resize
+    # For each sample: crop box centered at (0.5, 0.5) with size 1/scale
+    half_h = 0.5 / scales  # half-height of crop box in normalized coords
+    half_w = 0.5 / scales
+    y1 = 0.5 - half_h
+    x1 = 0.5 - half_w
+    y2 = 0.5 + half_h
+    x2 = 0.5 + half_w
+    boxes = tf.stack([y1, x1, y2, x2], axis=1)  # [B, 4]
+    box_indices = tf.range(batch_size)
+    crop_size = tf.cast([h, w], tf.int32)
+
+    images_scaled = tf.image.crop_and_resize(
+        images, boxes, box_indices, crop_size, method='bilinear')
+
+    # Apply mask: use scaled version only for valid samples
+    apply_mask_img = tf.reshape(apply_mask, [batch_size, 1, 1, 1])
+    images = images * (1.0 - apply_mask_img) + images_scaled * apply_mask_img
+
+    apply_mask_coord = tf.reshape(apply_mask, [batch_size, 1])
+    coords = coords * (1.0 - apply_mask_coord) + new_coords * apply_mask_coord
+    coords = tf.clip_by_value(coords, 0.0, 1.0)
+
+    return images, coords
+
+
 def _tf_rotate_batch(images, coords, has_doc, rotation_range):
     """Apply random rotation to a batch using TF ops.
 
@@ -354,7 +408,8 @@ def _tf_rotate_batch(images, coords, has_doc, rotation_range):
 
 
 def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None,
-                     image_norm: str = "imagenet", rotation_range=0.0):
+                     image_norm: str = "imagenet", rotation_range=0.0,
+                     scale_range=0.0):
     """
     Apply augmentation to a batch using TensorFlow ops (runs on GPU).
 
@@ -455,9 +510,11 @@ def tf_augment_batch(images, coords, has_doc, img_size=224, is_outlier=None,
     images = tf.clip_by_value(images, clip_min, clip_max)
     coords = tf.clip_by_value(coords, 0.0, 1.0)
 
-    # Rotation augmentation
+    # Geometric augmentations
     if rotation_range > 0:
         images, coords = _tf_rotate_batch(images, coords, has_doc, rotation_range)
+    if scale_range > 0:
+        images, coords = _tf_scale_batch(images, coords, has_doc, scale_range)
 
     return images, coords
 
